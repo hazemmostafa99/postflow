@@ -662,7 +662,7 @@ async function executeFacebookPost(jobId: string, post: any) {
       });
 
       console.log('[PostFlow] Clicking composer trigger:', composerTrigger.getAttribute('aria-label') ?? composerTrigger.textContent?.substring(0, 40));
-      composerTrigger.click();
+      clickLikeUser(composerTrigger);
       await sleep(POSTING_TIMING.composerOpenDelayMs);
       recordPostingStep(jobId, 'composer_trigger_clicked', {
         dialogs: document.querySelectorAll('div[role="dialog"], [aria-modal="true"]').length,
@@ -702,7 +702,14 @@ async function executeFacebookPost(jobId: string, post: any) {
       // an inline composer for this flow. Do not require role="dialog": the
       // GroupInlineComposer markup in some locales stays on the group page.
       console.log('[PostFlow] Waiting for create-post editor...');
-      const dialog = await waitForCreatePostDialog(POSTING_TIMING.createPostDialogTimeoutMs);
+      let dialog = await waitForCreatePostDialog(POSTING_TIMING.createPostDialogTimeoutMs);
+      if (!dialog) {
+        console.warn('[PostFlow] Create-post editor not found after first click; retrying composer trigger once');
+        recordPostingStep(jobId, 'editor_surface_retrying_click');
+        clickLikeUser(composerTrigger);
+        await sleep(POSTING_TIMING.composerOpenDelayMs);
+        dialog = await waitForCreatePostDialog(Math.floor(POSTING_TIMING.createPostDialogTimeoutMs / 2));
+      }
 
       if (!dialog) {
         throw new Error(`Facebook create-post editor did not appear within ${Math.round(POSTING_TIMING.createPostDialogTimeoutMs / 1000)}s`);
@@ -950,6 +957,15 @@ function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
 }
 
+function clickLikeUser(element: HTMLElement) {
+  element.scrollIntoView({ behavior: 'auto', block: 'center' });
+  element.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+  element.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
+  element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+  element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+  element.click();
+}
+
 function dataUrlToFile(dataUrl: string, index: number): File {
   const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.*)$/);
   if (!match) {
@@ -1088,17 +1104,69 @@ function waitForCreatePostDialog(timeoutMs: number): Promise<Element | null> {
       return style.display !== 'none' && style.visibility !== 'hidden' && node.getClientRects().length > 0;
     };
 
+    const isInsideArticle = (element: Element) => Boolean(element.closest('[role="article"]'));
+    const isLikelyComposerEditor = (element: Element) => {
+      if (!isVisible(element) || isInsideArticle(element)) return false;
+      const node = element as HTMLElement;
+      const combined = [
+        node.getAttribute('aria-label'),
+        node.getAttribute('aria-placeholder'),
+        node.getAttribute('placeholder'),
+        node.getAttribute('data-lexical-editor'),
+        node.textContent,
+      ].filter(Boolean).join(' ').toLowerCase();
+
+      if (node.getAttribute('data-lexical-editor') === 'true') return true;
+      if (node.getAttribute('contenteditable') === 'true' && node.getAttribute('role') === 'textbox') return true;
+      return [
+        'write something',
+        "what's on your mind",
+        'create a post',
+        'post',
+      ].some((keyword) => combined.includes(keyword));
+    };
+
+    const findUsefulSurfaceForEditor = (editor: Element) => {
+      const postButtonSelector = [
+        '[aria-label="Post"]',
+        '[aria-label="Publier"]',
+        '[aria-label="Postar"]',
+        '[role="button"]',
+        'button',
+      ].join(', ');
+
+      let current = editor.parentElement;
+      while (current && current !== document.body) {
+        const hasPostButton = Array.from(current.querySelectorAll<HTMLElement>(postButtonSelector)).some((candidate) => {
+          const text = (candidate.textContent ?? '').trim().toLowerCase();
+          const label = (candidate.getAttribute('aria-label') ?? '').trim().toLowerCase();
+          return ['post', 'publier', 'postar'].some((keyword) => text === keyword || label === keyword);
+        });
+        if (hasPostButton) return current;
+        current = current.parentElement;
+      }
+
+      return editor.closest('[role="main"]') ?? editor.parentElement;
+    };
+
     const check = () => {
       // Prefer the modal, because its Post button and editor belong together.
       const dialogs = Array.from(document.querySelectorAll<HTMLElement>('div[role="dialog"], [aria-modal="true"]'));
-      const dialog = dialogs.find(d => Array.from(d.querySelectorAll(editorSelector)).some(isVisible));
+      const dialog = dialogs.find(d => Array.from(d.querySelectorAll(editorSelector)).some(isLikelyComposerEditor));
       if (dialog) return dialog;
 
       // Fallback for the newer inline group composer. Return its nearest useful
       // container so the existing editor/media/button lookup remains scoped.
       const inline = document.querySelector<HTMLElement>('[data-pagelet="GroupInlineComposer"]');
-      const inlineEditor = inline && Array.from(inline.querySelectorAll(editorSelector)).find(isVisible);
+      const inlineEditor = inline && Array.from(inline.querySelectorAll(editorSelector)).find(isLikelyComposerEditor);
       if (inlineEditor) return inline;
+
+      // Facebook sometimes mounts the opened composer in a sibling pagelet
+      // instead of a dialog or GroupInlineComposer, especially after several
+      // group pages have been opened in the same tab.
+      const main = document.querySelector<HTMLElement>('[role="main"]') ?? document.body;
+      const looseEditor = Array.from(main.querySelectorAll(editorSelector)).find(isLikelyComposerEditor);
+      if (looseEditor) return findUsefulSurfaceForEditor(looseEditor);
 
       return null;
     };

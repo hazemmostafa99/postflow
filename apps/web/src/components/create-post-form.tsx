@@ -149,6 +149,10 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
         return;
       }
 
+      // The API creates the jobs, while the browser extension owns execution.
+      // Persist the signal as a fallback in case the extension content script
+      // has not finished initializing when this event is dispatched.
+      window.localStorage.setItem("postflow:pending-job-check", String(Date.now()));
       window.dispatchEvent(new CustomEvent("postflow:check-jobs"));
 
       if (onSuccess) {

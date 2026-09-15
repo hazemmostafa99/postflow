@@ -15,6 +15,11 @@ async function getClerkUserId(): Promise<string | null> {
 }
 
 async function apiFetch(path: string, body?: Record<string, unknown>, method?: string) {
+  if (!path || !path.startsWith('/')) {
+    console.warn('[PostFlow] Refusing API call with invalid path:', path);
+    return null;
+  }
+
   const clerkUserId = await getClerkUserId();
   if (!clerkUserId) {
     console.warn('[PostFlow] No user ID found — skipping API call:', path);
@@ -22,9 +27,10 @@ async function apiFetch(path: string, body?: Record<string, unknown>, method?: s
   }
 
   const httpMethod = method || (body ? 'POST' : 'GET');
+  const url = `${API_BASE_URL}${path}`;
 
   try {
-    const response = await fetch(`${API_BASE_URL}${path}`, {
+    const response = await fetch(url, {
       method: httpMethod,
       headers: {
         'Content-Type': 'application/json',
@@ -33,16 +39,22 @@ async function apiFetch(path: string, body?: Record<string, unknown>, method?: s
       body: body ? JSON.stringify(body) : undefined,
     });
 
+    // Handle empty responses (like 200 OK with no JSON)
+    const text = await response.text();
     if (!response.ok) {
-      console.warn(`[PostFlow] API error ${response.status} on ${path}`);
+      console.warn('[PostFlow] API error', {
+        status: response.status,
+        method: httpMethod,
+        path,
+        url,
+        response: text.slice(0, 300),
+      });
       return null;
     }
 
-    // Handle empty responses (like 200 OK with no JSON)
-    const text = await response.text();
     return text ? JSON.parse(text) : null;
   } catch (err) {
-    console.error('[PostFlow] Network error:', err);
+    console.error('[PostFlow] Network error:', { method: httpMethod, path, url, err });
     return null;
   }
 }
@@ -217,17 +229,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 let isProcessingJob = false;
 let finishExecutionHandshake: (() => void) | null = null;
+let activeExecution: { jobId: string; tabId: number } | null = null;
 
 async function checkPendingJobs() {
   if (isProcessingJob) return;
+  isProcessingJob = true;
 
   const job = await apiFetch('/api/jobs/next');
   if (!job || !job.postId) {
     console.log('[PostFlow] No pending jobs');
+    isProcessingJob = false;
     return;
   }
 
-  isProcessingJob = true;
   console.log('[PostFlow] Found pending job:', job._id);
 
   try {
@@ -257,9 +271,11 @@ async function checkPendingJobs() {
     if (!tabId) {
       await updateJobStatus(job._id, { status: 'FAILED', error: 'Could not get tab ID' });
       isProcessingJob = false;
+      activeExecution = null;
       return;
     }
     const readyTabId = tabId;
+    activeExecution = { jobId: job._id, tabId: readyTabId };
 
     // tabs.update/tabs.create resolves before the old Facebook document has
     // necessarily been replaced. Sending EXECUTE_JOB immediately can make
@@ -272,6 +288,7 @@ async function checkPendingJobs() {
         error: 'Target Facebook group page did not finish loading',
       });
       isProcessingJob = false;
+      activeExecution = null;
       return;
     }
     console.log('[PostFlow] Target Facebook group page is loaded; waiting for content script', targetUrl);
@@ -282,6 +299,14 @@ async function checkPendingJobs() {
       let retryHandle: ReturnType<typeof setInterval> | null = null;
 
     function sendExecuteJob(force = false) {
+        if (activeExecution?.jobId !== job._id || activeExecution?.tabId !== readyTabId) {
+          console.warn('[PostFlow] Skipping stale EXECUTE_JOB send', {
+            jobId: job._id,
+            tabId: readyTabId,
+            activeExecution,
+          });
+          return;
+        }
         if (sent && !force) return;
         if (sendInFlight) {
           console.log('[PostFlow] Skipping overlapping EXECUTE_JOB send', job._id);
@@ -310,6 +335,15 @@ async function checkPendingJobs() {
 
       function onMessage(message: any, sender: chrome.runtime.MessageSender) {
         if (message.type === 'CONTENT_SCRIPT_READY' && sender.tab?.id === readyTabId) {
+          if (activeExecution?.jobId !== job._id || activeExecution?.tabId !== readyTabId) {
+            console.warn('[PostFlow] Ignoring stale content-script ready handler', {
+              jobId: job._id,
+              tabId: readyTabId,
+              activeExecution,
+            });
+            cleanup();
+            return;
+          }
           // Facebook can tear down the content script when the composer is
           // clicked. Force delivery to the replacement content-script instance.
           console.log('[PostFlow] Facebook content script ready; resuming job', job._id);
@@ -338,6 +372,7 @@ async function checkPendingJobs() {
           error: 'Timed out waiting for Facebook page to load',
         });
         isProcessingJob = false;
+        activeExecution = null;
     }, POSTING_TIMING.facebookTabReadyTimeoutMs);
 
   } catch (err) {
@@ -347,6 +382,7 @@ async function checkPendingJobs() {
       error: 'Extension error while processing job' 
     });
     isProcessingJob = false;
+    activeExecution = null;
   }
 }
 
@@ -373,23 +409,52 @@ async function waitForFacebookTabDocument(tabId: number, targetUrl: string, time
   return false;
 }
 
+function isCurrentExecutionResult(message: any, sender: chrome.runtime.MessageSender) {
+  if (!activeExecution) {
+    console.warn('[PostFlow] Ignoring job result with no active execution:', message.type, message.jobId);
+    return false;
+  }
+  if (message.jobId !== activeExecution.jobId) {
+    console.warn('[PostFlow] Ignoring stale job result for non-active job:', {
+      type: message.type,
+      receivedJobId: message.jobId,
+      activeJobId: activeExecution.jobId,
+    });
+    return false;
+  }
+  if (sender.tab?.id !== activeExecution.tabId) {
+    console.warn('[PostFlow] Ignoring job result from non-active tab:', {
+      type: message.type,
+      jobId: message.jobId,
+      receivedTabId: sender.tab?.id,
+      activeTabId: activeExecution.tabId,
+    });
+    return false;
+  }
+  return true;
+}
+
 // Handle JOB result messages from content script
-chrome.runtime.onMessage.addListener((message) => {
-      if (message.type === 'JOB_SUCCESS') {
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (message.type === 'JOB_SUCCESS') {
+    if (!isCurrentExecutionResult(message, sender)) return;
     void (async () => {
       console.log('[PostFlow] Job succeeded:', message.jobId);
       finishExecutionHandshake?.();
       await updateJobStatus(message.jobId, { status: 'SUCCESS' });
       isProcessingJob = false;
+      activeExecution = null;
       checkPendingJobs();
     })();
   }
   if (message.type === 'JOB_FAILED') {
+    if (!isCurrentExecutionResult(message, sender)) return;
     void (async () => {
       console.error('[PostFlow] Job failed:', message.jobId, message.error);
       finishExecutionHandshake?.();
       await updateJobStatus(message.jobId, { status: 'FAILED', error: message.error });
       isProcessingJob = false;
+      activeExecution = null;
       checkPendingJobs();
     })();
   }

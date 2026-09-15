@@ -8,6 +8,7 @@
 
 const USER_ID_ATTR = 'data-postflow-user-id';
 const PENDING_SYNC_KEY = 'postflow:pending-sync-groups';
+const PENDING_JOB_CHECK_KEY = 'postflow:pending-job-check';
 
 // ── Context validity guard ──
 // When the extension is reloaded/updated, content scripts in already-open
@@ -66,6 +67,24 @@ function consumePendingGroupSync() {
   }
 }
 
+function consumePendingJobCheck() {
+  try {
+    const pendingCheck = window.localStorage.getItem(PENDING_JOB_CHECK_KEY);
+    if (!pendingCheck) return;
+
+    // Wait until the background worker has an authenticated user ID. This
+    // prevents a newly-created job signal from being lost during page startup.
+    chrome.storage.local.get('clerkUserId', (result) => {
+      if (!result.clerkUserId || !isExtensionAlive()) return;
+      window.localStorage.removeItem(PENDING_JOB_CHECK_KEY);
+      console.log('[PostFlow] Consuming pending job check from Web App');
+      safeSend({ type: 'TRIGGER_JOB_CHECK' });
+    });
+  } catch {
+    // localStorage can be unavailable in unusual browser privacy modes.
+  }
+}
+
 // ── User ID extraction ──
 
 function extractAndStore() {
@@ -112,6 +131,7 @@ function extractAndStore() {
 // Run on load and observe DOM changes in case Next.js renders after script injection
 extractAndStore();
 consumePendingGroupSync();
+consumePendingJobCheck();
 
 const observer = new MutationObserver(() => extractAndStore());
 observer.observe(document.body, { childList: true, subtree: true });
@@ -122,6 +142,7 @@ const pendingSyncInterval = window.setInterval(() => {
     return;
   }
   consumePendingGroupSync();
+  consumePendingJobCheck();
 }, 500);
 
 const webAppPresenceInterval = window.setInterval(() => {

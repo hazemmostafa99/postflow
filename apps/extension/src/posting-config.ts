@@ -15,8 +15,9 @@ const postingTiming: PostFlowPostingTimingConfig = {
   // Pause after selecting the "Post/Text" option if Facebook shows an intermediate creation modal.
   intermediateComposerOptionDelayMs: 400,
 
-  // Max time to wait for the real create-post dialog that contains the editable text box.
-  createPostDialogTimeoutMs: 10000,
+  // Max time to wait for the real create-post surface that contains the editable text box.
+  // Facebook can mount this late after several back-to-back group navigations.
+  createPostDialogTimeoutMs: 20000,
 
   // Pause after scrolling the editor into view so focus/click events land reliably.
   editorScrollDelayMs: 120,

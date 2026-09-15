@@ -1,20 +1,50 @@
-import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
+import {
+  Injectable,
+  BadRequestException,
+  NotFoundException,
+} from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { Post, PostDocument } from '../schemas/post.schema';
-import { PublishingJob, PublishingJobDocument } from '../schemas/publishing-job.schema';
+import {
+  PublishingJob,
+  PublishingJobDocument,
+} from '../schemas/publishing-job.schema';
 import { Group, GroupDocument } from '../schemas/group.schema';
 
 export class CreatePostDto {
-  content: string;
+  content!: string;
   mediaUrls?: string[];
-  targetGroupIds: string[]; // MongoDB _id strings of the groups to target
+  targetGroupIds!: string[]; // MongoDB _id strings of the groups to target
 }
 
 export interface ListPostsOptions {
   page?: number;
   limit?: number;
 }
+
+type LeanJobSummary = {
+  _id: Types.ObjectId;
+  postId: Types.ObjectId;
+  groupId: Types.ObjectId;
+  status: string;
+  attempts: number;
+  error?: string;
+  scheduledFor?: Date;
+  startedAt?: Date;
+  completedAt?: Date;
+  createdAt?: Date;
+  updatedAt?: Date;
+};
+
+type AggregatedPost = {
+  _id: Types.ObjectId;
+  content: string;
+  status: string;
+  createdAt?: Date;
+  updatedAt?: Date;
+  mediaCount: number;
+};
 
 @Injectable()
 export class PostsService {
@@ -38,7 +68,9 @@ export class PostsService {
       throw new BadRequestException('Post content or media is required');
     }
     if (!dto.targetGroupIds?.length) {
-      throw new BadRequestException('At least one target group must be selected');
+      throw new BadRequestException(
+        'At least one target group must be selected',
+      );
     }
 
     // Validate all group IDs belong to the user
@@ -71,9 +103,9 @@ export class PostsService {
 
     await this.jobModel.insertMany(jobs);
 
-    return { 
-      post: { ...post.toObject(), _id: post._id.toString() }, 
-      jobsCreated: jobs.length 
+    return {
+      post: { ...post.toObject(), _id: post._id.toString() },
+      jobsCreated: jobs.length,
     };
   }
 
@@ -88,7 +120,9 @@ export class PostsService {
 
     return mediaUrls.map((url) => {
       if (typeof url !== 'string' || !url.startsWith('data:image/')) {
-        throw new BadRequestException('Only image attachments are supported right now');
+        throw new BadRequestException(
+          'Only image attachments are supported right now',
+        );
       }
       if (url.length > 3_000_000) {
         throw new BadRequestException('Each image must be 2MB or smaller');
@@ -110,12 +144,12 @@ export class PostsService {
 
     // Attach job summary to each post
     const postIds = posts.map((p) => p._id);
-    const jobs = await this.jobModel
+    const jobs = (await this.jobModel
       .find({ postId: { $in: postIds } } as any)
       .lean()
-      .exec();
+      .exec()) as unknown as LeanJobSummary[];
 
-    const jobsByPost = jobs.reduce<Record<string, typeof jobs>>(
+    const jobsByPost = jobs.reduce<Record<string, LeanJobSummary[]>>(
       (acc, job) => {
         const key = job.postId.toString();
         if (!acc[key]) acc[key] = [];
@@ -137,32 +171,35 @@ export class PostsService {
     const limit = Math.min(100, Math.max(1, options.limit ?? 10));
     const skip = (page - 1) * limit;
 
-    const [posts, total] = await Promise.all([
-      this.postModel.aggregate([
-        { $match: { clerkUserId } },
-        { $sort: { createdAt: -1, _id: -1 } },
-        { $skip: skip },
-        { $limit: limit },
-        {
-          $project: {
-            content: 1,
-            status: 1,
-            createdAt: 1,
-            updatedAt: 1,
-            mediaCount: { $size: { $ifNull: ['$mediaUrls', []] } },
+    const [rawPosts, total] = await Promise.all([
+      this.postModel
+        .aggregate([
+          { $match: { clerkUserId } },
+          { $sort: { createdAt: -1, _id: -1 } },
+          { $skip: skip },
+          { $limit: limit },
+          {
+            $project: {
+              content: 1,
+              status: 1,
+              createdAt: 1,
+              updatedAt: 1,
+              mediaCount: { $size: { $ifNull: ['$mediaUrls', []] } },
+            },
           },
-        },
-      ]).exec(),
+        ])
+        .exec(),
       this.postModel.countDocuments({ clerkUserId }),
     ]);
+    const posts = rawPosts as unknown as AggregatedPost[];
 
     const postIds = posts.map((p) => p._id);
-    const jobs = await this.jobModel
+    const jobs = (await this.jobModel
       .find({ postId: { $in: postIds } } as any)
       .lean()
-      .exec();
+      .exec()) as unknown as LeanJobSummary[];
 
-    const jobsByPost = jobs.reduce<Record<string, typeof jobs>>(
+    const jobsByPost = jobs.reduce<Record<string, LeanJobSummary[]>>(
       (acc, job) => {
         const key = job.postId.toString();
         if (!acc[key]) acc[key] = [];
@@ -204,18 +241,24 @@ export class PostsService {
       .lean()
       .exec();
 
-    return { 
-      ...post, 
+    return {
+      ...post,
       _id: post._id.toString(),
-      jobs 
+      jobs,
     };
   }
 
   async deleteAllPosts(clerkUserId: string) {
-    const posts = await this.postModel.find({ clerkUserId }).select('_id').lean().exec();
+    const posts = await this.postModel
+      .find({ clerkUserId })
+      .select('_id')
+      .lean()
+      .exec();
     const postIds = posts.map((post) => post._id);
     if (postIds.length) {
-      await this.jobModel.deleteMany({ postId: { $in: postIds } } as any).exec();
+      await this.jobModel
+        .deleteMany({ postId: { $in: postIds } } as any)
+        .exec();
     }
     await this.postModel.deleteMany({ clerkUserId }).exec();
   }

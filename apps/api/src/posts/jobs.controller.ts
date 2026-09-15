@@ -9,6 +9,7 @@ import {
   HttpStatus,
   UnauthorizedException,
   NotFoundException,
+  BadRequestException,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
@@ -61,6 +62,10 @@ export class JobsController {
     @Body() body: { status: string; error?: string },
   ) {
     if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    const allowedStatuses = new Set(['PENDING', 'RUNNING', 'SUCCESS', 'FAILED']);
+    if (!allowedStatuses.has(body.status)) {
+      throw new BadRequestException('Invalid job status');
+    }
 
     // Make sure the job actually belongs to the user by populating the post
     const job = await this.jobModel.findById(id).populate('postId').exec();
@@ -71,11 +76,16 @@ export class JobsController {
       throw new UnauthorizedException('Not your job');
     }
 
+    const previousStatus = job.status;
     job.status = body.status;
-    if (body.error) job.error = body.error;
+    job.error = body.status === 'FAILED' ? body.error : undefined;
     
     // Increment attempts if it just finished (success or fail)
-    if (body.status === 'SUCCESS' || body.status === 'FAILED') {
+    if (
+      (body.status === 'SUCCESS' || body.status === 'FAILED') &&
+      previousStatus !== 'SUCCESS' &&
+      previousStatus !== 'FAILED'
+    ) {
       job.attempts = (job.attempts || 0) + 1;
       job.completedAt = new Date();
     } else if (body.status === 'RUNNING') {
@@ -83,7 +93,32 @@ export class JobsController {
     }
 
     await job.save();
+    await this.updateParentPostStatus(post);
 
     return job;
+  }
+
+  private async updateParentPostStatus(post: PostDocument) {
+    const jobs = await this.jobModel
+      .find({ postId: post._id } as any)
+      .select('status')
+      .lean()
+      .exec();
+
+    if (!jobs.length) return;
+
+    const allSucceeded = jobs.every((job) => job.status === 'SUCCESS');
+    const anyFailed = jobs.some((job) => job.status === 'FAILED');
+    const allFinished = jobs.every((job) => job.status === 'SUCCESS' || job.status === 'FAILED');
+
+    if (allSucceeded) {
+      post.status = 'COMPLETED';
+    } else if (allFinished && anyFailed) {
+      post.status = 'PARTIAL_FAILURE';
+    } else {
+      post.status = 'PUBLISHING';
+    }
+
+    await post.save();
   }
 }
