@@ -1,0 +1,13 @@
+{
+  "name": "postflow-extension",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc && node scripts/copy-static.mjs",
+    "watch": "tsc --watch"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.43",
+    "typescript": "^5.0.0"
+  }
+}

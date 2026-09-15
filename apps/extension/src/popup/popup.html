@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PostFlow</title>
+  <link rel="stylesheet" href="./popup.css" />
+</head>
+<body>
+  <main class="container">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Facebook group sync</p>
+        <h1>PostFlow</h1>
+      </div>
+      <span class="page-status" id="status">Checking...</span>
+    </header>
+
+    <section class="status-grid" aria-label="Sync status">
+      <article class="status-card">
+        <span class="status-dot" id="web-app-dot"></span>
+        <div>
+          <p>Web app</p>
+          <strong id="web-app-status">Checking...</strong>
+        </div>
+      </article>
+      <article class="status-card">
+        <span class="status-dot" id="sync-dot"></span>
+        <div>
+          <p>Groups</p>
+          <strong id="sync-status">Checking...</strong>
+        </div>
+      </article>
+    </section>
+
+    <button class="primary-button" id="refresh">
+      <span>Refresh groups</span>
+    </button>
+
+    <section class="groups-panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Detected groups</p>
+          <h2>Facebook Groups</h2>
+        </div>
+        <span class="count-pill" id="group-count">0</span>
+      </div>
+      <div id="groups">
+        <p class="empty">
+          No groups detected.
+        </p>
+      </div>
+    </section>
+  </main>
+  <script src="./popup.js"></script>
+</body>
+</html>

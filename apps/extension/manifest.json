@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "PostFlow",
+  "version": "0.1.0",
+  "description": "PostFlow Facebook Groups POC",
+  "permissions": [
+    "storage",
+    "tabs",
+    "alarms",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://www.facebook.com/*",
+    "http://localhost:8000/*",
+    "http://localhost:3000/*"
+  ],
+  "background": {
+    "service_worker": "dist/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "dist/popup/popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.facebook.com/*"],
+      "js": ["dist/posting-config.js", "dist/content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.facebook.com/*"],
+      "js": ["dist/facebook-session.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["http://localhost:3000/*"],
+      "js": ["dist/postflow-content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["dist/graphql-spy.js"],
+      "matches": ["https://www.facebook.com/*"]
+    }
+  ]
+}
