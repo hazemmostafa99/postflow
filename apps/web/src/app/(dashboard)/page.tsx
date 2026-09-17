@@ -1,7 +1,7 @@
 import { auth } from "@clerk/nextjs/server";
 import { redirect } from "next/navigation";
 import Link from "next/link";
-import { AlertCircle, CheckCircle2, Clock, FileText, Send, Users } from "lucide-react";
+import { AlertCircle, CheckCircle2, Clock, FileText, Users } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
 const API_BASE = process.env.API_URL || "http://localhost:8000";
@@ -135,25 +135,6 @@ export default async function DashboardPage() {
 
   return (
     <div className="page-shell">
-      <section className="page-header">
-        <div className="flex items-center gap-3">
-          <div className="soft-icon">
-            <Send className="h-5 w-5" />
-          </div>
-          <div>
-            <p className="page-kicker">Overview</p>
-            <h1 className="page-title">Publishing dashboard</h1>
-            <p className="page-subtitle">Track posts, groups, and publishing jobs at a glance.</p>
-          </div>
-        </div>
-        <Link
-          href="/posts"
-          className="inline-flex h-9 items-center justify-center rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-        >
-          View posts
-        </Link>
-      </section>
-
       <section className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <StatCard title="Total posts" value={posts.length} description={`${countThisMonth(posts)} created this month`} icon={FileText} />
         <StatCard title="Connected groups" value={groups.length} description="Available in the new post form" icon={Users} />

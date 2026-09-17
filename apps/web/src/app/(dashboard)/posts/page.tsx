@@ -3,7 +3,6 @@ import { redirect } from "next/navigation";
 import Link from "next/link";
 import { AlertCircle, ArrowRight, Clock, FileText, Image as ImageIcon, Users } from "lucide-react";
 import { NewPostDialog } from "@/components/new-post-dialog";
-import { DeleteButton } from "@/components/delete-button";
 
 const API_BASE = process.env.API_URL || "http://localhost:8000";
 const POSTS_PER_PAGE = 10;
@@ -138,24 +137,6 @@ export default async function PostsPage({
 
   return (
     <div className="page-shell">
-      <section className="page-header">
-        <div className="flex items-center gap-3">
-          <div className="soft-icon">
-            <FileText className="h-5 w-5" />
-          </div>
-          <div>
-            <p className="page-kicker">Posts</p>
-            <h1 className="page-title">Publishing queue</h1>
-            <p className="page-subtitle">Create posts, monitor delivery, and inspect failures.</p>
-          </div>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <DeleteButton endpoint="/api/groups" label="all synced groups" buttonLabel="Delete all groups" />
-          <DeleteButton endpoint="/api/posts" label="all posts" buttonLabel="Delete all posts" />
-          <NewPostDialog />
-        </div>
-      </section>
-
       <section className="grid gap-4 md:grid-cols-3">
         <div className="surface p-4">
           <p className="text-xs font-medium uppercase tracking-normal text-muted-foreground">Total posts</p>

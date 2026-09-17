@@ -15,6 +15,7 @@ Create `apps/api/.env`:
 
 ```env
 DATABASE_URL=mongodb://localhost:27017/postflow
+CLERK_SECRET_KEY=your_secret_key
 PORT=8000
 ```
 
@@ -37,6 +38,24 @@ http://localhost:8000
 npm run build
 npm run start:prod
 ```
+
+## Bootstrap the first Admin
+
+The first Admin is created once from the API workspace. The script creates the Clerk user first and then the matching active PostFlow user. If the database write fails, it removes the Clerk user again.
+
+```bash
+set ADMIN_PASSWORD=use-a-secure-password
+npm run create-admin -- --email admin@company.com
+```
+
+On PowerShell:
+
+```powershell
+$env:ADMIN_PASSWORD = "use-a-secure-password"
+npm run create-admin -- --email admin@company.com
+```
+
+Do not commit the password or put it in source control. `DATABASE_URL` and `CLERK_SECRET_KEY` must be available in `apps/api/.env` or the shell environment.
 
 ## Tests
 
@@ -108,4 +127,3 @@ POST /api/extensions/session
 3. API creates one `PublishingJob` per selected group.
 4. Extension polls `GET /api/jobs/next`.
 5. Extension publishes to Facebook and updates job status.
-

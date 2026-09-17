@@ -1,6 +1,5 @@
-import { SignUp } from "@clerk/nextjs";
 import Link from "next/link";
-import { ArrowLeft, CheckCircle2, Send } from "lucide-react";
+import { ArrowLeft, CheckCircle2, Mail, Send } from "lucide-react";
 
 export default function SignUpPage() {
   return (
@@ -52,33 +51,15 @@ export default function SignUpPage() {
                 </span>
                 <span className="text-xl font-semibold">PostFlow</span>
               </div>
-              <h2 className="text-3xl font-semibold tracking-tight">Create your account</h2>
-              <p className="mt-2 text-muted-foreground">Get started with PostFlow in a few seconds.</p>
+              <h2 className="text-3xl font-semibold tracking-tight">Invitation required</h2>
+              <p className="mt-2 text-muted-foreground">PostFlow is a private workspace. Ask an administrator to invite you.</p>
             </div>
-
-            <SignUp
-              appearance={{
-                elements: {
-                  rootBox: "w-full",
-                  card: "w-full bg-card shadow-sm border border-border rounded-xl p-6",
-                  headerTitle: "hidden",
-                  headerSubtitle: "hidden",
-                  socialButtonsBlockButton: "border border-border bg-background text-foreground hover:bg-accent",
-                  socialButtonsBlockButtonText: "font-medium",
-                  dividerLine: "bg-border",
-                  dividerText: "text-muted-foreground",
-                  formFieldLabel: "text-foreground",
-                  formFieldInput: "bg-background border-border text-foreground placeholder:text-muted-foreground focus:border-primary focus:ring-0",
-                  formButtonPrimary: "bg-primary text-primary-foreground hover:bg-primary/90 shadow-none",
-                  footerActionText: "text-muted-foreground",
-                  footerActionLink: "text-primary hover:text-primary/80 font-medium",
-                  identityPreviewText: "text-foreground",
-                  identityPreviewEditButton: "text-muted-foreground",
-                  formFieldAction: "text-primary hover:text-primary/80",
-                },
-              }}
-              fallbackRedirectUrl="/"
-            />
+            <div className="rounded-xl border border-border bg-card p-6 shadow-sm">
+              <Mail className="h-8 w-8 text-primary" />
+              <h3 className="mt-4 font-semibold">Have an invitation?</h3>
+              <p className="mt-2 text-sm leading-6 text-muted-foreground">Follow the secure link in your invitation email to finish setting up your Clerk account.</p>
+              <Link href="/sign-in" className="mt-6 inline-flex h-9 items-center rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90">Go to sign in</Link>
+            </div>
           </div>
         </section>
       </div>

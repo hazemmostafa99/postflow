@@ -47,7 +47,7 @@ export function NewPostDialog({ label = "New Post", compact = false }: NewPostDi
 
       {open && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/55 p-4 backdrop-blur-sm"
+          className="fixed inset-0 z-50 flex min-h-screen items-center justify-center overflow-y-auto bg-stone-950/55 p-4 backdrop-blur-sm"
           role="dialog"
           aria-modal="true"
           aria-labelledby="new-post-title"
@@ -55,7 +55,7 @@ export function NewPostDialog({ label = "New Post", compact = false }: NewPostDi
             if (event.target === event.currentTarget) close();
           }}
         >
-          <div className="w-full max-w-2xl overflow-hidden rounded-xl border border-border bg-card shadow-2xl">
+          <div className="my-auto max-h-[calc(100vh-2rem)] w-full max-w-2xl overflow-hidden rounded-xl border border-border bg-card shadow-2xl">
             <div className="flex items-center justify-between border-b border-border bg-muted/35 px-5 py-4">
               <div>
                 <h2 id="new-post-title" className="text-lg font-semibold tracking-tight">

@@ -16,7 +16,7 @@ export default function SignInPage() {
           </div>
 
           <div className="max-w-xl p-10">
-            <p className="text-sm font-semibold uppercase tracking-normal text-sidebar-primary">Publishing workspace</p>
+            <p className="text-sm font-semibold uppercase tracking-normal text-sidebar-primary">PostFlow</p>
             <h1 className="mt-4 text-4xl font-semibold leading-tight tracking-tight xl:text-5xl">
               Publish to your Facebook Groups from one focused dashboard.
             </h1>

@@ -1,5 +1,5 @@
 import * as React from "react"
-import { Send, LayoutDashboard, FileText } from "lucide-react"
+import { Send, LayoutDashboard, FileText, Users, UserCog } from "lucide-react"
 
 import {
   Sidebar,
@@ -18,9 +18,11 @@ import Link from "next/link"
 const items = [
   { title: "Overview", url: "/", icon: LayoutDashboard },
   { title: "Posts", url: "/posts", icon: FileText },
+  { title: "Users", url: "/users", icon: UserCog },
+  { title: "Teams", url: "/teams", icon: Users },
 ]
 
-export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
+export function AppSidebar({ role, ...props }: React.ComponentProps<typeof Sidebar> & { role?: string }) {
   return (
     <Sidebar variant="sidebar" {...props}>
       <SidebarHeader className="flex h-16 justify-center border-b border-sidebar-border px-4">
@@ -57,9 +59,13 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         />
         <div className="flex flex-col">
           <span className="text-sm font-semibold text-sidebar-foreground">My Account</span>
-          <span className="text-xs text-sidebar-foreground/60">Manage profile</span>
+          <span className="text-xs text-sidebar-foreground/60">{role ? formatRole(role) : "Manage profile"}</span>
         </div>
       </SidebarFooter>
     </Sidebar>
   )
+}
+
+function formatRole(role: string) {
+  return role.replace("_", " ").toLowerCase().replace(/\b\w/g, (letter) => letter.toUpperCase())
 }
