@@ -168,3 +168,57 @@ window.addEventListener('postflow:check-jobs', () => {
   console.log('[PostFlow] Job check requested from Web App');
   safeSend({ type: 'TRIGGER_JOB_CHECK' });
 });
+
+function triggerPendingPostSync(post?: PendingFacebookPost) {
+  if (!isExtensionAlive()) {
+    window.dispatchEvent(new CustomEvent('postflow:pending-sync-finished', {
+      detail: { ok: false, error: 'Extension disconnected' },
+    }));
+    return;
+  }
+
+  const message = post
+    ? { type: 'TRIGGER_SINGLE_PENDING_SYNC', post }
+    : { type: 'TRIGGER_PENDING_POST_SYNC' };
+  try {
+    chrome.runtime.sendMessage(message, (response) => {
+      const error = chrome.runtime.lastError?.message;
+      window.dispatchEvent(new CustomEvent('postflow:pending-sync-finished', {
+        detail: error ? { ok: false, error, postId: post?.id } : { ...response, postId: post?.id },
+      }));
+    });
+  } catch {
+    isContextValid = false;
+    window.dispatchEvent(new CustomEvent('postflow:pending-sync-finished', {
+      detail: { ok: false, error: 'Extension error' },
+    }));
+  }
+}
+
+// Manual refresh entry points for the Web App. Both use the same background
+// sync commands as automatic scheduling and return their result to the page.
+window.addEventListener('postflow:sync-pending-posts', () => triggerPendingPostSync());
+window.addEventListener('postflow:sync-pending-post', (event) => {
+  const post = (event as CustomEvent<PendingFacebookPost>).detail;
+  if (post?.id) triggerPendingPostSync(post);
+});
+
+window.addEventListener('postflow:sync-post-engagement', (event) => {
+  if (!isExtensionAlive()) return;
+  try {
+    const post = (event as CustomEvent<{ id?: string; postUrl?: string; postId?: string }>).detail;
+    chrome.runtime.sendMessage(
+      post?.id && post?.postUrl
+        ? { type: 'TRIGGER_SINGLE_ENGAGEMENT_SYNC', post }
+        : { type: 'TRIGGER_ENGAGEMENT_SYNC', postId: post?.postId },
+      (response) => {
+        const error = chrome.runtime.lastError?.message;
+        window.dispatchEvent(new CustomEvent('postflow:engagement-sync-finished', {
+          detail: error ? { ok: false, error } : response,
+        }));
+      },
+    );
+  } catch {
+    isContextValid = false;
+  }
+});

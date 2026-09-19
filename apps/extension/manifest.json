@@ -24,7 +24,17 @@
   "content_scripts": [
     {
       "matches": ["https://www.facebook.com/*"],
-      "js": ["dist/posting-config.js", "dist/content.js"],
+      "js": [
+        "dist/posting-config.js",
+        "dist/post-tracking/types.js",
+        "dist/post-tracking/detect-pending-approval.js",
+        "dist/post-tracking/find-published-post.js",
+        "dist/post-tracking/find-pending-published-post.js",
+        "dist/post-tracking/parse-facebook-count.js",
+        "dist/post-tracking/extract-engagement.js",
+        "dist/post-tracking/wait-for-post-submission-result.js",
+        "dist/content.js"
+      ],
       "run_at": "document_idle"
     },
     {

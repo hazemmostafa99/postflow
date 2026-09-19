@@ -5,6 +5,10 @@ import './posting-config.js';
 const API_BASE_URL = 'http://localhost:8000';
 const HEARTBEAT_ALARM = 'postflow-heartbeat';
 const HEARTBEAT_INTERVAL_MINUTES = 1;
+const PENDING_POST_SYNC_ALARM = 'postflow-pending-post-sync';
+const PENDING_POST_SYNC_INTERVAL_MINUTES = 10;
+const ENGAGEMENT_SYNC_ALARM = 'postflow-engagement-sync';
+const ENGAGEMENT_SYNC_INTERVAL_MINUTES = 30;
 const POSTING_TIMING = (globalThis as { PostFlowPostingTiming?: PostFlowPostingTimingConfig }).PostFlowPostingTiming!;
 
 // ── Helpers ──
@@ -61,7 +65,15 @@ async function apiFetch(path: string, body?: Record<string, unknown>, method?: s
 
 async function updateJobStatus(
   jobId: string,
-  body: { status: string; error?: string },
+  body: {
+    status: string;
+    error?: string;
+    submissionResult?: {
+      status: 'PUBLISHED' | 'PENDING_APPROVAL' | 'UNKNOWN';
+      postUrl?: string;
+      reason?: string;
+    };
+  },
 ) {
   return apiFetch(`/api/jobs/${jobId}/status`, body);
 }
@@ -228,11 +240,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // ── Job Execution Flow ──
 
 let isProcessingJob = false;
+let isCheckingPendingPost = false;
+let isFacebookSyncBusy = false;
+let pendingCheckSequence = 0;
 let finishExecutionHandshake: (() => void) | null = null;
 let activeExecution: { jobId: string; tabId: number } | null = null;
 
 async function checkPendingJobs() {
-  if (isProcessingJob) return;
+  if (isProcessingJob || isFacebookSyncBusy) {
+    console.log('[PostFlow] Skipping job check while Facebook navigation is busy', {
+      isProcessingJob,
+      isFacebookSyncBusy,
+    });
+    return;
+  }
   isProcessingJob = true;
 
   const job = await apiFetch('/api/jobs/next');
@@ -249,7 +270,16 @@ async function checkPendingJobs() {
     await updateJobStatus(job._id, { status: 'RUNNING' });
 
     // 2. Find or create a Facebook tab for the group
-    const targetUrl = job.groupId.url;
+    const targetUrl = getSafeFacebookGroupUrl(job.groupId, job.groupId.url);
+    if (!targetUrl) {
+      console.error('[PostFlow] Refusing to navigate to invalid Facebook group URL', {
+        jobId: job._id,
+        group: job.groupId,
+      });
+      await updateJobStatus(job._id, { status: 'FAILED', error: 'Invalid Facebook group URL' });
+      isProcessingJob = false;
+      return;
+    }
     
     // Check if we already have an active Facebook tab we can reuse
     const tabs = await chrome.tabs.query({ url: '*://*.facebook.com/*' });
@@ -322,6 +352,7 @@ async function checkPendingJobs() {
           type: 'EXECUTE_JOB',
           jobId: job._id,
           post: job.postId,
+          group: job.groupId,
         }).then(() => {
           sendInFlight = false;
           sent = true;
@@ -386,6 +417,19 @@ async function checkPendingJobs() {
   }
 }
 
+function getSafeFacebookGroupUrl(group: any, fallback?: string): string | null {
+  const candidate = typeof fallback === 'string' ? fallback : group?.url;
+  let groupId = typeof group?.externalId === 'string' ? group.externalId : '';
+  try {
+    const url = candidate ? new URL(candidate) : null;
+    if (!groupId) groupId = url?.pathname.match(/^\/groups\/([^/]+)/i)?.[1] ?? '';
+  } catch {
+    // Rebuild from externalId when the stored URL is malformed.
+  }
+  if (!groupId || /[/?#]/.test(groupId)) return null;
+  return `https://www.facebook.com/groups/${groupId}/`;
+}
+
 async function waitForFacebookTabDocument(tabId: number, targetUrl: string, timeoutMs: number): Promise<boolean> {
   const startedAt = Date.now();
   let targetPath = '';
@@ -441,7 +485,10 @@ chrome.runtime.onMessage.addListener((message, sender) => {
     void (async () => {
       console.log('[PostFlow] Job succeeded:', message.jobId);
       finishExecutionHandshake?.();
-      await updateJobStatus(message.jobId, { status: 'SUCCESS' });
+      await updateJobStatus(message.jobId, {
+        status: 'SUCCESS',
+        submissionResult: message.submissionResult,
+      });
       isProcessingJob = false;
       activeExecution = null;
       checkPendingJobs();
@@ -460,16 +507,353 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   }
 });
 
+/** Navigate to one pending post's group and ask the Facebook content script to
+ * perform the DOM match. This function intentionally does not update the API;
+ * persistence belongs to the next feature phase. */
+async function checkSinglePendingPost(post: PendingFacebookPost, lockAlreadyHeld = false): Promise<PendingPostSyncResult> {
+  if (isProcessingJob) {
+    return { status: 'CHECK_FAILED', reason: 'A new Facebook post is currently being published' };
+  }
+  if (isCheckingPendingPost) {
+    return { status: 'CHECK_FAILED', reason: 'Another pending post check is already running' };
+  }
+  if (!lockAlreadyHeld && isFacebookSyncBusy) {
+    return { status: 'CHECK_FAILED', reason: 'Another Facebook sync is already running' };
+  }
+  if (!lockAlreadyHeld) isFacebookSyncBusy = true;
+
+  isCheckingPendingPost = true;
+  const requestId = `pending-${++pendingCheckSequence}`;
+  let syncTabId: number | undefined;
+  try {
+    const groupUrl = getSafeFacebookGroupUrl(post, post.groupUrl);
+    if (!groupUrl) {
+      return { status: 'CHECK_FAILED', reason: 'Invalid Facebook group URL' };
+    }
+    console.log('[PendingPostSync] Starting single post check', {
+      postId: post.id,
+      groupUrl,
+      requestId,
+    });
+    // Status checks must never reuse or foreground the tab used for a new
+    // publish. Reusing tabs here was the source of old posts appearing during
+    // a different group's publish flow.
+    let checkUrl = groupUrl;
+    if (post.postUrl) {
+      try {
+        const savedUrl = new URL(post.postUrl);
+        if (/^\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/\d+/i.test(savedUrl.pathname)) {
+          checkUrl = savedUrl.href;
+        }
+      } catch {
+        // Fall back to the group feed when the saved pending URL is invalid.
+      }
+    }
+    const fbTab = await chrome.tabs.create({ url: checkUrl, active: false });
+    syncTabId = fbTab.id;
+
+    if (!fbTab.id || !(await waitForFacebookTabAfterNavigation(fbTab.id, checkUrl, POSTING_TIMING.facebookTabReadyTimeoutMs))) {
+      console.warn('[PendingPostSync] Facebook pending-post navigation failed', { postId: post.id, checkUrl });
+      return { status: 'CHECK_FAILED', reason: 'Target Facebook group page did not finish loading' };
+    }
+
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < POSTING_TIMING.facebookTabReadyTimeoutMs) {
+      try {
+        console.log('[PendingPostSync] Asking Facebook content script to check post', {
+          postId: post.id,
+          tabId: fbTab.id,
+          requestId,
+        });
+        const response = await chrome.tabs.sendMessage(fbTab.id, {
+          type: 'CHECK_PENDING_POST',
+          requestId,
+          post,
+        });
+        if (response?.ok && response.result) {
+          console.log('[PendingPostSync] Facebook content script returned result', {
+            postId: post.id,
+            result: response.result,
+          });
+          return response.result as PendingPostSyncResult;
+        }
+      } catch {
+        // Content scripts can be replaced during navigation; retry until timeout.
+      }
+      await new Promise((resolve) => setTimeout(resolve, POSTING_TIMING.facebookMessageRetryIntervalMs));
+    }
+    return { status: 'CHECK_FAILED', reason: 'Timed out waiting for pending post matcher' };
+  } catch (err: any) {
+    return { status: 'CHECK_FAILED', reason: err?.message ?? 'Pending post check failed' };
+  } finally {
+    if (syncTabId !== undefined) {
+      await chrome.tabs.remove(syncTabId).catch(() => undefined);
+    }
+    isCheckingPendingPost = false;
+    if (!lockAlreadyHeld) isFacebookSyncBusy = false;
+  }
+}
+
+/**
+ * Wait for a real navigation cycle when reusing a tab. A same-path tab can
+ * otherwise still report `complete` for the old Facebook document.
+ */
+async function waitForFacebookTabAfterNavigation(tabId: number, targetUrl: string, timeoutMs: number): Promise<boolean> {
+  const startedAt = Date.now();
+  let targetPath = '';
+  let targetGroupPath = '';
+  let targetPostIdentity = '';
+  const targetIsPost = /\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/\d+/i.test(targetUrl);
+  try {
+    const parsedTarget = new URL(targetUrl);
+    targetPath = parsedTarget.pathname.replace(/\/+$/, '').toLowerCase();
+    targetGroupPath = parsedTarget.pathname.match(/^\/groups\/[^/]+/i)?.[0].toLowerCase() ?? '';
+    targetPostIdentity = parsedTarget.pathname.match(/^\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/(\d+)/i)?.[1] ?? '';
+  } catch {
+    return false;
+  }
+
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      const currentUrl = tab.url ?? '';
+      const currentPath = currentUrl ? new URL(currentUrl).pathname.replace(/\/+$/, '').toLowerCase() : '';
+      const currentPostIdentity = currentPath.match(/^\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/(\d+)/i)?.[1] ?? '';
+      const landedOnTarget = currentPath === targetPath ||
+        (targetIsPost && currentPath === targetGroupPath) ||
+        (targetIsPost && targetPostIdentity && currentPostIdentity === targetPostIdentity);
+      if (tab.status === 'complete' && landedOnTarget && Date.now() - startedAt >= 1500) return true;
+    } catch {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return false;
+}
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.type !== 'TRIGGER_SINGLE_PENDING_SYNC' || !message.post) return;
+  void checkSinglePendingPost(message.post as PendingFacebookPost)
+    .then(async (result) => {
+      const updated = await persistPendingSyncResult(message.post as PendingFacebookPost, result);
+      console.log('[PendingPostSync] Single check persisted', {
+        postId: message.post.id,
+        status: result.status,
+        updated,
+      });
+      sendResponse({ ok: true, result, updated });
+    })
+    .catch((err) => sendResponse({ ok: false, error: err?.message ?? 'Pending post sync failed' }));
+  return true;
+});
+
+let isPendingBatchRunning = false;
+
+/** Fetch and process a small pending-post batch without opening concurrent tabs. */
+async function syncPendingPostsBatch(): Promise<Array<{ postId: string; result: PendingPostSyncResult; updated: boolean }>> {
+  if (isPendingBatchRunning || isFacebookSyncBusy || isProcessingJob) return [];
+  isPendingBatchRunning = true;
+  isFacebookSyncBusy = true;
+
+  try {
+    const pendingPosts = await apiFetch('/api/jobs/pending?limit=10');
+    if (!Array.isArray(pendingPosts)) {
+      console.warn('[PendingPostSync] Could not fetch pending posts');
+      return [];
+    }
+
+    const results: Array<{ postId: string; result: PendingPostSyncResult; updated: boolean }> = [];
+    for (const post of pendingPosts as PendingFacebookPost[]) {
+      let result: PendingPostSyncResult;
+      try {
+        result = await checkSinglePendingPost(post, true);
+      } catch (err: any) {
+        result = { status: 'CHECK_FAILED', reason: err?.message ?? 'Pending post check failed' };
+      }
+
+      const updated = await persistPendingSyncResult(post, result);
+      results.push({ postId: post.id, result, updated });
+      console.log('[PendingPostSync] Completed pending post check', {
+        postId: post.id,
+        status: result.status,
+        updated,
+      });
+    }
+    return results;
+  } finally {
+    isPendingBatchRunning = false;
+    isFacebookSyncBusy = false;
+  }
+}
+
+async function persistPendingSyncResult(post: PendingFacebookPost, result: PendingPostSyncResult): Promise<boolean> {
+  const response = await apiFetch(`/api/jobs/${post.id}/pending-sync`, result);
+  return Boolean(response);
+}
+
+let isEngagementBatchRunning = false;
+let engagementCheckSequence = 0;
+let isCheckingEngagement = false;
+
+function normalizeStoredFacebookPostUrl(value: string): string | null {
+  const markdownMatch = value.trim().match(/^\[[^\]]+\]\((https?:\/\/[^)]+)\)$/i);
+  const candidate = markdownMatch?.[1] ?? value.trim();
+  try {
+    const url = new URL(candidate);
+    if (!/facebook\.com$/i.test(url.hostname) && !/\.facebook\.com$/i.test(url.hostname)) return null;
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlreadyHeld = false): Promise<PostEngagementSyncResult> {
+  if (isProcessingJob) {
+    return { status: 'CHECK_FAILED', reason: 'A new Facebook post is currently being published' };
+  }
+  if (isCheckingEngagement || (!lockAlreadyHeld && isFacebookSyncBusy)) {
+    return { status: 'CHECK_FAILED', reason: 'Another engagement check is already running' };
+  }
+  if (!lockAlreadyHeld) isFacebookSyncBusy = true;
+  isCheckingEngagement = true;
+  const requestId = `engagement-${++engagementCheckSequence}`;
+  let syncTabId: number | undefined;
+  const postUrl = normalizeStoredFacebookPostUrl(post.postUrl);
+  if (!postUrl) {
+    console.error('[PostAnalytics] Invalid stored Facebook post URL', { postId: post.id, postUrl: post.postUrl });
+    isCheckingEngagement = false;
+    if (!lockAlreadyHeld) isFacebookSyncBusy = false;
+    return { status: 'CHECK_FAILED', reason: 'Stored Facebook post URL is invalid' };
+  }
+  try {
+    console.log('[PostAnalytics] Opening published post', {
+      postId: post.id,
+      postUrl,
+      requestId,
+    });
+    // Analytics runs in an isolated background tab. It must not navigate the
+    // active publishing tab to a previously stored post URL.
+    const fbTab = await chrome.tabs.create({ url: postUrl, active: false });
+    syncTabId = fbTab.id;
+    console.log('[PostAnalytics] Facebook tab opened', { tabId: fbTab.id, postId: post.id });
+    const ready = Boolean(fbTab.id && await waitForFacebookTabAfterNavigation(fbTab.id, postUrl, POSTING_TIMING.facebookTabReadyTimeoutMs));
+    console.log('[PostAnalytics] Facebook tab readiness result', { tabId: fbTab.id, postId: post.id, ready });
+    if (!fbTab.id || !ready) {
+      console.warn('[PostAnalytics] Facebook post navigation failed', { postId: post.id, postUrl });
+      return { status: 'CHECK_FAILED', reason: 'Target Facebook post did not finish loading' };
+    }
+
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < POSTING_TIMING.facebookTabReadyTimeoutMs) {
+      try {
+        console.log('[PostAnalytics] Sending engagement check to Facebook tab', {
+          postId: post.id,
+          tabId: fbTab.id,
+          requestId,
+        });
+        const response = await chrome.tabs.sendMessage(fbTab.id, {
+          type: 'CHECK_POST_ENGAGEMENT', requestId, post: { ...post, postUrl },
+        });
+        console.log('[PostAnalytics] Facebook tab response received', { postId: post.id, tabId: fbTab.id, response });
+        if (response?.ok && response.result) {
+          console.log('[PostAnalytics] Engagement check completed', { postId: post.id, result: response.result });
+          return response.result as PostEngagementSyncResult;
+        }
+      } catch (error) {
+        console.log('[PostAnalytics] Facebook content script unavailable; retrying', {
+          postId: post.id,
+          tabId: fbTab.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        // The content script can be replaced while Facebook finishes navigation.
+      }
+      await new Promise((resolve) => setTimeout(resolve, POSTING_TIMING.facebookMessageRetryIntervalMs));
+    }
+    console.error('[PostAnalytics] Timed out waiting for Facebook engagement content script', {
+      postId: post.id,
+      tabId: fbTab.id,
+    });
+    return { status: 'CHECK_FAILED', reason: 'Timed out waiting for engagement counters' };
+  } catch (err: any) {
+    return { status: 'CHECK_FAILED', reason: err?.message ?? 'Engagement check failed' };
+  } finally {
+    if (syncTabId !== undefined) {
+      await chrome.tabs.remove(syncTabId).catch(() => undefined);
+    }
+    isCheckingEngagement = false;
+    if (!lockAlreadyHeld) isFacebookSyncBusy = false;
+  }
+}
+
+async function syncPublishedEngagementBatch(postId?: string) {
+  if (isEngagementBatchRunning || isFacebookSyncBusy || isProcessingJob) return [];
+  isEngagementBatchRunning = true;
+  isFacebookSyncBusy = true;
+  try {
+    const query = postId
+      ? `/api/jobs/engagement-pending?limit=50&postId=${encodeURIComponent(postId)}`
+      : '/api/jobs/engagement-pending?limit=10';
+    const posts = await apiFetch(query);
+    if (!Array.isArray(posts)) return [];
+    const results = [];
+    for (const post of posts as PublishedFacebookPost[]) {
+      const result = await checkSinglePostEngagement(post, true);
+      const updated = Boolean(await apiFetch(`/api/jobs/${post.id}/engagement`, result));
+      results.push({ postId: post.id, result, updated });
+      console.log('[PostAnalytics] Engagement sync completed', { postId: post.id, result, updated });
+    }
+    return results;
+  } finally {
+    isEngagementBatchRunning = false;
+    isFacebookSyncBusy = false;
+  }
+}
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.type === 'TRIGGER_SINGLE_ENGAGEMENT_SYNC' && message.post) {
+    void checkSinglePostEngagement(message.post as PublishedFacebookPost)
+      .then(async (result) => {
+        const updated = Boolean(await apiFetch(`/api/jobs/${message.post.id}/engagement`, result));
+        sendResponse({ ok: true, result, updated, postId: message.post.id });
+      })
+      .catch((err) => sendResponse({ ok: false, error: err?.message ?? 'Engagement sync failed' }));
+    return true;
+  }
+  if (message.type !== 'TRIGGER_ENGAGEMENT_SYNC') return;
+  void syncPublishedEngagementBatch(typeof message.postId === 'string' ? message.postId : undefined)
+    .then((results) => sendResponse({ ok: true, results }))
+    .catch((err) => sendResponse({ ok: false, error: err?.message ?? 'Engagement sync failed' }));
+  return true;
+});
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.type !== 'TRIGGER_PENDING_POST_SYNC') return;
+  void syncPendingPostsBatch()
+    .then((results) => sendResponse({ ok: true, results }))
+    .catch((err) => sendResponse({ ok: false, error: err?.message ?? 'Pending post batch failed' }));
+  return true;
+});
+
 // ── Alarms ──
 
 chrome.alarms.create(HEARTBEAT_ALARM, {
   periodInMinutes: HEARTBEAT_INTERVAL_MINUTES,
 });
+chrome.alarms.create(PENDING_POST_SYNC_ALARM, {
+  periodInMinutes: PENDING_POST_SYNC_INTERVAL_MINUTES,
+});
+// Engagement checks are explicitly user-triggered from the dashboard. An
+// automatic alarm can open a previously stored post URL while a new post is
+// being published, so do not schedule background navigation for analytics.
+void chrome.alarms.clear(ENGAGEMENT_SYNC_ALARM);
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === HEARTBEAT_ALARM) {
     sendHeartbeat();
     checkPendingJobs(); // Also check jobs on heartbeat
+  }
+  if (alarm.name === PENDING_POST_SYNC_ALARM) {
+    void syncPendingPostsBatch();
   }
 });
 

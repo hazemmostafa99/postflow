@@ -488,6 +488,78 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'CHECK_PENDING_POST') {
+    void (async () => {
+      try {
+        console.log('[PendingPostSync] Content script received pending post check', {
+          postId: message.post?.id,
+          requestId: message.requestId,
+          url: location.href,
+        });
+        const ready = await waitForCondition(
+          () => Boolean(
+            document.querySelector('[role="main"]') ||
+            document.querySelector('[data-pagelet*="Feed"]') ||
+            document.querySelector('[role="article"]'),
+          ),
+          POSTING_TIMING.groupPageReadyTimeoutMs,
+        );
+        if (!ready) {
+          sendResponse({
+            ok: true,
+            result: { status: 'CHECK_FAILED', reason: 'Facebook group feed did not load' },
+          });
+          return;
+        }
+
+        const result = checkPendingFacebookPost(message.post as PendingFacebookPost);
+        console.log('[PendingPostSync] Content script matched pending post', {
+          postId: message.post?.id,
+          result,
+        });
+        console.log('[PendingPostSync] Check result', {
+          postId: message.post?.id,
+          status: result.status,
+        });
+        sendResponse({ ok: true, result });
+      } catch (err: any) {
+        sendResponse({
+          ok: true,
+          result: { status: 'CHECK_FAILED', reason: err?.message ?? 'Pending post check failed' },
+        });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === 'CHECK_POST_ENGAGEMENT') {
+    void (async () => {
+      try {
+        console.log('[PostAnalytics] Engagement check received', {
+          postId: message.post?.id,
+          postUrl: message.post?.postUrl,
+          currentUrl: location.href,
+        });
+        const result = await waitForPostEngagement(
+          message.post?.postUrl ?? '',
+          POSTING_TIMING.facebookTabReadyTimeoutMs,
+        );
+        console.log('[PostAnalytics] Engagement extraction result', {
+          postId: message.post?.id,
+          result,
+        });
+        sendResponse({
+          ok: true,
+          result,
+        });
+      } catch (err: any) {
+        console.error('[PostAnalytics] Engagement extraction error', err);
+        sendResponse({ ok: true, result: { status: 'CHECK_FAILED', reason: err?.message ?? 'Engagement check failed' } });
+      }
+    })();
+    return true;
+  }
+
   if (message.type === 'EXECUTE_JOB') {
     if (isExecutingJob && activeJobId === message.jobId) {
       console.warn('[PostFlow] Ignoring duplicate EXECUTE_JOB for active job:', message.jobId);
@@ -502,13 +574,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     recordPostingStep(message.jobId, 'job_received', {
       hasContent: Boolean(message.post?.content),
       mediaCount: Array.isArray(message.post?.mediaUrls) ? message.post.mediaUrls.length : 0,
+      groupExternalId: message.group?.externalId,
+      groupUrl: message.group?.url,
     });
     activeJobId = message.jobId;
-    executeFacebookPost(message.jobId, message.post)
-      .then(() => {
+    executeFacebookPost(message.jobId, message.post, message.group)
+      .then((submissionResult) => {
         // We actually use chrome.runtime.sendMessage to communicate status
         // because the tab might navigate or reload, but the background script listens for it.
-        chrome.runtime.sendMessage({ type: 'JOB_SUCCESS', jobId: message.jobId, postId: message.post?._id });
+        chrome.runtime.sendMessage({
+          type: 'JOB_SUCCESS',
+          jobId: message.jobId,
+          postId: message.post?._id,
+          submissionResult,
+        });
       })
       .catch((err) => {
         chrome.runtime.sendMessage({ type: 'JOB_FAILED', jobId: message.jobId, postId: message.post?._id, error: err.message });
@@ -518,14 +597,48 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 // ── Job Execution (DOM Manipulation) ──
 
-async function executeFacebookPost(jobId: string, post: any) {
-  return new Promise<void>(async (resolve, reject) => {
+function extractFacebookGroupIdFromUrl(value?: string): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value, window.location.origin);
+    const match = url.pathname.match(/^\/groups\/([^/?#]+)/i);
+    return match?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
+async function executeFacebookPost(jobId: string, post: any, group?: any): Promise<FacebookPostSubmissionResult> {
+  return new Promise<FacebookPostSubmissionResult>(async (resolve, reject) => {
     isExecutingJob = true;
     try {
       console.log(`[PostFlow] Starting job ${jobId}`);
       const mediaUrls = Array.isArray(post.mediaUrls) ? post.mediaUrls.filter((url: unknown) => typeof url === 'string') : [];
       const hasMedia = mediaUrls.length > 0;
-      recordPostingStep(jobId, 'job_started', { hasContent: Boolean(post.content), mediaCount: mediaUrls.length });
+      const currentGroupId =
+        group?.externalId ??
+        extractFacebookGroupIdFromUrl(group?.url) ??
+        extractFacebookGroupIdFromUrl(window.location.href);
+      const isTargetGroupRoot = () => {
+        try {
+          const url = new URL(window.location.href);
+          const path = url.pathname.replace(/\/+$/, '');
+          const groupId = path.match(/^\/groups\/([^/]+)/i)?.[1];
+          return Boolean(
+            groupId &&
+            currentGroupId &&
+            groupId.toLowerCase() === currentGroupId.toLowerCase() &&
+            path.toLowerCase() === `/groups/${groupId}`.toLowerCase(),
+          );
+        } catch {
+          return false;
+        }
+      };
+      recordPostingStep(jobId, 'job_started', {
+        hasContent: Boolean(post.content),
+        mediaCount: mediaUrls.length,
+        currentGroupId,
+      });
 
       // 1. Find the "Write something…" composer trigger on the group page.
 
@@ -664,6 +777,9 @@ async function executeFacebookPost(jobId: string, post: any) {
       console.log('[PostFlow] Clicking composer trigger:', composerTrigger.getAttribute('aria-label') ?? composerTrigger.textContent?.substring(0, 40));
       clickLikeUser(composerTrigger);
       await sleep(POSTING_TIMING.composerOpenDelayMs);
+      if (!isTargetGroupRoot()) {
+        throw new Error(`Facebook navigated away from the target group before opening the composer: ${location.href}`);
+      }
       recordPostingStep(jobId, 'composer_trigger_clicked', {
         dialogs: document.querySelectorAll('div[role="dialog"], [aria-modal="true"]').length,
       });
@@ -671,7 +787,12 @@ async function executeFacebookPost(jobId: string, post: any) {
       // Facebook sometimes shows an intermediate "What do you want to create?" modal
       // with options: Post, Photo/Video, etc. We need to click "Post/Text" in that case.
       // Use .includes() not === because FB adds extra text like "منشور مجهول الهوية"
-      const interimDialog = document.querySelector<HTMLElement>('div[role="dialog"], [aria-modal="true"]');
+      const visibleDialogs = Array.from(document.querySelectorAll<HTMLElement>('div[role="dialog"], [aria-modal="true"]')).filter((candidate) => {
+        if (candidate.hidden || candidate.getAttribute('aria-hidden') === 'true') return false;
+        const style = window.getComputedStyle(candidate);
+        return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+      });
+      const interimDialog = visibleDialogs.length ? visibleDialogs[visibleDialogs.length - 1] : null;
       if (interimDialog && !interimDialog.querySelector('[contenteditable="true"], [role="textbox"], textarea')) {
         recordPostingStep(jobId, 'intermediate_dialog_detected', {
           text: interimDialog.innerText?.trim().slice(0, 120),
@@ -689,6 +810,9 @@ async function executeFacebookPost(jobId: string, post: any) {
           console.log('[PostFlow] Clicking Post/Text option in intermediate modal:', textOption.textContent?.trim().substring(0, 30));
           textOption.click();
           await sleep(POSTING_TIMING.intermediateComposerOptionDelayMs);
+          if (!isTargetGroupRoot()) {
+            throw new Error(`Facebook intermediate Post option navigated to a different surface: ${location.href}`);
+          }
           recordPostingStep(jobId, 'intermediate_post_option_clicked', {
             text: textOption.textContent?.trim().slice(0, 80),
           });
@@ -874,17 +998,25 @@ async function executeFacebookPost(jobId: string, post: any) {
         ariaLabel: postButton.getAttribute('aria-label'),
       });
 
+      const existingPostElements = new Set<Element>([
+        ...document.querySelectorAll('[role="article"], [data-pagelet*="FeedUnit"]'),
+      ]);
+      const submittedAt = Date.now();
+      const initialPageUrl = location.href;
+
       (postButton as HTMLElement).click();
       console.log('[PostFlow] Post button clicked, waiting for publish confirmation...');
       recordPostingStep(jobId, 'post_button_clicked');
 
-      // 4. Wait for Facebook to reject or accept the click. Facebook often
-      // publishes successfully while keeping a dialog/toast surface mounted.
+      // 4. Track the result separately from posting failures.
       const publishSuccessCues = [
         'your post is now published',
         'your post has been published',
         'post published',
         'published',
+        '\u062a\u0645 \u0646\u0634\u0631',
+        '\u062a\u0645 \u0646\u0634\u0631 \u0645\u0646\u0634\u0648\u0631\u0643',
+        '\u062a\u0645 \u0646\u0634\u0631 \u0627\u0644\u0645\u0646\u0634\u0648\u0631',
         'تم نشر',
         'تم نشر منشورك',
       ];
@@ -906,8 +1038,63 @@ async function executeFacebookPost(jobId: string, post: any) {
         const lower = source.toLowerCase();
         return texts.some((text) => lower.includes(text.toLowerCase()));
       };
+      const getVisibleText = (element: Element | null) => {
+        if (!(element instanceof HTMLElement)) return '';
+        if (element.hidden || element.getAttribute('aria-hidden') === 'true') return '';
+        const style = window.getComputedStyle(element);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return '';
+        return [
+          element.innerText ?? element.textContent ?? '',
+          element.getAttribute('aria-label') ?? '',
+          element.getAttribute('title') ?? '',
+        ].join(' ');
+      };
+      const getPublishSuccessEvidence = () => {
+        const semanticSurfaces = Array.from(document.querySelectorAll(
+          '[role="alert"], [role="status"], [aria-live], [data-visualcompletion="ignore-dynamic"]',
+        ));
+        const surfaceText = semanticSurfaces.map(getVisibleText).join('\n');
+        if (hasCue(publishSuccessCues, surfaceText)) return 'Facebook showed a publish success message';
 
-      const publishStartedAt = Date.now();
+        const dialogGone = !document.body.contains(dialog);
+        const editorGone = dialogGone || !dialog.querySelector('[contenteditable="true"], [role="textbox"], textarea');
+        const buttonGone = dialogGone || !dialog.contains(postButton);
+        if (dialogGone || (editorGone && buttonGone)) {
+          const pageText = document.body.innerText ?? '';
+          if (hasCue(publishSuccessCues, pageText)) return 'Facebook closed the composer after a publish success message';
+          return 'Facebook accepted the composer after the Post click';
+        }
+        return null;
+      };
+
+      const submissionResult = await waitForPostSubmissionResult({
+        root: document,
+        submittedText: post.content ?? '',
+        submittedAt,
+        timeout: POSTING_TIMING.publishConfirmationTimeoutMs,
+        interval: POSTING_TIMING.publishPollIntervalMs,
+        existingPostElements,
+        currentGroupId,
+        initialPageUrl,
+        getFailureReason: () => {
+          const dialogText = document.body.contains(dialog) ? ((dialog as HTMLElement).innerText ?? '') : '';
+          const pageText = (document.body.innerText ?? '').toLowerCase();
+          return hasCue(publishErrorCues, `${dialogText}\n${pageText}`)
+            ? 'Facebook rejected the post after clicking Post'
+            : null;
+        },
+        getSuccessEvidence: getPublishSuccessEvidence,
+      });
+
+      recordPostingStep(jobId, 'submission_result_detected', {
+        status: submissionResult.status,
+        postUrl: 'postUrl' in submissionResult ? submissionResult.postUrl : undefined,
+        reason: submissionResult.status === 'UNKNOWN' ? submissionResult.reason : undefined,
+      });
+      resolve(submissionResult);
+      return;
+
+      /* const publishStartedAt = Date.now();
       while (Date.now() - publishStartedAt < POSTING_TIMING.publishConfirmationTimeoutMs) {
         await sleep(POSTING_TIMING.publishPollIntervalMs);
 
@@ -941,7 +1128,7 @@ async function executeFacebookPost(jobId: string, post: any) {
       console.log('[PostFlow] No Facebook error after clicking Post - treating publish as accepted');
       recordPostingStep(jobId, 'publish_confirmation_timeout_accepted');
       resolve();
-      return;
+      return; */
 
     } catch (err: any) {
       recordPostingStep(jobId, 'job_failed_in_content_script', { error: err?.message ?? String(err) });

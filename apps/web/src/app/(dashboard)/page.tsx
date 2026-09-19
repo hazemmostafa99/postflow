@@ -9,6 +9,9 @@ const API_BASE = process.env.API_URL || "http://localhost:8000";
 interface Job {
   _id: string;
   status: string;
+  submissionStatus?: "PUBLISHED" | "PENDING_APPROVAL" | "UNKNOWN";
+  postUrl?: string;
+  submissionReason?: string;
   error?: string;
   createdAt?: string;
   updatedAt?: string;
@@ -79,6 +82,12 @@ function statusLabel(status: string): string {
   return "Pending";
 }
 
+function jobStatusLabel(job: Job): string {
+  if (job.submissionStatus === "PENDING_APPROVAL") return "Pending approval";
+  if (job.submissionStatus === "UNKNOWN") return "Submission status unknown";
+  return statusLabel(job.status);
+}
+
 function StatCard({
   title,
   value,
@@ -128,7 +137,7 @@ export default async function DashboardPage() {
 
   const activeJobs = jobs.filter((job) => job.status === "PENDING" || job.status === "RUNNING");
   const failedJobs = jobs.filter((job) => job.status === "FAILED");
-  const successfulJobs = jobs.filter((job) => job.status === "SUCCESS");
+  const successfulJobs = jobs.filter((job) => job.status === "SUCCESS" && job.submissionStatus !== "PENDING_APPROVAL");
   const recentJobs = [...jobs]
     .sort((a, b) => new Date(b.updatedAt ?? b.createdAt ?? 0).getTime() - new Date(a.updatedAt ?? a.createdAt ?? 0).getTime())
     .slice(0, 6);
@@ -165,7 +174,7 @@ export default async function DashboardPage() {
                   >
                     {job.status === "FAILED" ? (
                       <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-500" />
-                    ) : job.status === "SUCCESS" ? (
+                    ) : job.status === "SUCCESS" && job.submissionStatus !== "PENDING_APPROVAL" ? (
                       <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" />
                     ) : (
                       <Clock className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
@@ -179,7 +188,7 @@ export default async function DashboardPage() {
                           {timeAgo(job.updatedAt ?? job.createdAt)}
                         </span>
                       </div>
-                      <p className="mt-0.5 text-xs text-muted-foreground">{statusLabel(job.status)}</p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">{jobStatusLabel(job)}</p>
                       {job.error && <p className="mt-1 line-clamp-2 text-xs text-red-500">{job.error}</p>}
                     </div>
                   </Link>

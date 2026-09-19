@@ -37,7 +37,7 @@ export class ExtensionsService {
       .findOneAndUpdate(
         { clerkUserId },
         { lastHeartbeat: new Date(), status: 'ACTIVE' },
-        { new: true },
+        { returnDocument: 'after' },
       )
       .exec();
 
@@ -61,7 +61,7 @@ export class ExtensionsService {
           facebookSessionDetected: sessionDetected,
           lastHeartbeat: new Date(),
         },
-        { new: true },
+        { returnDocument: 'after' },
       )
       .exec();
 

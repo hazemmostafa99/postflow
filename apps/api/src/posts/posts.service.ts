@@ -28,6 +28,9 @@ type LeanJobSummary = {
   postId: Types.ObjectId;
   groupId: Types.ObjectId;
   status: string;
+  submissionStatus?: string;
+  postUrl?: string;
+  submissionReason?: string;
   attempts: number;
   error?: string;
   scheduledFor?: Date;

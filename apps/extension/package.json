@@ -3,11 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "test": "node --test tests/engagement.test.cjs tests/publishing-detection.test.cjs",
     "build": "tsc && node scripts/copy-static.mjs",
     "watch": "tsc --watch"
   },
   "devDependencies": {
     "@types/chrome": "^0.1.43",
+    "linkedom": "^0.18.13",
     "typescript": "^5.0.0"
   }
 }

@@ -2,6 +2,8 @@ import { auth } from "@clerk/nextjs/server";
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import { AlertCircle, ArrowLeft, Clock, ExternalLink, Users } from "lucide-react";
+import { RefreshGroupStatusButton, RefreshPostStatusControls } from "@/components/refresh-post-status-controls";
+import { RefreshPostEngagementButton, RefreshAllPostEngagementButton } from "@/components/refresh-post-engagement-button";
 
 const API_BASE = process.env.API_URL || "http://localhost:8000";
 
@@ -9,15 +11,27 @@ interface Group {
   _id: string;
   name: string;
   url: string;
+  externalId?: string;
 }
 
 interface Job {
   _id: string;
   groupId: Group;
   status: string;
+  submissionStatus?: "PUBLISHED" | "PENDING_APPROVAL" | "UNKNOWN";
+  postUrl?: string;
+  submissionReason?: string;
   attempts: number;
   error?: string;
   completedAt?: string;
+  submittedAt?: string;
+  engagement?: {
+    reactionCount?: number;
+    commentCount?: number;
+    lastSyncedAt: string;
+  };
+  lastEngagementSyncAt?: string;
+  lastEngagementSyncError?: string;
 }
 
 interface Post {
@@ -53,7 +67,8 @@ function timeAgo(dateStr: string): string {
   return "Just now";
 }
 
-function JobStatusBadge({ status }: { status: string }) {
+function JobStatusBadge({ job }: { job: Job }) {
+  const { status } = job;
   if (status === "PENDING" || status === "RUNNING") {
     return (
       <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20">
@@ -66,6 +81,20 @@ function JobStatusBadge({ status }: { status: string }) {
     return (
       <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-500/10 text-red-400 border border-red-500/20">
         Failed
+      </span>
+    );
+  }
+  if (job.submissionStatus === "PENDING_APPROVAL") {
+    return (
+      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20">
+        Pending approval
+      </span>
+    );
+  }
+  if (job.submissionStatus === "UNKNOWN") {
+    return (
+      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-zinc-500/10 text-zinc-400 border border-zinc-500/20">
+        Status unknown
       </span>
     );
   }
@@ -84,9 +113,17 @@ function OverallStatusBadge({ jobs }: { jobs: Job[] }) {
   const success = jobs.filter((j) => j.status === "SUCCESS").length;
   const failed = jobs.filter((j) => j.status === "FAILED").length;
   const pending = jobs.filter((j) => j.status === "PENDING" || j.status === "RUNNING").length;
+  const pendingApproval = jobs.filter((j) => j.submissionStatus === "PENDING_APPROVAL").length;
+  const unknown = jobs.filter((j) => j.submissionStatus === "UNKNOWN").length;
 
   if (pending > 0) {
     return <span className="text-amber-500">Publishing ({pending} remaining)</span>;
+  }
+  if (pendingApproval > 0) {
+    return <span className="text-amber-500">Pending approval ({pendingApproval})</span>;
+  }
+  if (unknown > 0) {
+    return <span className="text-zinc-500">Submission status unknown</span>;
   }
   if (failed > 0 && success > 0) {
     return <span className="text-orange-500">Partial Success ({success}/{jobs.length})</span>;
@@ -127,10 +164,24 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
           <ArrowLeft className="w-3.5 h-3.5" />
           Back to Posts
         </Link>
-        <div className="flex items-center justify-between">
-          <h2 className="text-2xl font-bold tracking-tight">Post Details</h2>
-          <div className="flex items-center gap-2 text-sm font-medium">
+          <div className="flex items-center justify-between">
+            <h2 className="text-2xl font-bold tracking-tight">Post Details</h2>
+          <div className="flex items-center gap-4 text-sm font-medium">
             <OverallStatusBadge jobs={post.jobs} />
+            {post.jobs.some((job) => job.submissionStatus === "PUBLISHED" && job.postUrl) && (
+              <RefreshAllPostEngagementButton postId={post._id} />
+            )}
+            <RefreshPostStatusControls
+              jobs={post.jobs.filter((job) => job.submissionStatus === "PENDING_APPROVAL").map((job) => ({
+                id: job._id,
+                groupId: job.groupId._id,
+                groupExternalId: job.groupId.externalId,
+                groupUrl: job.groupId.url,
+                content: post.content,
+                submittedAt: job.submittedAt ?? post.createdAt,
+                postUrl: job.postUrl,
+              }))}
+            />
           </div>
         </div>
         <div className="flex items-center gap-4 text-sm text-muted-foreground mt-2">
@@ -184,6 +235,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                 <tr className="border-b border-border bg-muted/40">
                   <th className="text-left px-4 py-3 font-medium text-muted-foreground">Group</th>
                   <th className="text-left px-4 py-3 font-medium text-muted-foreground">Status</th>
+                  <th className="text-left px-4 py-3 font-medium text-muted-foreground">Engagement</th>
                   <th className="text-right px-4 py-3 font-medium text-muted-foreground">Attempts</th>
                 </tr>
               </thead>
@@ -209,10 +261,53 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                         >
                           View Group <ExternalLink className="w-3 h-3" />
                         </a>
+                        {job.postUrl && (
+                          <a
+                            href={job.postUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs text-amber-500 hover:underline inline-flex items-center gap-1 mt-1"
+                          >
+                            View Facebook post <ExternalLink className="w-3 h-3" />
+                          </a>
+                        )}
+                        {job.submissionStatus === "PUBLISHED" && job.postUrl && (
+                          <RefreshPostEngagementButton postId={job._id} postUrl={job.postUrl} />
+                        )}
+                        {(job.submissionStatus === "PENDING_APPROVAL" ||
+                          (job.submissionStatus === "PUBLISHED" && (!job.postUrl || job.postUrl.includes("/pending_posts/")))) && (
+                          <RefreshGroupStatusButton job={{
+                            id: job._id,
+                            groupId: job.groupId._id,
+                            groupExternalId: job.groupId.externalId,
+                            groupUrl: job.groupId.url,
+                            content: post.content,
+                            submittedAt: job.submittedAt ?? post.createdAt,
+                            postUrl: job.postUrl,
+                          }} />
+                        )}
                       </div>
                     </td>
                     <td className="px-4 py-3 align-top pt-4">
-                      <JobStatusBadge status={job.status} />
+                      <JobStatusBadge job={job} />
+                    </td>
+                    <td className="px-4 py-3 align-top pt-4">
+                      {job.engagement ? (
+                        <div className="space-y-1 text-xs">
+                          <div className="flex gap-3 text-foreground">
+                            <span>{job.engagement.reactionCount ?? "—"} reactions</span>
+                            <span>{job.engagement.commentCount ?? "—"} comments</span>
+                          </div>
+                          <div className="text-muted-foreground">
+                            Updated {timeAgo(job.engagement.lastSyncedAt)}
+                          </div>
+                        </div>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">Not synced</span>
+                      )}
+                      {job.lastEngagementSyncError && (
+                        <div className="mt-1 max-w-56 text-xs text-red-400">{job.lastEngagementSyncError}</div>
+                      )}
                     </td>
                     <td className="px-4 py-3 align-top pt-4 text-right text-muted-foreground">
                       {job.attempts > 0 ? job.attempts : '-'}

@@ -53,7 +53,7 @@ export class TeamsService {
       await this.validateManager(body.managerId);
       patch.managerId = body.managerId || null;
     }
-    const team = await this.teamModel.findByIdAndUpdate(id, patch, { new: true }).exec();
+    const team = await this.teamModel.findByIdAndUpdate(id, patch, { returnDocument: 'after' }).exec();
     if (!team) throw new NotFoundException('Team not found');
     return team;
   }

@@ -10,6 +10,9 @@ const POSTS_PER_PAGE = 10;
 interface Job {
   _id: string;
   status: string;
+  submissionStatus?: "PUBLISHED" | "PENDING_APPROVAL" | "UNKNOWN";
+  postUrl?: string;
+  submissionReason?: string;
   error?: string;
 }
 
@@ -79,12 +82,29 @@ function PostStatusBadge({ jobs }: { jobs: Job[] }) {
   const success = jobs.filter((j) => j.status === "SUCCESS").length;
   const failed = jobs.filter((j) => j.status === "FAILED").length;
   const pending = jobs.filter((j) => j.status === "PENDING" || j.status === "RUNNING").length;
+  const pendingApproval = jobs.filter((j) => j.submissionStatus === "PENDING_APPROVAL").length;
+  const unknown = jobs.filter((j) => j.submissionStatus === "UNKNOWN").length;
 
   if (pending > 0) {
     return (
       <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/20 bg-amber-500/10 px-2.5 py-0.5 text-xs font-medium text-amber-600">
         <span className="h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse" />
         Pending ({pending})
+      </span>
+    );
+  }
+  if (pendingApproval > 0) {
+    return (
+      <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/20 bg-amber-500/10 px-2.5 py-0.5 text-xs font-medium text-amber-600">
+        <span className="h-1.5 w-1.5 rounded-full bg-amber-500" />
+        {pendingApproval === jobs.length ? "Pending approval" : `Approval pending (${pendingApproval})`}
+      </span>
+    );
+  }
+  if (unknown > 0) {
+    return (
+      <span className="inline-flex items-center rounded-full border border-zinc-500/20 bg-zinc-500/10 px-2.5 py-0.5 text-xs font-medium text-zinc-500">
+        Status unknown
       </span>
     );
   }
