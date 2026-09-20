@@ -4,8 +4,13 @@
   "private": true,
   "scripts": {
     "test": "node --test tests/engagement.test.cjs tests/publishing-detection.test.cjs",
-    "build": "tsc && node scripts/copy-static.mjs",
-    "watch": "tsc --watch"
+    "build": "npm run build:dev",
+    "build:dev": "tsc && node scripts/copy-static.mjs development",
+    "build:prod": "tsc && node scripts/copy-static.mjs production",
+    "watch": "npm run build:dev && tsc --watch"
+  },
+  "engines": {
+    "node": ">=20.12.0"
   },
   "devDependencies": {
     "@types/chrome": "^0.1.43",

@@ -11,6 +11,8 @@ coverage/
 .env
 .env.*
 !.env.example
+!apps/extension/.env.development
+!apps/extension/.env.production
 
 # Logs
 *.log

@@ -2,7 +2,10 @@
 
 import './posting-config.js';
 
-const API_BASE_URL = 'http://localhost:8000';
+import { API_BASE_URL, BUILD_ENV } from './env.js';
+
+console.info(`[PostFlow] ${BUILD_ENV === 'production' ? 'PROD' : 'DEV'} environment | API: ${API_BASE_URL}`);
+
 const HEARTBEAT_ALARM = 'postflow-heartbeat';
 const HEARTBEAT_INTERVAL_MINUTES = 1;
 const PENDING_POST_SYNC_ALARM = 'postflow-pending-post-sync';
