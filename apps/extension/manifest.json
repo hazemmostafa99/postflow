@@ -11,6 +11,8 @@
   ],
   "host_permissions": [
     "https://www.facebook.com/*",
+    "https://api.fitcure.online/*",
+    "https://fitcure.online/*",
     "http://localhost:8000/*",
     "http://localhost:3000/*"
   ],
@@ -43,7 +45,12 @@
       "run_at": "document_idle"
     },
     {
-      "matches": ["http://localhost:3000/*", "http://127.0.0.1:3000/*"],
+      "matches": [
+        "https://fitcure.online/*",
+        "https://www.fitcure.online/*",
+        "http://localhost:3000/*",
+        "http://127.0.0.1:3000/*"
+      ],
       "js": ["dist/postflow-content.js"],
       "run_at": "document_idle"
     }

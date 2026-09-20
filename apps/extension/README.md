@@ -13,8 +13,8 @@ The extension connects the local PostFlow dashboard/API with Facebook. It detect
 The extension is currently configured for local development:
 
 ```text
-Web: http://localhost:3000
-API: http://localhost:8000
+Web: https://fitcure.online
+API: https://api.fitcure.online
 Facebook: https://www.facebook.com/*
 ```
 
