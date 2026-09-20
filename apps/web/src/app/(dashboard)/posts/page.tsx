@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import Link from "next/link";
 import { AlertCircle, ArrowRight, Clock, FileText, Image as ImageIcon, Users } from "lucide-react";
 import { NewPostDialog } from "@/components/new-post-dialog";
+import { ScheduledTime } from "@/components/scheduled-time";
 
 const API_BASE = process.env.API_URL || "http://localhost:8000";
 const POSTS_PER_PAGE = 10;
@@ -14,6 +15,7 @@ interface Job {
   postUrl?: string;
   submissionReason?: string;
   error?: string;
+  scheduledFor?: string;
 }
 
 interface Post {
@@ -135,6 +137,13 @@ function getFailureReason(jobs: Job[]): string | null {
   return failedJob?.error?.trim() ?? null;
 }
 
+function getScheduledTime(jobs: Job[]): string | undefined {
+  return jobs
+    .map((job) => job.scheduledFor)
+    .filter((value): value is string => Boolean(value))
+    .sort((left, right) => new Date(left).getTime() - new Date(right).getTime())[0];
+}
+
 export const metadata = {
   title: "Posts - PostFlow",
   description: "Manage and track your published Facebook Group posts.",
@@ -193,12 +202,14 @@ export default async function PostsPage({
                   <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-normal text-muted-foreground">Groups</th>
                   <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-normal text-muted-foreground">Status</th>
                   <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-normal text-muted-foreground">Created</th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-normal text-muted-foreground">Scheduled</th>
                   <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-normal text-muted-foreground">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-border">
                 {posts.map((post) => {
                   const failureReason = getFailureReason(post.jobs);
+                  const scheduledFor = getScheduledTime(post.jobs);
                   return (
                     <tr key={post._id} className="transition-colors hover:bg-accent/70">
                       <td className="max-w-xs px-4 py-4">
@@ -230,6 +241,9 @@ export default async function PostsPage({
                           <Clock className="h-3.5 w-3.5" />
                           <span>{timeAgo(post.createdAt)}</span>
                         </div>
+                      </td>
+                      <td className="px-4 py-4">
+                        <ScheduledTime value={scheduledFor} className="text-muted-foreground" />
                       </td>
                       <td className="px-4 py-4 text-right">
                         <Link

@@ -25,6 +25,10 @@ export class PublishingJob {
   @Prop({ required: true, default: 0 })
   attempts: number;
 
+  /** Stable position inside the Post Flow, used when recalculating schedules. */
+  @Prop({ default: 0 })
+  flowOrder: number;
+
   @Prop()
   error?: string;
 

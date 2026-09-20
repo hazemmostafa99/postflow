@@ -30,6 +30,8 @@ interface GroupsResponse {
 const GROUPS_PER_PAGE = 20;
 const MAX_MEDIA_FILES = 4;
 const MAX_MEDIA_FILE_SIZE = 2 * 1024 * 1024;
+const MAX_VIDEO_FILES = 1;
+const MAX_VIDEO_FILE_SIZE = 25 * 1024 * 1024;
 
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -46,6 +48,9 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
   const [selectedGroupsById, setSelectedGroupsById] = useState<Map<string, Group>>(new Map());
   const [content, setContent] = useState("");
   const [mediaUrls, setMediaUrls] = useState<string[]>([]);
+  const [startTime, setStartTime] = useState("");
+  const [spacePostsApart, setSpacePostsApart] = useState(false);
+  const [spacingMinutes, setSpacingMinutes] = useState(3);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isReadingMedia, setIsReadingMedia] = useState(false);
   const [isLoadingGroups, setIsLoadingGroups] = useState(false);
@@ -123,11 +128,15 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
     setError(null);
 
     if (!content.trim() && mediaUrls.length === 0) {
-      setError("Please write content or attach at least one image.");
+      setError("Please write content or attach at least one image or video.");
       return;
     }
     if (selectedGroupsById.size === 0) {
       setError("Please select at least one group to publish to.");
+      return;
+    }
+    if (spacePostsApart && !startTime) {
+      setError("Choose a start time before spacing posts apart.");
       return;
     }
 
@@ -140,6 +149,9 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
           content: content.trim(),
           mediaUrls,
           targetGroupIds: Array.from(selectedGroupsById.keys()),
+          ...(startTime ? { startTime: new Date(startTime).toISOString() } : {}),
+          spacePostsApart,
+          ...(spacePostsApart ? { spacingMinutes } : {}),
         }),
       });
 
@@ -177,19 +189,28 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
     setError(null);
 
     if (mediaUrls.length + files.length > MAX_MEDIA_FILES) {
-      setError(`You can attach up to ${MAX_MEDIA_FILES} images.`);
+      setError(`You can attach up to ${MAX_MEDIA_FILES} media files.`);
       return;
     }
 
-    const invalidFile = files.find((file) => !file.type.startsWith("image/"));
+    const invalidFile = files.find((file) => !file.type.startsWith("image/") && !file.type.startsWith("video/"));
     if (invalidFile) {
-      setError("Only image files are supported right now.");
+      setError("Only image and video files are supported.");
       return;
     }
 
-    const oversizedFile = files.find((file) => file.size > MAX_MEDIA_FILE_SIZE);
+    const videoCount = mediaUrls.filter((url) => url.startsWith("data:video/")).length;
+    const newVideoCount = files.filter((file) => file.type.startsWith("video/")).length;
+    if (videoCount + newVideoCount > MAX_VIDEO_FILES) {
+      setError("You can attach one video per post.");
+      return;
+    }
+
+    const oversizedFile = files.find((file) =>
+      file.type.startsWith("video/") ? file.size > MAX_VIDEO_FILE_SIZE : file.size > MAX_MEDIA_FILE_SIZE,
+    );
     if (oversizedFile) {
-      setError("Each image must be 2MB or smaller.");
+      setError(oversizedFile.type.startsWith("video/") ? "Videos must be 25MB or smaller." : "Images must be 2MB or smaller.");
       return;
     }
 
@@ -198,7 +219,7 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
       const urls = await Promise.all(files.map(readFileAsDataUrl));
       setMediaUrls((prev) => [...prev, ...urls]);
     } catch {
-      setError("Could not read one of the selected images.");
+      setError("Could not read one of the selected media files.");
     } finally {
       setIsReadingMedia(false);
     }
@@ -236,6 +257,61 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
         </p>
       </div>
 
+      <div className="space-y-3 rounded-lg border border-border bg-muted/20 p-3">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="space-y-1.5">
+            <label htmlFor="start-time" className="text-sm font-medium text-foreground">
+              Start time <span className="font-normal text-muted-foreground">(optional)</span>
+            </label>
+            <input
+              id="start-time"
+              type="datetime-local"
+              value={startTime}
+              onChange={(e) => setStartTime(e.target.value)}
+              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm shadow-sm focus:outline-none focus:ring-3 focus:ring-ring/20"
+            />
+          </div>
+          <label className="flex cursor-pointer items-center gap-2 self-end pb-2 text-sm font-medium text-foreground">
+            <input
+              type="checkbox"
+              checked={spacePostsApart}
+              onChange={(e) => setSpacePostsApart(e.target.checked)}
+              className="h-4 w-4 accent-primary"
+            />
+            Space posts apart
+          </label>
+        </div>
+        {spacePostsApart && (
+          <div className="max-w-xs space-y-1.5">
+            <label htmlFor="spacing-minutes" className="text-xs font-medium text-muted-foreground">
+              Minimum time between posts
+            </label>
+            <select
+              id="spacing-minutes"
+              value={spacingMinutes}
+              onChange={(e) => setSpacingMinutes(Number(e.target.value))}
+              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm shadow-sm focus:outline-none focus:ring-3 focus:ring-ring/20"
+            >
+              {[1, 2, 3, 5, 10, 15, 30].map((minutes) => (
+                <option key={minutes} value={minutes}>{minutes} minute{minutes === 1 ? "" : "s"}</option>
+              ))}
+            </select>
+          </div>
+        )}
+        {startTime && selectedGroups.length > 0 && (
+          <div className="text-xs text-muted-foreground">
+            {selectedGroups.map((group, index) => (
+              <div key={group._id} className="flex justify-between gap-4 py-0.5">
+                <span className="truncate">{index + 1}. {group.name}</span>
+                <span className="shrink-0">
+                  {new Date(new Date(startTime).getTime() + index * (spacePostsApart ? spacingMinutes : 0) * 60_000).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
       <div className="space-y-2">
         <div className="flex items-center justify-between">
           <label className="text-sm font-medium text-foreground">
@@ -246,10 +322,10 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
           </label>
           <label className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-xs font-medium text-primary transition-colors hover:bg-accent">
             {isReadingMedia ? <Loader2 className="h-3 w-3 animate-spin" /> : <ImagePlus className="h-3 w-3" />}
-            Add images
+            Add images or video
             <input
               type="file"
-              accept="image/*"
+              accept="image/*,video/*"
               multiple
               onChange={handleMediaChange}
               disabled={isReadingMedia || mediaUrls.length >= MAX_MEDIA_FILES}
@@ -262,12 +338,16 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
           <div className="grid grid-cols-4 gap-2">
             {mediaUrls.map((url, index) => (
               <div key={`${url.slice(0, 32)}-${index}`} className="group relative aspect-square overflow-hidden rounded-lg border border-border bg-muted shadow-sm">
-                <img src={url} alt="" className="h-full w-full object-cover" />
+                {url.startsWith("data:video/") ? (
+                  <video src={url} controls className="h-full w-full object-cover" />
+                ) : (
+                  <img src={url} alt="" className="h-full w-full object-cover" />
+                )}
                 <button
                   type="button"
                   onClick={() => removeMedia(index)}
                   className="absolute right-1 top-1 inline-flex h-7 w-7 items-center justify-center rounded-md bg-background/95 text-muted-foreground opacity-0 shadow-sm transition-opacity hover:text-foreground group-hover:opacity-100"
-                  aria-label="Remove image"
+                  aria-label="Remove media"
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                 </button>

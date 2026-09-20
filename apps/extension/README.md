@@ -13,7 +13,7 @@ The extension connects the local PostFlow dashboard/API with Facebook. It detect
 
 Build-time public API configuration is committed in:
 
-- `.env.development`: `API_BASE_URL=http://localhost:5000`
+- `.env.development`: `API_BASE_URL=http://localhost:8000`
 - `.env.production`: `API_BASE_URL=https://api.fitcure.online`
 
 The build reads the selected file using Node's `parseEnv` and generates
@@ -82,7 +82,7 @@ To identify the active environment, click the extension's **service worker**
 link on `chrome://extensions` and open **Console**. Each service worker start logs:
 
 ```text
-[PostFlow] DEV environment | API: http://localhost:5000
+[PostFlow] DEV environment | API: http://localhost:8000
 # Or:
 [PostFlow] PROD environment | API: https://api.fitcure.online
 ```

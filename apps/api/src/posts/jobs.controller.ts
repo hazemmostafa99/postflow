@@ -30,9 +30,33 @@ type PostEngagementSyncResult = {
 function isPendingFacebookPostUrl(value?: string): boolean {
   if (!value) return false;
   try {
-    return /^\/groups\/[^/]+\/pending_posts\/\d+/i.test(new URL(value).pathname);
+    return /^\/groups\/[^/]+\/pending_posts\/[A-Za-z0-9_-]+/i.test(new URL(value).pathname);
   } catch {
     return false;
+  }
+}
+
+function normalizeFacebookGroupPostUrl(value?: string): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    if (host !== 'facebook.com' && !host.endsWith('.facebook.com')) return value;
+    const match = url.pathname.match(/^\/groups\/([^/]+)\/(posts|permalink|pending_posts)\/([A-Za-z0-9_-]+)/i);
+    if (!match) return value;
+    return `https://www.facebook.com/groups/${match[1]}/${match[2]}/${match[3]}/`;
+  } catch {
+    return value;
+  }
+}
+
+function getFacebookPostIdentity(value?: string): string | undefined {
+  const normalized = normalizeFacebookGroupPostUrl(value);
+  if (!normalized) return undefined;
+  try {
+    return new URL(normalized).pathname.match(/^\/groups\/[^/]+\/(?:posts|permalink|pending_posts)\/([A-Za-z0-9_-]+)/i)?.[1];
+  } catch {
+    return undefined;
   }
 }
 
@@ -59,8 +83,13 @@ export class JobsController {
       .findOne({
         postId: { $in: postIds } as any,
         status: 'PENDING',
+        $or: [
+          { scheduledFor: { $exists: false } },
+          { scheduledFor: null },
+          { scheduledFor: { $lte: new Date() } },
+        ],
       })
-      .sort({ createdAt: 1 })
+      .sort({ scheduledFor: 1, flowOrder: 1, createdAt: 1 })
       .populate('postId', 'content mediaUrls')
       .populate('groupId', 'name url externalId')
       .exec();
@@ -260,11 +289,19 @@ export class JobsController {
     if (post.clerkUserId !== clerkUserId) {
       throw new UnauthorizedException('Not your job');
     }
+    const normalizedBodyPostUrl = normalizeFacebookGroupPostUrl(body.postUrl);
+    if (job.postUrl) {
+      const normalizedExistingPostUrl = normalizeFacebookGroupPostUrl(job.postUrl);
+      if (normalizedExistingPostUrl && normalizedExistingPostUrl !== job.postUrl) {
+        job.postUrl = normalizedExistingPostUrl;
+      }
+    }
+
     if (job.submissionStatus === FacebookSubmissionStatus.PUBLISHED) {
-      if (isPendingFacebookPostUrl(job.postUrl) && (body.status === 'STILL_PENDING' || isPendingFacebookPostUrl(body.postUrl))) {
+      if (isPendingFacebookPostUrl(job.postUrl) && (body.status === 'STILL_PENDING' || isPendingFacebookPostUrl(normalizedBodyPostUrl))) {
         const checkedAt = new Date();
         job.submissionStatus = FacebookSubmissionStatus.PENDING_APPROVAL;
-        if (body.postUrl) job.postUrl = body.postUrl;
+        if (normalizedBodyPostUrl) job.postUrl = normalizedBodyPostUrl;
         job.lastCheckedAt = checkedAt;
         job.syncAttempts = (job.syncAttempts ?? 0) + 1;
         job.lastSyncError = undefined;
@@ -275,9 +312,16 @@ export class JobsController {
         await job.save();
         return job;
       }
-      if (body.status === 'PUBLISHED' && body.postUrl && !job.postUrl) {
+      if (
+        body.status === 'PUBLISHED' &&
+        normalizedBodyPostUrl &&
+        (
+          !job.postUrl ||
+          getFacebookPostIdentity(job.postUrl) === getFacebookPostIdentity(normalizedBodyPostUrl)
+        )
+      ) {
         const checkedAt = new Date();
-        job.postUrl = body.postUrl;
+        job.postUrl = normalizedBodyPostUrl;
         job.publishedDetectedAt ??= checkedAt;
         job.lastCheckedAt = checkedAt;
         job.syncAttempts = (job.syncAttempts ?? 0) + 1;
@@ -297,7 +341,7 @@ export class JobsController {
 
     if (body.status === 'PUBLISHED') {
       job.submissionStatus = FacebookSubmissionStatus.PUBLISHED;
-      if (body.postUrl) job.postUrl = body.postUrl;
+      if (normalizedBodyPostUrl) job.postUrl = normalizedBodyPostUrl;
       job.publishedDetectedAt ??= checkedAt;
       job.lastSyncError = undefined;
       job.nextCheckAt = undefined;
@@ -365,15 +409,16 @@ export class JobsController {
     job.status = body.status;
     job.error = body.status === 'FAILED' ? body.error : undefined;
     if (body.submissionResult) {
+      const normalizedSubmissionPostUrl = normalizeFacebookGroupPostUrl(body.submissionResult.postUrl);
       job.submissionStatus = body.submissionResult.status;
       // A later retry may report the status without repeating the permalink.
       // Never erase a URL that was already captured successfully.
       if (
         (body.submissionResult.status === FacebookSubmissionStatus.PUBLISHED ||
           body.submissionResult.status === FacebookSubmissionStatus.PENDING_APPROVAL) &&
-        body.submissionResult.postUrl
+        normalizedSubmissionPostUrl
       ) {
-        job.postUrl = body.submissionResult.postUrl;
+        job.postUrl = normalizedSubmissionPostUrl;
       }
       if (body.submissionResult.status === FacebookSubmissionStatus.UNKNOWN) {
         job.postUrl = undefined;

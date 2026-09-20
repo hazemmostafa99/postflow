@@ -61,7 +61,12 @@ async function apiFetch(path: string, body?: Record<string, unknown>, method?: s
 
     return text ? JSON.parse(text) : null;
   } catch (err) {
-    console.error('[PostFlow] Network error:', { method: httpMethod, path, url, err });
+    console.error('[PostFlow] Network error:', {
+      method: httpMethod,
+      path,
+      url,
+      error: err instanceof Error ? err.message : String(err),
+    });
     return null;
   }
 }
@@ -247,7 +252,12 @@ let isCheckingPendingPost = false;
 let isFacebookSyncBusy = false;
 let pendingCheckSequence = 0;
 let finishExecutionHandshake: (() => void) | null = null;
-let activeExecution: { jobId: string; tabId: number } | null = null;
+let activeExecution: {
+  jobId: string;
+  tabId: number;
+  group?: any;
+  post?: any;
+} | null = null;
 
 async function checkPendingJobs() {
   if (isProcessingJob || isFacebookSyncBusy) {
@@ -308,7 +318,12 @@ async function checkPendingJobs() {
       return;
     }
     const readyTabId = tabId;
-    activeExecution = { jobId: job._id, tabId: readyTabId };
+    activeExecution = {
+      jobId: job._id,
+      tabId: readyTabId,
+      group: job.groupId,
+      post: job.postId,
+    };
 
     // tabs.update/tabs.create resolves before the old Facebook document has
     // necessarily been replaced. Sending EXECUTE_JOB immediately can make
@@ -487,6 +502,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
     if (!isCurrentExecutionResult(message, sender)) return;
     void (async () => {
       console.log('[PostFlow] Job succeeded:', message.jobId);
+      const completedExecution = activeExecution;
       finishExecutionHandshake?.();
       await updateJobStatus(message.jobId, {
         status: 'SUCCESS',
@@ -494,6 +510,53 @@ chrome.runtime.onMessage.addListener((message, sender) => {
       });
       isProcessingJob = false;
       activeExecution = null;
+
+      const completedMediaUrls = Array.isArray(completedExecution?.post?.mediaUrls)
+        ? completedExecution.post.mediaUrls
+        : [];
+      const completedPostHasVideo = completedMediaUrls.some((url: unknown) => typeof url === 'string' && url.startsWith('data:video/'));
+      const shouldRunAutomaticPostLinkCheck = Boolean(
+        completedExecution?.group &&
+        completedExecution.post &&
+        (
+          (
+            message.submissionResult?.status === 'PUBLISHED' &&
+            !message.submissionResult.postUrl
+          ) ||
+          (
+            message.submissionResult?.status === 'UNKNOWN' &&
+            completedPostHasVideo
+          )
+        ),
+      );
+
+      if (shouldRunAutomaticPostLinkCheck && completedExecution?.group && completedExecution.post) {
+        const syncPost: PendingFacebookPost = {
+          id: message.jobId,
+          groupId: String(completedExecution.group._id ?? completedExecution.group.id ?? ''),
+          groupExternalId: completedExecution.group.externalId,
+          groupUrl: completedExecution.group.url,
+          status: 'PENDING_APPROVAL',
+          content: completedExecution.post.content,
+          submittedAt: new Date().toISOString(),
+          mediaCount: Array.isArray(completedExecution.post.mediaUrls)
+            ? completedExecution.post.mediaUrls.length
+            : 0,
+        };
+        console.log('[PostFlow] Starting automatic post-link check after publish result', {
+          jobId: message.jobId,
+          publishStatus: message.submissionResult?.status,
+          hasVideo: completedPostHasVideo,
+        });
+        const syncResult = await checkSinglePendingPost(syncPost);
+        const updated = await persistPendingSyncResult(syncPost, syncResult);
+        console.log('[PostFlow] Automatic post-link check finished', {
+          jobId: message.jobId,
+          status: syncResult.status,
+          updated,
+        });
+      }
+
       checkPendingJobs();
     })();
   }
@@ -545,7 +608,7 @@ async function checkSinglePendingPost(post: PendingFacebookPost, lockAlreadyHeld
     if (post.postUrl) {
       try {
         const savedUrl = new URL(post.postUrl);
-        if (/^\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/\d+/i.test(savedUrl.pathname)) {
+        if (/^\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/[A-Za-z0-9_-]+/i.test(savedUrl.pathname)) {
           checkUrl = savedUrl.href;
         }
       } catch {
@@ -606,12 +669,12 @@ async function waitForFacebookTabAfterNavigation(tabId: number, targetUrl: strin
   let targetPath = '';
   let targetGroupPath = '';
   let targetPostIdentity = '';
-  const targetIsPost = /\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/\d+/i.test(targetUrl);
+  const targetIsPost = /\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/[A-Za-z0-9_-]+/i.test(targetUrl);
   try {
     const parsedTarget = new URL(targetUrl);
     targetPath = parsedTarget.pathname.replace(/\/+$/, '').toLowerCase();
     targetGroupPath = parsedTarget.pathname.match(/^\/groups\/[^/]+/i)?.[0].toLowerCase() ?? '';
-    targetPostIdentity = parsedTarget.pathname.match(/^\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/(\d+)/i)?.[1] ?? '';
+    targetPostIdentity = parsedTarget.pathname.match(/^\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/([A-Za-z0-9_-]+)/i)?.[1] ?? '';
   } catch {
     return false;
   }
@@ -621,7 +684,7 @@ async function waitForFacebookTabAfterNavigation(tabId: number, targetUrl: strin
       const tab = await chrome.tabs.get(tabId);
       const currentUrl = tab.url ?? '';
       const currentPath = currentUrl ? new URL(currentUrl).pathname.replace(/\/+$/, '').toLowerCase() : '';
-      const currentPostIdentity = currentPath.match(/^\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/(\d+)/i)?.[1] ?? '';
+      const currentPostIdentity = currentPath.match(/^\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/([A-Za-z0-9_-]+)/i)?.[1] ?? '';
       const landedOnTarget = currentPath === targetPath ||
         (targetIsPost && currentPath === targetGroupPath) ||
         (targetIsPost && targetPostIdentity && currentPostIdentity === targetPostIdentity);

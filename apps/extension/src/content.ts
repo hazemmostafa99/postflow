@@ -72,6 +72,200 @@ let lastSentSignature = "";
 let isExecutingJob = false;
 let activeJobId: string | null = null;
 
+interface FacebookResponseCandidateDetail {
+  requestUrl?: string;
+  postUrls?: unknown[];
+  storyFbids?: unknown[];
+  videoIds?: unknown[];
+  uploadSessionIds?: unknown[];
+}
+
+type PublishCandidateSource = 'response-post-url' | 'response-story-fbid';
+
+interface PublishTrackingCandidate {
+  source: PublishCandidateSource;
+  value: string;
+  requestUrl?: string;
+  observedAt: number;
+}
+
+interface PublishTrackingSession {
+  jobId: string;
+  groupId?: string;
+  submittedAt: number;
+  hasVideo: boolean;
+  existingPostUrls: ReadonlySet<string>;
+  candidates: PublishTrackingCandidate[];
+  candidateKeys: Set<string>;
+  mediaVideoIds: Set<string>;
+  uploadSessionIds: Set<string>;
+}
+
+let activePublishTrackingSession: PublishTrackingSession | null = null;
+
+function createPublishTrackingSession(options: {
+  jobId: string;
+  groupId?: string;
+  submittedAt: number;
+  hasVideo: boolean;
+  existingPostUrls: ReadonlySet<string>;
+}): PublishTrackingSession {
+  const session: PublishTrackingSession = {
+    ...options,
+    candidates: [],
+    candidateKeys: new Set(),
+    mediaVideoIds: new Set(),
+    uploadSessionIds: new Set(),
+  };
+  console.log('[PostTracking] Publish tracking session started', {
+    jobId: session.jobId,
+    groupId: session.groupId,
+    hasVideo: session.hasVideo,
+    existingPostUrlCount: session.existingPostUrls.size,
+  });
+  return session;
+}
+
+function normalizeTrackedPostUrl(value: string): string | null {
+  try {
+    const url = new URL(value, window.location.origin);
+    const path = url.pathname.replace(/\/+$/, '');
+    if (!/^\/groups\/[^/]+\/(?:posts|permalink|pending_posts)\/[A-Za-z0-9_-]+/i.test(path)) return null;
+    url.search = '';
+    url.hash = '';
+    return url.href.replace(/\/$/, '').toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function addPublishCandidate(
+  session: PublishTrackingSession,
+  source: PublishCandidateSource,
+  value: string,
+  requestUrl?: string,
+): void {
+  const key = `${source}:${value}`;
+  if (session.candidateKeys.has(key)) return;
+  session.candidateKeys.add(key);
+  session.candidates.push({ source, value, requestUrl, observedAt: Date.now() });
+}
+
+function trackFacebookResponseCandidates(detail: FacebookResponseCandidateDetail): void {
+  const session = activePublishTrackingSession;
+  if (!session) return;
+
+  const postUrls = Array.isArray(detail.postUrls)
+    ? detail.postUrls.filter((url): url is string => typeof url === 'string')
+    : [];
+  const storyFbids = Array.isArray(detail.storyFbids)
+    ? detail.storyFbids.filter((value): value is string => typeof value === 'string' && /^\d+$/.test(value))
+    : [];
+  const videoIds = Array.isArray(detail.videoIds)
+    ? detail.videoIds.filter((value): value is string => typeof value === 'string' && /^\d+$/.test(value))
+    : [];
+  const uploadSessionIds = Array.isArray(detail.uploadSessionIds)
+    ? detail.uploadSessionIds.filter((value): value is string => typeof value === 'string' && /^\d+$/.test(value))
+    : [];
+
+  if (!session.hasVideo) {
+    for (const postUrl of postUrls) addPublishCandidate(session, 'response-post-url', postUrl, detail.requestUrl);
+  } else if (postUrls.length) {
+    console.log('[PostTracking] Ignoring direct network post URLs during video publish', {
+      jobId: session.jobId,
+      postUrlCount: postUrls.length,
+      reason: 'video responses can include unrelated feed stories',
+      requestUrl: detail.requestUrl,
+    });
+  }
+  for (const storyFbid of storyFbids) addPublishCandidate(session, 'response-story-fbid', storyFbid, detail.requestUrl);
+  for (const videoId of videoIds) session.mediaVideoIds.add(videoId);
+  for (const uploadSessionId of uploadSessionIds) session.uploadSessionIds.add(uploadSessionId);
+
+  if (postUrls.length || storyFbids.length || videoIds.length || uploadSessionIds.length) {
+    console.log('[PostTracking] Facebook network candidates observed', {
+      jobId: session.jobId,
+      postUrlCount: postUrls.length,
+      storyFbidCount: storyFbids.length,
+      videoIdCount: videoIds.length,
+      uploadSessionIdCount: uploadSessionIds.length,
+      requestUrl: detail.requestUrl,
+    });
+  }
+}
+
+function getBestNetworkPostUrl(session: PublishTrackingSession): string | null {
+  for (let index = session.candidates.length - 1; index >= 0; index--) {
+    const candidate = session.candidates[index];
+    const candidateUrl = candidate.source === 'response-story-fbid' && session.groupId
+      ? 'https://www.facebook.com/groups/' + session.groupId + '/posts/' + candidate.value + '/'
+      : candidate.value;
+    const normalizedCandidate = normalizeTrackedPostUrl(candidateUrl);
+    if (!normalizedCandidate) {
+      console.log('[PostTracking] Rejected network candidate', {
+        jobId: session.jobId,
+        source: candidate.source,
+        reason: 'not-a-group-post-url',
+      });
+      continue;
+    }
+    if (session.existingPostUrls.has(normalizedCandidate)) {
+      console.log('[PostTracking] Rejected network candidate', {
+        jobId: session.jobId,
+        source: candidate.source,
+        reason: 'already-present-before-submit',
+      });
+      continue;
+    }
+    const candidateGroupId = extractFacebookGroupIdFromUrl(candidateUrl);
+    const currentPageGroupId = extractFacebookGroupIdFromUrl(location.href);
+    if (
+      candidate.source === 'response-post-url' &&
+      session.groupId &&
+      candidateGroupId &&
+      candidateGroupId.toLowerCase() !== session.groupId.toLowerCase() &&
+      (!currentPageGroupId || candidateGroupId.toLowerCase() !== currentPageGroupId.toLowerCase())
+    ) {
+      console.log('[PostTracking] Rejected network candidate', {
+        jobId: session.jobId,
+        source: candidate.source,
+        reason: 'different-group',
+        candidateGroupId,
+        expectedGroupId: session.groupId,
+      });
+      continue;
+    }
+    console.log('[PostTracking] Accepted network candidate', {
+      jobId: session.jobId,
+      source: candidate.source,
+      postUrl: candidateUrl,
+      requestUrl: candidate.requestUrl,
+    });
+    return candidateUrl;
+  }
+  return null;
+}
+
+function injectFacebookResponseSpy(): void {
+  const script = document.createElement('script');
+  script.src = chrome.runtime.getURL('dist/graphql-spy.js');
+  script.onload = () => script.remove();
+  (document.head || document.documentElement).appendChild(script);
+}
+
+window.addEventListener('postflow:facebook-response', ((event: CustomEvent<FacebookResponseCandidateDetail>) => {
+  if (!isExecutingJob) return;
+  trackFacebookResponseCandidates(event.detail ?? {});
+}) as EventListener, false);
+
+window.addEventListener('message', ((event: MessageEvent<FacebookResponseCandidateDetail & { source?: string; type?: string }>) => {
+  if (event.source !== window || event.data?.source !== 'postflow-graphql-spy' || event.data.type !== 'facebook-response') return;
+  if (!isExecutingJob) return;
+  trackFacebookResponseCandidates(event.data);
+}) as EventListener, false);
+
+injectFacebookResponseSpy();
+
 // ── Cleanup registry ──
 
 let mutationObserver: MutationObserver | null = null;
@@ -1001,8 +1195,23 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
       const existingPostElements = new Set<Element>([
         ...document.querySelectorAll('[role="article"], [data-pagelet*="FeedUnit"]'),
       ]);
+      const existingPostUrls = new Set(
+        Array.from(existingPostElements)
+          .map((element) => extractPostPermalink(element, currentGroupId))
+          .filter((url): url is string => Boolean(url))
+          .map((url) => normalizeTrackedPostUrl(url) ?? url.replace(/\/$/, '').toLowerCase()),
+      );
       const submittedAt = Date.now();
       const initialPageUrl = location.href;
+      const hasVideo = mediaUrls.some((url: string) => url.startsWith('data:video/'));
+      const trackingSession = createPublishTrackingSession({
+        jobId,
+        groupId: currentGroupId,
+        submittedAt,
+        hasVideo,
+        existingPostUrls,
+      });
+      activePublishTrackingSession = trackingSession;
 
       (postButton as HTMLElement).click();
       console.log('[PostFlow] Post button clicked, waiting for publish confirmation...');
@@ -1049,7 +1258,24 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
           element.getAttribute('title') ?? '',
         ].join(' ');
       };
+      const videoProcessingCues = [
+        'processing your video',
+        'your video is being processed',
+        'we are processing the video',
+        'we\'re processing the video',
+        'جارٍ معالجة الفيديو',
+        'تجري الآن معالجة الفيديو',
+      ];
+      const isVideoProcessingVisible = () => {
+        if (!hasVideo) return false;
+        const pageText = (document.body.innerText ?? '').toLowerCase();
+        return videoProcessingCues.some((cue) => pageText.includes(cue.toLowerCase()));
+      };
       const getPublishSuccessEvidence = () => {
+        // This is an intermediate confirmation. Do not finish the job until
+        // Facebook renders the submitted post/permalink or the longer video
+        // polling window expires.
+        if (isVideoProcessingVisible()) return 'Facebook accepted the video and is processing it';
         const semanticSurfaces = Array.from(document.querySelectorAll(
           '[role="alert"], [role="status"], [aria-live], [data-visualcompletion="ignore-dynamic"]',
         ));
@@ -1071,9 +1297,13 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
         root: document,
         submittedText: post.content ?? '',
         submittedAt,
-        timeout: POSTING_TIMING.publishConfirmationTimeoutMs,
+        timeout: hasVideo
+          ? POSTING_TIMING.videoPublishConfirmationTimeoutMs
+          : POSTING_TIMING.publishConfirmationTimeoutMs,
         interval: POSTING_TIMING.publishPollIntervalMs,
         existingPostElements,
+        existingPostUrls,
+        submittedMediaCount: mediaUrls.length,
         currentGroupId,
         initialPageUrl,
         getFailureReason: () => {
@@ -1084,13 +1314,26 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
             : null;
         },
         getSuccessEvidence: getPublishSuccessEvidence,
+        getNetworkPostUrl: () => getBestNetworkPostUrl(trackingSession),
       });
 
       recordPostingStep(jobId, 'submission_result_detected', {
         status: submissionResult.status,
         postUrl: 'postUrl' in submissionResult ? submissionResult.postUrl : undefined,
         reason: submissionResult.status === 'UNKNOWN' ? submissionResult.reason : undefined,
+        networkCandidates: trackingSession.candidates.length,
+        videoIds: trackingSession.mediaVideoIds.size,
+        uploadSessionIds: trackingSession.uploadSessionIds.size,
       });
+      console.log('[PostTracking] Publish tracking session ended', {
+        jobId,
+        status: submissionResult.status,
+        postUrl: 'postUrl' in submissionResult ? submissionResult.postUrl : undefined,
+        networkCandidates: trackingSession.candidates.length,
+        videoIds: Array.from(trackingSession.mediaVideoIds),
+        uploadSessionIds: Array.from(trackingSession.uploadSessionIds),
+      });
+      if (activePublishTrackingSession === trackingSession) activePublishTrackingSession = null;
       resolve(submissionResult);
       return;
 
@@ -1134,6 +1377,7 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
       recordPostingStep(jobId, 'job_failed_in_content_script', { error: err?.message ?? String(err) });
       reject(err);
     } finally {
+      if (activeJobId === jobId) activePublishTrackingSession = null;
       isExecutingJob = false;
       activeJobId = null;
     }
@@ -1154,7 +1398,7 @@ function clickLikeUser(element: HTMLElement) {
 }
 
 function dataUrlToFile(dataUrl: string, index: number): File {
-  const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.*)$/);
+  const match = dataUrl.match(/^data:((?:image|video)\/[a-zA-Z0-9.+-]+);base64,(.*)$/);
   if (!match) {
     throw new Error('Unsupported media format');
   }
@@ -1241,7 +1485,9 @@ async function attachMediaToDialog(dialog: Element, mediaUrls: string[]) {
       const alt = image.alt.toLowerCase();
       return src.startsWith('blob:') || src.startsWith('data:') || alt.includes('photo') || alt.includes('image');
     });
-    return hasPreviewImage ||
+    const videos = Array.from(dialog.querySelectorAll<HTMLVideoElement>('video'));
+    const hasPreviewVideo = videos.some((video) => video.currentSrc || video.src);
+    return hasPreviewImage || hasPreviewVideo ||
       text.includes('photos/videos') ||
       text.includes('photo/video') ||
       text.includes('edit all') ||

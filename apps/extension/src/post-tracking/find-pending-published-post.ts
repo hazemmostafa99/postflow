@@ -21,7 +21,7 @@ function getFacebookPostIdentity(value?: string): string | null {
   if (!value) return null;
   try {
     const path = new URL(value, window.location.origin).pathname;
-    return path.match(/^\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/(\d+)/i)?.[1] ?? null;
+    return path.match(/^\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/([A-Za-z0-9_-]+)/i)?.[1] ?? null;
   } catch {
     return null;
   }
@@ -30,7 +30,7 @@ function getFacebookPostIdentity(value?: string): string | null {
 function isFacebookPendingUrl(value?: string): boolean {
   if (!value) return false;
   try {
-    return /^\/groups\/[^/]+\/pending_posts\/\d+/i.test(new URL(value).pathname);
+    return /^\/groups\/[^/]+\/pending_posts\/[A-Za-z0-9_-]+/i.test(new URL(value).pathname);
   } catch {
     return false;
   }
@@ -44,10 +44,8 @@ function getCurrentFacebookPostUrl(expectedPostUrl?: string): string | null {
     const path = url.pathname.replace(/\/+$/, '');
     const currentIdentity = getFacebookPostIdentity(url.href);
     if (!currentIdentity || currentIdentity !== expectedIdentity || isFacebookPendingUrl(url.href)) return null;
-    if (!/^\/groups\/[^/]+\/(?:posts|permalink)\/\d+/i.test(path)) return null;
-    url.search = '';
-    url.hash = '';
-    return url.href;
+    if (!/^\/groups\/[^/]+\/(?:posts|permalink)\/[A-Za-z0-9_-]+/i.test(path)) return null;
+    return normalizeFacebookGroupPostUrl(url.href);
   } catch {
     return null;
   }

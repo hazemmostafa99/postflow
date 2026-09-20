@@ -11,7 +11,7 @@
   ],
   "host_permissions": [
     "https://www.facebook.com/*",
-    "http://localhost:5000/*",
+    "http://localhost:8000/*",
     "https://api.fitcure.online/*",
     "https://fitcure.online/*",
     "http://localhost:3000/*"

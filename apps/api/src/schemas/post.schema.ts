@@ -17,6 +17,16 @@ export class Post {
   // DRAFT | PUBLISHING | COMPLETED | PARTIAL_FAILURE
   @Prop({ required: true, default: 'DRAFT' })
   status: string;
+
+  /** Optional Post Flow scheduling configuration. */
+  @Prop()
+  startTime?: Date;
+
+  @Prop({ default: false })
+  spacePostsApart: boolean;
+
+  @Prop()
+  spacingMinutes?: number;
 }
 
 export const PostSchema = SchemaFactory.createForClass(Post);

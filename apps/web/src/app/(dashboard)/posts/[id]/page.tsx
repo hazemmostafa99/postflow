@@ -4,6 +4,8 @@ import Link from "next/link";
 import { AlertCircle, ArrowLeft, Clock, ExternalLink, Users } from "lucide-react";
 import { RefreshGroupStatusButton, RefreshPostStatusControls } from "@/components/refresh-post-status-controls";
 import { RefreshPostEngagementButton, RefreshAllPostEngagementButton } from "@/components/refresh-post-engagement-button";
+import { ScheduledTime } from "@/components/scheduled-time";
+import { PostScheduleEditor } from "@/components/post-schedule-editor";
 
 const API_BASE = process.env.API_URL || "http://localhost:8000";
 
@@ -32,6 +34,7 @@ interface Job {
   };
   lastEngagementSyncAt?: string;
   lastEngagementSyncError?: string;
+  scheduledFor?: string;
 }
 
 interface Post {
@@ -40,6 +43,9 @@ interface Post {
   mediaUrls: string[];
   status: string;
   createdAt: string;
+  startTime?: string;
+  spacePostsApart?: boolean;
+  spacingMinutes?: number;
   jobs: Job[];
 }
 
@@ -211,12 +217,21 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
             {post.mediaUrls?.length > 0 && (
               <div className="mt-4 grid grid-cols-2 gap-2">
                 {post.mediaUrls.map((url, index) => (
-                  <img
-                    key={`${post._id}-media-${index}`}
-                    src={url}
-                    alt=""
-                    className="aspect-square w-full rounded-md border border-border object-cover"
-                  />
+                  url.startsWith("data:video/") ? (
+                    <video
+                      key={`${post._id}-media-${index}`}
+                      src={url}
+                      controls
+                      className="aspect-square w-full rounded-md border border-border object-cover"
+                    />
+                  ) : (
+                    <img
+                      key={`${post._id}-media-${index}`}
+                      src={url}
+                      alt=""
+                      className="aspect-square w-full rounded-md border border-border object-cover"
+                    />
+                  )
                 ))}
               </div>
             )}
@@ -234,6 +249,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
               <thead>
                 <tr className="border-b border-border bg-muted/40">
                   <th className="text-left px-4 py-3 font-medium text-muted-foreground">Group</th>
+                  <th className="text-left px-4 py-3 font-medium text-muted-foreground">Scheduled</th>
                   <th className="text-left px-4 py-3 font-medium text-muted-foreground">Status</th>
                   <th className="text-left px-4 py-3 font-medium text-muted-foreground">Engagement</th>
                   <th className="text-right px-4 py-3 font-medium text-muted-foreground">Attempts</th>
@@ -289,6 +305,9 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                       </div>
                     </td>
                     <td className="px-4 py-3 align-top pt-4">
+                      <ScheduledTime value={job.scheduledFor} className="text-xs text-muted-foreground" />
+                    </td>
+                    <td className="px-4 py-3 align-top pt-4">
                       <JobStatusBadge job={job} />
                     </td>
                     <td className="px-4 py-3 align-top pt-4">
@@ -319,6 +338,22 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
           </div>
         </div>
       </div>
+
+      <PostScheduleEditor
+        postId={post._id}
+        startTime={post.startTime}
+        spacePostsApart={post.spacePostsApart}
+        spacingMinutes={post.spacingMinutes}
+        readOnly={post.jobs.length > 0 && !post.jobs.some((job) => job.status === "PENDING")}
+        jobs={post.jobs
+          .map((job) => ({
+            _id: job._id,
+            groupName: job.groupId.name,
+            status: job.status,
+            submissionStatus: job.submissionStatus,
+            scheduledFor: job.scheduledFor,
+          }))}
+      />
     </div>
   );
 }

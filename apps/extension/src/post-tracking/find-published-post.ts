@@ -4,6 +4,9 @@ interface FindPublishedPostOptions {
   submittedAt: number;
   /** Capture visible post elements before clicking Post. */
   existingPostElements?: ReadonlySet<Element>;
+  /** Capture post permalinks before clicking Post; Facebook may re-render old nodes. */
+  existingPostUrls?: ReadonlySet<string>;
+  submittedMediaCount?: number;
   currentGroupId?: string;
 }
 
@@ -26,10 +29,17 @@ function isVisiblePostElement(element: Element): boolean {
 }
 
 /** Match text while tolerating Facebook whitespace changes and truncation. */
-function isSubmittedPostMatch(postElement: Element, submittedText: string): boolean {
+function isSubmittedPostMatch(
+  postElement: Element,
+  submittedText: string,
+  submittedMediaCount = 0,
+): boolean {
   const submitted = normalizePostText(submittedText);
   const candidate = normalizePostText(postElement.textContent ?? "");
-  if (!submitted || !candidate) return false;
+  if (!submitted) {
+    return submittedMediaCount > 0 && Boolean(postElement.querySelector('img, video'));
+  }
+  if (!candidate) return false;
   if (candidate.includes(submitted)) return true;
 
   const minimumComparableLength = Math.min(40, Math.ceil(submitted.length * 0.6));
@@ -92,6 +102,19 @@ function getGroupIdAliases(currentGroupId?: string): Set<string> {
   return aliases;
 }
 
+function normalizeFacebookGroupPostUrl(value?: string): string | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value, window.location.origin);
+    if (!isFacebookHost(url.hostname)) return null;
+    const match = url.pathname.match(/^\/groups\/([^/]+)\/(posts|permalink|pending_posts)\/([A-Za-z0-9_-]+)/i);
+    if (!match) return null;
+    return `https://www.facebook.com/groups/${match[1]}/${match[2]}/${match[3]}/`;
+  } catch {
+    return null;
+  }
+}
+
 /** Extract a Facebook Group post permalink from a post container. */
 function extractPostPermalink(postElement: Element, currentGroupId?: string): string | null {
   const groupAliases = getGroupIdAliases(currentGroupId);
@@ -104,7 +127,7 @@ function extractPostPermalink(postElement: Element, currentGroupId?: string): st
       if (!/^\/groups\/[^/]+\/(?:posts|permalink|pending_posts)\//i.test(path)) continue;
       const groupId = path.match(/^\/groups\/([^/]+)\//i)?.[1]?.toLowerCase();
       if (groupAliases.size && (!groupId || !groupAliases.has(groupId))) continue;
-      return url.href;
+      return normalizeFacebookGroupPostUrl(url.href);
     } catch {
       // Inspect the next anchor when Facebook exposes a malformed href.
     }
@@ -131,6 +154,8 @@ function findPublishedPost({
   submittedText,
   submittedAt,
   existingPostElements,
+  existingPostUrls,
+  submittedMediaCount,
   currentGroupId,
 }: FindPublishedPostOptions): PublishedPostMatch | null {
   const expectedGroupId = currentGroupId ?? getCurrentFacebookGroupId();
@@ -142,9 +167,10 @@ function findPublishedPost({
   for (const candidate of candidates) {
     if (seen.has(candidate) || !isVisiblePostElement(candidate)) continue;
     seen.add(candidate);
-    if (!isSubmittedPostMatch(candidate, submittedText)) continue;
+    if (!isSubmittedPostMatch(candidate, submittedText, submittedMediaCount)) continue;
     if (!isNewEvidence(candidate, submittedAt, existingPostElements)) continue;
     const postUrl = extractPostPermalink(candidate, currentGroupId) ?? undefined;
+    if (postUrl && existingPostUrls?.has((normalizeFacebookGroupPostUrl(postUrl) ?? postUrl).replace(/\/$/, '').toLowerCase())) continue;
     if (expectedGroupId && !postUrl) continue;
 
     return {

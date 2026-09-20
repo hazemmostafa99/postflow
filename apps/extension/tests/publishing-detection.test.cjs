@@ -102,6 +102,35 @@ test('new matching post is accepted before Facebook hydrates its timestamp', () 
   assert.equal(result?.postUrl, 'https://www.facebook.com/groups/123/posts/new-without-time/');
 });
 
+test('a re-rendered old post permalink is not treated as the submitted post', () => {
+  const app = setup(article({ post: 'old-rerendered', text: 'video post' }));
+  const result = app.context.findPublishedPost({
+    root: app.document,
+    submittedText: 'video post',
+    submittedAt: Date.parse('2026-09-19T12:00:00.000Z'),
+    existingPostElements: new Set(),
+    existingPostUrls: new Set(['https://www.facebook.com/groups/123/posts/old-rerendered']),
+    currentGroupId: '123',
+  });
+  assert.equal(result, null);
+});
+
+test('media-only posts can match a newly inserted post with media', () => {
+  const app = setup(`<div role="article">
+    <a href="https://www.facebook.com/groups/123/posts/video-new/">permalink</a>
+    <video src="blob:video-preview"></video>
+  </div>`);
+  const result = app.context.findPublishedPost({
+    root: app.document,
+    submittedText: '',
+    submittedAt: Date.parse('2026-09-19T12:00:00.000Z'),
+    existingPostElements: new Set(),
+    submittedMediaCount: 1,
+    currentGroupId: '123',
+  });
+  assert.equal(result?.postUrl, 'https://www.facebook.com/groups/123/posts/video-new/');
+});
+
 test('publish detection only accepts permalinks from the target group', () => {
   const app = setup([
     article({ group: '999', post: 'wrong', text: 'same content' }),

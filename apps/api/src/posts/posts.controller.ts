@@ -1,6 +1,7 @@
 import {
   Controller,
   Post,
+  Patch,
   Get,
   Delete,
   Param,
@@ -11,7 +12,7 @@ import {
   Query,
   UnauthorizedException,
 } from '@nestjs/common';
-import { PostsService, CreatePostDto } from './posts.service';
+import { PostsService, CreatePostDto, UpdatePostScheduleDto } from './posts.service';
 
 @Controller('api/posts')
 export class PostsController {
@@ -53,6 +54,17 @@ export class PostsController {
   ) {
     if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
     return this.postsService.getPost(clerkUserId, id);
+  }
+
+  /** PATCH /api/posts/:id/schedule — reschedule future jobs only. */
+  @Patch(':id/schedule')
+  async updateSchedule(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('id') id: string,
+    @Body() body: UpdatePostScheduleDto,
+  ) {
+    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    return this.postsService.updatePostSchedule(clerkUserId, id, body);
   }
 
   /** DELETE /api/posts - delete all posts and their publishing jobs */

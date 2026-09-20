@@ -20,6 +20,7 @@ interface PostFlowPostingTimingConfig {
   keyboardFallbackDelayMs: number;
   postButtonEnableTimeoutMs: number;
   publishConfirmationTimeoutMs: number;
+  videoPublishConfirmationTimeoutMs: number;
   publishPollIntervalMs: number;
   mediaButtonDelayMs: number;
   mediaInputTimeoutMs: number;
