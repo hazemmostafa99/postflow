@@ -9,6 +9,7 @@ interface WaitForPostSubmissionResultOptions {
   initialPageUrl?: string;
   getFailureReason?: () => string | null;
   getSuccessEvidence?: () => string | null;
+  getInterceptedPostUrl?: () => string | null;
 }
 
 function waitForTrackingDelay(milliseconds: number): Promise<void> {
@@ -48,6 +49,7 @@ async function waitForPostSubmissionResult({
   initialPageUrl,
   getFailureReason,
   getSuccessEvidence,
+  getInterceptedPostUrl,
 }: WaitForPostSubmissionResultOptions): Promise<FacebookPostSubmissionResult> {
   const startedAt = Date.now();
   const timeoutMs = Math.max(0, timeout);
@@ -83,6 +85,12 @@ async function waitForPostSubmissionResult({
 
       const failureReason = getFailureReason?.();
       if (failureReason) throw new Error(failureReason);
+
+      const interceptedPostUrl = getInterceptedPostUrl?.();
+      if (interceptedPostUrl) {
+        console.log("[PostTracking] Published post detected from GraphQL response", { postUrl: interceptedPostUrl });
+        return { status: "PUBLISHED", postUrl: interceptedPostUrl };
+      }
 
       const publishedPost = findPublishedPost({
         root,

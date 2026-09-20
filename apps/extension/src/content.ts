@@ -68,6 +68,26 @@ function recordPostingStep(jobId: string, step: string, details: PostingLogDetai
   }
 }
 const groups = new Map<string, FacebookGroup>();
+const interceptedPostUrls = new Set<string>();
+
+function rememberInterceptedPostUrls(text: string): void {
+  const matches = text.match(/https?:\/\/www\.facebook\.com\/groups\/[^"\s\\]+\/(?:posts|permalink|pending_posts)\/\d+/gi) ?? [];
+  for (const raw of matches) {
+    const normalized = raw.replace(/\\/g, '');
+    try {
+      const url = new URL(normalized);
+      if (url.hostname === 'www.facebook.com' && /\/groups\/[^/]+\/(?:posts|permalink|pending_posts)\/\d+/i.test(url.pathname)) {
+        url.search = '';
+        url.hash = '';
+        interceptedPostUrls.add(url.href);
+      }
+    } catch { /* ignore malformed response strings */ }
+  }
+}
+
+window.addEventListener('postflow:graphql-response', ((event: CustomEvent<string>) => {
+  if (typeof event.detail === 'string') rememberInterceptedPostUrls(event.detail);
+}) as EventListener);
 let lastSentSignature = "";
 let isExecutingJob = false;
 let activeJobId: string | null = null;
@@ -456,6 +476,14 @@ function initialize() {
 
   connect();
 
+  // Run the interceptor in the page's main world so it can observe Facebook's
+  // own fetch/XHR responses (content-script fetch hooks cannot see those).
+  const spy = document.createElement('script');
+  spy.src = chrome.runtime.getURL('dist/graphql-spy.js');
+  spy.async = false;
+  (document.head ?? document.documentElement).appendChild(spy);
+  spy.remove();
+
   // Do NOT auto-scan and do NOT inject the GraphQL spy.
   // Groups are only synced when the user explicitly clicks
   // "Sync with Extension" in the PostFlow web app, which triggers SCAN_NOW.
@@ -643,18 +671,7 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
       // 1. Find the "Write something…" composer trigger on the group page.
 
       await waitForCondition(
-        () => {
-          const main = document.querySelector('[role="main"]');
-          const inline = document.querySelector('[data-pagelet="GroupInlineComposer"]');
-          if (!main && !inline) return false;
-          return !!document.querySelector(
-            '[data-pagelet="GroupInlineComposer"] [role="button"], ' +
-            '[data-pagelet="GroupInlineComposer"] button, ' +
-            '[aria-label*="Create a post" i], ' +
-            '[aria-label*="Write something" i], ' +
-            '[aria-placeholder*="Write something" i]'
-          );
-        },
+        () => findComposerTrigger() !== null,
         POSTING_TIMING.groupPageReadyTimeoutMs,
       );
       recordPostingStep(jobId, 'group_composer_surface_ready', {
@@ -662,103 +679,7 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
         hasInlineComposer: Boolean(document.querySelector('[data-pagelet="GroupInlineComposer"]')),
       });
 
-      // Facebook places the composer in `data-pagelet="GroupInlineComposer"`
-      // which is often a SIBLING to the actual feed (`data-pagelet="GroupFeed"`).
-      // We must search a broader container like `role="main"` to ensure we see both.
-      const searchRoot: Element =
-        document.querySelector('[role="main"]') ??
-        document.body;
-
-      console.log('[PostFlow] Search root found:', searchRoot.tagName, searchRoot.getAttribute('role'));
-
-      let composerTrigger: HTMLElement | null = null;
-
-      // Method 0: The most direct and reliable Facebook selector (GroupInlineComposer)
-      const inlineComposer = document.querySelector('[data-pagelet="GroupInlineComposer"]');
-      if (inlineComposer) {
-        // Find the first button inside it
-        const btn = inlineComposer.querySelector<HTMLElement>('[role="button"], button, [tabindex="0"]');
-        if (btn) {
-          composerTrigger = btn;
-          console.log('[PostFlow] Found composer via GroupInlineComposer data-pagelet');
-        }
-      }
-
-      // Known placeholder texts Facebook uses in the composer trigger span
-      const COMPOSER_TEXTS = [
-        'اكتب شيئًا',   // Arabic (exact prefix from real FB HTML)
-        'اكتب شيئ',     // Arabic variant without diacritics
-        'ما الذي يدور', // Arabic "what's on your mind"
-        'write something',
-        "what's on your mind",
-        'create a post',
-        'écrivez quelque chose',
-        'was möchtest du',
-      ];
-
-      /** True if `el` is nested inside a post card (role="article").
-       *  The real composer trigger is ABOVE all posts, never inside one. */
-      function isInsideArticle(el: HTMLElement): boolean {
-        let cur: HTMLElement | null = el.parentElement;
-        while (cur && cur !== searchRoot) {
-          if (cur.getAttribute('role') === 'article') return true;
-          cur = cur.parentElement;
-        }
-        return false;
-      }
-
-      function textMatchesComposer(el: HTMLElement): boolean {
-        const text = (el.textContent ?? '').trim();
-        if (text.length < 2 || text.length > 120) return false;
-        const lower = text.toLowerCase();
-        return COMPOSER_TEXTS.some(t => lower.includes(t.toLowerCase()));
-      }
-
-      // Method A: Find a span with the placeholder text, then walk UP to its
-      // closest role="button" parent — this is exactly what Facebook renders.
-      // Skip any span that lives inside a post card (role="article").
-      const allSpans = Array.from(searchRoot.querySelectorAll<HTMLElement>('span'));
-      for (const span of allSpans) {
-        if (textMatchesComposer(span) && !isInsideArticle(span)) {
-          // Walk up to find the clickable role="button" ancestor
-          let el: HTMLElement | null = span;
-          while (el && el !== searchRoot) {
-            if (el.getAttribute('role') === 'button') {
-              composerTrigger = el;
-              console.log('[PostFlow] Found composer via span→button walk:', span.textContent?.trim().substring(0, 40));
-              break;
-            }
-            el = el.parentElement;
-          }
-          if (composerTrigger) break;
-        }
-      }
-
-      // Method B: aria-placeholder / aria-label on the element itself
-      if (!composerTrigger) {
-        const candidate = searchRoot.querySelector<HTMLElement>(
-          '[aria-placeholder], [aria-label*="Create" i], [aria-label*="Write" i]' /* +
-          '[aria-label*="What\\'s on your mind" i], [aria-label*="اكتب"]'
-        */
-        );
-        if (candidate && !isInsideArticle(candidate)) {
-          composerTrigger = candidate;
-          console.log('[PostFlow] Found composer via aria attribute:', composerTrigger.getAttribute('aria-placeholder') ?? composerTrigger.getAttribute('aria-label'));
-        }
-      }
-
-      // Method C: Last resort — any role="button" whose textContent matches,
-      // but NOT inside a post article.
-      if (!composerTrigger) {
-        const roleButtons = Array.from(searchRoot.querySelectorAll<HTMLElement>('div[role="button"]'));
-        for (const btn of roleButtons) {
-          if (textMatchesComposer(btn) && !isInsideArticle(btn)) {
-            composerTrigger = btn;
-            console.log('[PostFlow] Found composer via role=button text match:', btn.textContent?.trim().substring(0, 40));
-            break;
-          }
-        }
-      }
+      const composerTrigger = findComposerTrigger();
 
       if (!composerTrigger) {
         throw new Error(
@@ -777,6 +698,17 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
       console.log('[PostFlow] Clicking composer trigger:', composerTrigger.getAttribute('aria-label') ?? composerTrigger.textContent?.substring(0, 40));
       clickLikeUser(composerTrigger);
       await sleep(POSTING_TIMING.composerOpenDelayMs);
+      const visibleInvite = Array.from(document.querySelectorAll<HTMLElement>('div[role="dialog"], [aria-modal="true"]'))
+        .find((candidate) => {
+          const style = window.getComputedStyle(candidate);
+          const text = (candidate.innerText ?? candidate.textContent ?? '').toLowerCase();
+          return !candidate.hidden && candidate.getAttribute('aria-hidden') !== 'true'
+            && style.display !== 'none' && style.visibility !== 'hidden'
+            && /invite friends|search for friends|send invites|invite people/.test(text);
+        });
+      if (visibleInvite) {
+        throw new Error('Facebook opened the Invite dialog instead of the Create post dialog');
+      }
       if (!isTargetGroupRoot()) {
         throw new Error(`Facebook navigated away from the target group before opening the composer: ${location.href}`);
       }
@@ -794,6 +726,10 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
       });
       const interimDialog = visibleDialogs.length ? visibleDialogs[visibleDialogs.length - 1] : null;
       if (interimDialog && !interimDialog.querySelector('[contenteditable="true"], [role="textbox"], textarea')) {
+        const interimText = (interimDialog.innerText ?? interimDialog.textContent ?? '').trim().toLowerCase();
+        if (interimText.includes('invite') || interimText.includes('members')) {
+          throw new Error('Facebook opened the Invite dialog instead of the Create post dialog; composer trigger was rejected');
+        }
         recordPostingStep(jobId, 'intermediate_dialog_detected', {
           text: interimDialog.innerText?.trim().slice(0, 120),
         });
@@ -911,13 +847,42 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
 
       const textAfterExec = editorEl.textContent ?? '';
       console.log('[PostFlow] Editor text after execCommand:', textAfterExec.substring(0, 50));
+      if (!textAfterExec.includes(post.content)) {
+        // Some Lexical builds report execCommand=true but do not commit the
+        // change to their controlled state until an input event is delivered.
+        editorEl.dispatchEvent(new InputEvent('beforeinput', {
+          bubbles: true,
+          cancelable: true,
+          inputType: 'insertText',
+          data: post.content,
+        }));
+        editorEl.dispatchEvent(new InputEvent('input', {
+          bubbles: true,
+          inputType: 'insertText',
+          data: post.content,
+        }));
+        await sleep(POSTING_TIMING.textInsertDelayMs);
+      }
       recordPostingStep(jobId, 'text_insert_attempted', {
         execResult,
-        textLength: textAfterExec.length,
+        textLength: (editorEl.textContent ?? '').length,
+        textMatches: (editorEl.textContent ?? '').includes(post.content),
       });
 
-      if (!textAfterExec.trim()) {
+      if (!(editorEl.textContent ?? '').includes(post.content)) {
         console.log('[PostFlow] execCommand did not work, trying keyboard simulation...');
+        try {
+          const clipboard = new DataTransfer();
+          clipboard.setData('text/plain', post.content);
+          editorEl.dispatchEvent(new ClipboardEvent('paste', {
+            bubbles: true,
+            cancelable: true,
+            clipboardData: clipboard,
+          }));
+          await sleep(POSTING_TIMING.textInsertDelayMs);
+        } catch {
+          // Continue to keyboard fallback.
+        }
 
         // Step 3b: Keyboard simulation — type character by character
         // This is guaranteed to work with React/Lexical because it mirrors real user input.
@@ -946,6 +911,20 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
         recordPostingStep(jobId, 'keyboard_fallback_finished', { textLength: (editorEl.textContent ?? '').length });
       }
 
+      // Last fallback for Facebook builds that ignore untrusted keyboard
+      // events: update the focused contenteditable and notify its input
+      // delegate. This is intentionally after the normal editor paths so the
+      // editor framework still owns the final state.
+      if (!(editorEl.textContent ?? '').includes(post.content)) {
+        editorEl.replaceChildren(document.createTextNode(post.content));
+        editorEl.dispatchEvent(new InputEvent('input', {
+          bubbles: true,
+          inputType: 'insertText',
+          data: post.content,
+        }));
+        await sleep(POSTING_TIMING.textInsertDelayMs);
+      }
+
       if (!(editorEl.textContent ?? '').trim() && !hasMedia) {
         throw new Error('Failed to inject text into Facebook composer — all strategies failed');
       }
@@ -967,17 +946,23 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
         '[aria-label="نشر"]',       // Arabic
         '[aria-label="Publier"]',   // French
         '[aria-label="Postar"]',    // Portuguese
-        'div[role="button"][tabindex="0"]',
+        '[aria-label="Publish"]',
+        'button',
+        '[role="button"]',
       ];
 
       const findPostButton = () => {
         for (const sel of postButtonSelectors) {
-          const candidates = Array.from(dialogSearchRoot.querySelectorAll(sel));
+          const localCandidates = Array.from(dialogSearchRoot.querySelectorAll(sel));
+          const globalCandidates = localCandidates.length ? localCandidates : Array.from(document.querySelectorAll(sel));
+          const candidates = globalCandidates;
           const enabled = candidates.find(el =>
             el.getAttribute('aria-disabled') !== 'true' &&
-            el.textContent &&
-            el.textContent.trim().length > 0 &&
-            el.textContent.trim().length < 20
+            ((el.textContent ?? '').trim().toLowerCase() === 'post' ||
+             (el.getAttribute('aria-label') ?? '').trim().toLowerCase() === 'post' ||
+             (el.textContent ?? '').trim().toLowerCase() === 'publish' ||
+             (el.getAttribute('aria-label') ?? '').trim().toLowerCase() === 'publish' ||
+             (el.textContent ?? '').trim() === 'نشر')
           );
           if (enabled) {
             console.log('[PostFlow] Found post button with selector:', sel, 'text:', enabled.textContent?.trim());
@@ -1084,6 +1069,12 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
             : null;
         },
         getSuccessEvidence: getPublishSuccessEvidence,
+        getInterceptedPostUrl: () => Array.from(interceptedPostUrls).find((url) => {
+          try {
+            return new URL(url).pathname.includes(`/groups/${currentGroupId}/`)
+              || new URL(url).pathname.match(/\/groups\/[^/]+\//i);
+          } catch { return false; }
+        }) ?? null,
       });
 
       recordPostingStep(jobId, 'submission_result_detected', {
@@ -1146,10 +1137,10 @@ function sleep(ms: number): Promise<void> {
 
 function clickLikeUser(element: HTMLElement) {
   element.scrollIntoView({ behavior: 'auto', block: 'center' });
-  element.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-  element.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
-  element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-  element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+  element.focus();
+  // Facebook's delegated handlers treat the native click as the activation
+  // signal. Extra synthetic mousedown/mouseup events can be handled by a
+  // neighboring group-header action (notably Invite).
   element.click();
 }
 
@@ -1292,8 +1283,14 @@ function waitForCreatePostDialog(timeoutMs: number): Promise<Element | null> {
     };
 
     const isInsideArticle = (element: Element) => Boolean(element.closest('[role="article"]'));
+    const isInviteSurface = (element: Element) => {
+      const surface = element.closest<HTMLElement>('div[role="dialog"], [aria-modal="true"]');
+      if (!surface) return false;
+      const text = (surface.innerText ?? surface.textContent ?? '').toLowerCase();
+      return /invite friends|search for friends|send invites|invite people/.test(text);
+    };
     const isLikelyComposerEditor = (element: Element) => {
-      if (!isVisible(element) || isInsideArticle(element)) return false;
+      if (!isVisible(element) || isInsideArticle(element) || isInviteSurface(element)) return false;
       const node = element as HTMLElement;
       const combined = [
         node.getAttribute('aria-label'),
@@ -1340,7 +1337,7 @@ function waitForCreatePostDialog(timeoutMs: number): Promise<Element | null> {
       // Prefer the modal, because its Post button and editor belong together.
       const dialogs = Array.from(document.querySelectorAll<HTMLElement>('div[role="dialog"], [aria-modal="true"]'));
       const dialog = dialogs.find(d => Array.from(d.querySelectorAll(editorSelector)).some(isLikelyComposerEditor));
-      if (dialog) return dialog;
+      if (dialog && !isInviteSurface(dialog)) return dialog;
 
       // Fallback for the newer inline group composer. Return its nearest useful
       // container so the existing editor/media/button lookup remains scoped.

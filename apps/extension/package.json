@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "test": "node --test tests/engagement.test.cjs tests/publishing-detection.test.cjs",
+    "test": "node --test tests/engagement.test.cjs tests/publishing-detection.test.cjs tests/composer-trigger.test.cjs",
     "build": "npm run build:dev",
     "build:dev": "tsc && node scripts/copy-static.mjs development",
     "build:prod": "tsc && node scripts/copy-static.mjs production",

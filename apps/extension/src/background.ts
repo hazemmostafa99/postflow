@@ -49,19 +49,20 @@ async function apiFetch(path: string, body?: Record<string, unknown>, method?: s
     // Handle empty responses (like 200 OK with no JSON)
     const text = await response.text();
     if (!response.ok) {
-      console.warn('[PostFlow] API error', {
-        status: response.status,
-        method: httpMethod,
-        path,
-        url,
-        response: text.slice(0, 300),
-      });
+      console.warn(`[PostFlow] API error: ${httpMethod} ${url} returned HTTP ${response.status} ${response.statusText}`);
       return null;
     }
 
-    return text ? JSON.parse(text) : null;
+    if (!text.trim()) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      console.error(`[PostFlow] Invalid API response: ${httpMethod} ${url} returned HTTP ${response.status}, but the body is not valid JSON (Content-Type: ${response.headers.get('content-type') ?? 'unknown'})`);
+      return null;
+    }
   } catch (err) {
-    console.error('[PostFlow] Network error:', { method: httpMethod, path, url, err });
+    const reason = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    console.error(`[PostFlow] Network error: ${httpMethod} ${url} — ${reason}`);
     return null;
   }
 }

@@ -35,6 +35,7 @@
         "dist/post-tracking/parse-facebook-count.js",
         "dist/post-tracking/extract-engagement.js",
         "dist/post-tracking/wait-for-post-submission-result.js",
+        "dist/find-composer-trigger.js",
         "dist/content.js"
       ],
       "run_at": "document_idle"

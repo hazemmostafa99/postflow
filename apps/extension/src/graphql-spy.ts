@@ -89,6 +89,7 @@
   }
 
   function processText(text: string): void {
+    window.dispatchEvent(new CustomEvent("postflow:graphql-response", { detail: text }));
     // Facebook may return multiple JSON objects in a single response body
     const lines = text.split("\n");
     const allGroups: GroupData[] = [];
