@@ -2,7 +2,10 @@ const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
 
 /** Return the normal delay based on how long the post has been pending. */
-export function getPendingPostCheckDelayMs(submittedAt: Date, now = new Date()): number {
+export function getPendingPostCheckDelayMs(
+  submittedAt: Date,
+  now = new Date(),
+): number {
   const ageMs = Math.max(0, now.getTime() - submittedAt.getTime());
   if (ageMs < HOUR_MS) return 10 * MINUTE_MS;
   if (ageMs < 6 * HOUR_MS) return 30 * MINUTE_MS;

@@ -243,6 +243,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'TRIGGER_JOB_CHECK') {
     checkPendingJobs();
   }
+  if (message.type === 'RESUME_PUBLISH_QUEUE') {
+    publishQueuePaused = null;
+    void chrome.storage.local.remove('publishQueuePaused');
+    checkPendingJobs();
+  }
 });
 
 // ── Job Execution Flow ──
@@ -250,6 +255,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 let isProcessingJob = false;
 let isCheckingPendingPost = false;
 let isFacebookSyncBusy = false;
+let publishQueuePaused: {
+  reason: string;
+  status?: string;
+  jobId?: string;
+  pausedAt: number;
+} | null = null;
 let pendingCheckSequence = 0;
 let finishExecutionHandshake: (() => void) | null = null;
 let activeExecution: {
@@ -259,7 +270,24 @@ let activeExecution: {
   post?: any;
 } | null = null;
 
+void chrome.storage.local.get('publishQueuePaused').then((result) => {
+  const paused = result.publishQueuePaused as Partial<NonNullable<typeof publishQueuePaused>> | undefined;
+  if (paused && typeof paused.reason === 'string' && typeof paused.pausedAt === 'number') {
+    publishQueuePaused = {
+      reason: paused.reason,
+      status: typeof paused.status === 'string' ? paused.status : undefined,
+      jobId: typeof paused.jobId === 'string' ? paused.jobId : undefined,
+      pausedAt: paused.pausedAt,
+    };
+    console.warn('[PostFlow] Restored paused publishing queue state', publishQueuePaused);
+  }
+}).catch(() => undefined);
+
 async function checkPendingJobs() {
+  if (publishQueuePaused) {
+    console.warn('[PostFlow] Publishing queue is paused; skipping job check', publishQueuePaused);
+    return;
+  }
   if (isProcessingJob || isFacebookSyncBusy) {
     console.log('[PostFlow] Skipping job check while Facebook navigation is busy', {
       isProcessingJob,
@@ -549,11 +577,22 @@ chrome.runtime.onMessage.addListener((message, sender) => {
           hasVideo: completedPostHasVideo,
         });
         const syncResult = await checkSinglePendingPost(syncPost);
-        const updated = await persistPendingSyncResult(syncPost, syncResult);
+        const shouldPersistAutomaticPostLinkCheck = message.submissionResult?.status === 'PENDING_APPROVAL' ||
+          syncResult.status === 'PUBLISHED' ||
+          (
+            message.submissionResult?.status === 'UNKNOWN' &&
+            completedPostHasVideo &&
+            syncResult.status === 'STILL_PENDING' &&
+            Boolean(syncResult.postUrl)
+          );
+        const updated = shouldPersistAutomaticPostLinkCheck
+          ? await persistPendingSyncResult(syncPost, syncResult)
+          : false;
         console.log('[PostFlow] Automatic post-link check finished', {
           jobId: message.jobId,
           status: syncResult.status,
           updated,
+          persisted: shouldPersistAutomaticPostLinkCheck,
         });
       }
 
@@ -565,10 +604,20 @@ chrome.runtime.onMessage.addListener((message, sender) => {
     void (async () => {
       console.error('[PostFlow] Job failed:', message.jobId, message.error);
       finishExecutionHandshake?.();
+      if (message.shouldPauseQueue) {
+        publishQueuePaused = {
+          reason: message.error ?? 'Facebook publishing requires manual attention',
+          status: message.publishStatus,
+          jobId: message.jobId,
+          pausedAt: Date.now(),
+        };
+        await chrome.storage.local.set({ publishQueuePaused });
+        console.warn('[PostFlow] Publishing queue paused for manual attention', publishQueuePaused);
+      }
       await updateJobStatus(message.jobId, { status: 'FAILED', error: message.error });
       isProcessingJob = false;
       activeExecution = null;
-      checkPendingJobs();
+      if (!publishQueuePaused) checkPendingJobs();
     })();
   }
 });

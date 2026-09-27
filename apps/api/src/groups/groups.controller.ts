@@ -3,7 +3,6 @@ import {
   Post,
   Get,
   Delete,
-  Param,
   Body,
   Headers,
   Query,
@@ -14,7 +13,7 @@ import {
 import { GroupsService, SyncGroupDto } from './groups.service';
 
 class SyncGroupsDto {
-  groups: SyncGroupDto[];
+  groups!: SyncGroupDto[];
 }
 
 @Controller('api/groups')
@@ -31,7 +30,8 @@ export class GroupsController {
     @Headers('x-clerk-user-id') clerkUserId: string,
     @Body() body: SyncGroupsDto,
   ) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
     return this.groupsService.syncGroups(clerkUserId, body.groups ?? []);
   }
 
@@ -46,7 +46,8 @@ export class GroupsController {
     @Query('page') page?: string,
     @Query('limit') limit?: string,
   ) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
     if (page || limit) {
       return this.groupsService.listGroups(clerkUserId, {
         search,
@@ -64,8 +65,8 @@ export class GroupsController {
   @Delete()
   @HttpCode(HttpStatus.NO_CONTENT)
   async removeAll(@Headers('x-clerk-user-id') clerkUserId: string) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
     await this.groupsService.deleteAllGroups(clerkUserId);
   }
-
 }

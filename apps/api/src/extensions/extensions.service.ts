@@ -1,7 +1,10 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
-import { ExtensionInstallation, ExtensionInstallationDocument } from '../schemas/extension-installation.schema';
+import {
+  ExtensionInstallation,
+  ExtensionInstallationDocument,
+} from '../schemas/extension-installation.schema';
 
 @Injectable()
 export class ExtensionsService {
@@ -42,7 +45,9 @@ export class ExtensionsService {
       .exec();
 
     if (!installation) {
-      throw new NotFoundException('Extension installation not found. Please register first.');
+      throw new NotFoundException(
+        'Extension installation not found. Please register first.',
+      );
     }
     return installation;
   }
@@ -66,7 +71,9 @@ export class ExtensionsService {
       .exec();
 
     if (!installation) {
-      throw new NotFoundException('Extension installation not found. Please register first.');
+      throw new NotFoundException(
+        'Extension installation not found. Please register first.',
+      );
     }
     return installation;
   }

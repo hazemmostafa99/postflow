@@ -122,7 +122,9 @@ export class PostsService {
         : {}),
     });
 
-    const groupsById = new Map(groups.map((group) => [group._id.toString(), group]));
+    const groupsById = new Map(
+      groups.map((group) => [group._id.toString(), group]),
+    );
     const orderedGroups = dto.targetGroupIds.flatMap((groupId, order) => {
       const group = groupsById.get(groupId);
       return group ? [{ group, order }] : [];
@@ -130,7 +132,10 @@ export class PostsService {
     const schedule = startTime
       ? calculatePostSchedule({
           startTime,
-          posts: orderedGroups.map(({ group, order }) => ({ post: group, order })),
+          posts: orderedGroups.map(({ group, order }) => ({
+            post: group,
+            order,
+          })),
           spacePostsApart,
           spacingMinutes: spacePostsApart ? (dto.spacingMinutes ?? null) : null,
         })
@@ -184,7 +189,9 @@ export class PostsService {
     }
 
     const pendingJobs = await this.jobModel
-      .find({ postId: post._id, status: 'PENDING' } as any)
+      .find({ status: 'PENDING' })
+      .where('postId')
+      .equals(post._id)
       .sort({ flowOrder: 1, createdAt: 1, _id: 1 })
       .exec();
 
@@ -235,7 +242,10 @@ export class PostsService {
     }
 
     return mediaUrls.map((url) => {
-      if (typeof url !== 'string' || !/^data:(image|video)\/[a-zA-Z0-9.+-]+;base64,/.test(url)) {
+      if (
+        typeof url !== 'string' ||
+        !/^data:(image|video)\/[a-zA-Z0-9.+-]+;base64,/.test(url)
+      ) {
         throw new BadRequestException(
           'Only image and video attachments are supported',
         );
@@ -244,10 +254,17 @@ export class PostsService {
       const maxEncodedLength = isVideo ? 34_000_000 : 3_000_000;
       if (url.length > maxEncodedLength) {
         throw new BadRequestException(
-          isVideo ? 'Videos must be 25MB or smaller' : 'Images must be 2MB or smaller',
+          isVideo
+            ? 'Videos must be 25MB or smaller'
+            : 'Images must be 2MB or smaller',
         );
       }
-      if (isVideo && mediaUrls.filter((item) => typeof item === 'string' && item.startsWith('data:video/')).length > 1) {
+      if (
+        isVideo &&
+        mediaUrls.filter(
+          (item) => typeof item === 'string' && item.startsWith('data:video/'),
+        ).length > 1
+      ) {
         throw new BadRequestException('You can attach one video per post');
       }
       return url;
@@ -268,7 +285,9 @@ export class PostsService {
     // Attach job summary to each post
     const postIds = posts.map((p) => p._id);
     const jobs = (await this.jobModel
-      .find({ postId: { $in: postIds } } as any)
+      .find()
+      .where('postId')
+      .in(postIds)
       .lean()
       .exec()) as unknown as LeanJobSummary[];
 
@@ -318,7 +337,9 @@ export class PostsService {
 
     const postIds = posts.map((p) => p._id);
     const jobs = (await this.jobModel
-      .find({ postId: { $in: postIds } } as any)
+      .find()
+      .where('postId')
+      .in(postIds)
       .lean()
       .exec()) as unknown as LeanJobSummary[];
 
@@ -359,7 +380,9 @@ export class PostsService {
     if (!post) throw new NotFoundException('Post not found');
 
     const jobs = await this.jobModel
-      .find({ postId: post._id } as any)
+      .find()
+      .where('postId')
+      .equals(post._id)
       .populate('groupId', 'name url externalId')
       .lean()
       .exec();
@@ -379,9 +402,7 @@ export class PostsService {
       .exec();
     const postIds = posts.map((post) => post._id);
     if (postIds.length) {
-      await this.jobModel
-        .deleteMany({ postId: { $in: postIds } } as any)
-        .exec();
+      await this.jobModel.deleteMany().where('postId').in(postIds).exec();
     }
     await this.postModel.deleteMany({ clerkUserId }).exec();
   }

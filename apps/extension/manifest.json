@@ -30,6 +30,7 @@
         "dist/posting-config.js",
         "dist/post-tracking/types.js",
         "dist/post-tracking/detect-pending-approval.js",
+        "dist/post-tracking/facebook-interruption-detector.js",
         "dist/post-tracking/find-published-post.js",
         "dist/post-tracking/find-pending-published-post.js",
         "dist/post-tracking/parse-facebook-count.js",

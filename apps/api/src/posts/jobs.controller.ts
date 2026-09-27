@@ -14,7 +14,11 @@ import {
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
-import { FacebookSubmissionStatus, PublishingJob, PublishingJobDocument } from '../schemas/publishing-job.schema';
+import {
+  FacebookSubmissionStatus,
+  PublishingJob,
+  PublishingJobDocument,
+} from '../schemas/publishing-job.schema';
 import { Post as PostSchema, PostDocument } from '../schemas/post.schema';
 import { getNextPendingPostCheckAt } from './pending-sync-schedule';
 import { getNextEngagementSyncAt } from './engagement-sync-schedule';
@@ -27,10 +31,51 @@ type PostEngagementSyncResult = {
   reason?: string;
 };
 
+type LeanId = {
+  _id: {
+    toString(): string;
+  };
+};
+
+type PendingJobLean = {
+  _id: {
+    toString(): string;
+  };
+  postId: {
+    content?: string;
+    mediaUrls?: string[];
+  };
+  groupId: {
+    _id: {
+      toString(): string;
+    };
+    externalId?: string;
+    url?: string;
+  };
+  postUrl?: string;
+  submittedAt?: Date;
+  lastCheckedAt?: Date;
+  nextCheckAt?: Date;
+  syncAttempts?: number;
+  lastSyncError?: string;
+  createdAt?: Date;
+};
+
+type TimestampedDocument = {
+  createdAt?: Date;
+};
+
+function getCreatedAt(value: unknown): Date | undefined {
+  const record = value as TimestampedDocument;
+  return record.createdAt instanceof Date ? record.createdAt : undefined;
+}
+
 function isPendingFacebookPostUrl(value?: string): boolean {
   if (!value) return false;
   try {
-    return /^\/groups\/[^/]+\/pending_posts\/[A-Za-z0-9_-]+/i.test(new URL(value).pathname);
+    return /^\/groups\/[^/]+\/pending_posts\/[A-Za-z0-9_-]+/i.test(
+      new URL(value).pathname,
+    );
   } catch {
     return false;
   }
@@ -41,8 +86,11 @@ function normalizeFacebookGroupPostUrl(value?: string): string | undefined {
   try {
     const url = new URL(value);
     const host = url.hostname.toLowerCase();
-    if (host !== 'facebook.com' && !host.endsWith('.facebook.com')) return value;
-    const match = url.pathname.match(/^\/groups\/([^/]+)\/(posts|permalink|pending_posts)\/([A-Za-z0-9_-]+)/i);
+    if (host !== 'facebook.com' && !host.endsWith('.facebook.com'))
+      return value;
+    const match = url.pathname.match(
+      /^\/groups\/([^/]+)\/(posts|permalink|pending_posts)\/([A-Za-z0-9_-]+)/i,
+    );
     if (!match) return value;
     return `https://www.facebook.com/groups/${match[1]}/${match[2]}/${match[3]}/`;
   } catch {
@@ -54,7 +102,9 @@ function getFacebookPostIdentity(value?: string): string | undefined {
   const normalized = normalizeFacebookGroupPostUrl(value);
   if (!normalized) return undefined;
   try {
-    return new URL(normalized).pathname.match(/^\/groups\/[^/]+\/(?:posts|permalink|pending_posts)\/([A-Za-z0-9_-]+)/i)?.[1];
+    return new URL(normalized).pathname.match(
+      /^\/groups\/[^/]+\/(?:posts|permalink|pending_posts)\/([A-Za-z0-9_-]+)/i,
+    )?.[1];
   } catch {
     return undefined;
   }
@@ -72,16 +122,20 @@ export class JobsController {
   /** GET /api/jobs/next — fetch the next pending job for the extension */
   @Get('next')
   async getNextJob(@Headers('x-clerk-user-id') clerkUserId: string) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
 
     // First find all posts belonging to this user
-    const posts = await this.postModel.find({ clerkUserId }).select('_id').lean().exec();
-    const postIds = posts.map(p => p._id);
+    const posts = await this.postModel
+      .find({ clerkUserId })
+      .select('_id')
+      .lean<LeanId[]>()
+      .exec();
+    const postIds = posts.map((p) => p._id.toString());
 
     // Find the oldest pending job for any of these posts
     const job = await this.jobModel
       .findOne({
-        postId: { $in: postIds } as any,
         status: 'PENDING',
         $or: [
           { scheduledFor: { $exists: false } },
@@ -89,6 +143,8 @@ export class JobsController {
           { scheduledFor: { $lte: new Date() } },
         ],
       })
+      .where('postId')
+      .in(postIds)
       .sort({ scheduledFor: 1, flowOrder: 1, createdAt: 1 })
       .populate('postId', 'content mediaUrls')
       .populate('groupId', 'name url externalId')
@@ -111,7 +167,8 @@ export class JobsController {
     @Headers('x-clerk-user-id') clerkUserId: string,
     @Query('limit') limit?: string,
   ) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
 
     const parsedLimit = limit ? Number(limit) : 10;
     const batchLimit = Number.isFinite(parsedLimit)
@@ -122,47 +179,54 @@ export class JobsController {
     const posts = await this.postModel
       .find({ clerkUserId })
       .select('_id')
-      .lean()
+      .lean<LeanId[]>()
       .exec();
-    const postIds = posts.map((post) => post._id);
+    const postIds = posts.map((post) => post._id.toString());
 
     if (!postIds.length) return [];
 
+    const pendingFilter = {
+      status: 'SUCCESS',
+      submissionStatus: FacebookSubmissionStatus.PENDING_APPROVAL,
+      $or: [
+        { nextCheckAt: { $exists: false } },
+        { nextCheckAt: null },
+        { nextCheckAt: { $lte: now } },
+      ],
+    };
+
     const jobs = await this.jobModel
-      .find({
-        postId: { $in: postIds } as any,
-        status: 'SUCCESS',
-        submissionStatus: FacebookSubmissionStatus.PENDING_APPROVAL,
-        $or: [
-          { nextCheckAt: { $exists: false } },
-          { nextCheckAt: null },
-          { nextCheckAt: { $lte: now } },
-        ],
-      })
+      .find(pendingFilter)
+      .where('postId')
+      .in(postIds)
       .sort({ submittedAt: 1, createdAt: 1, _id: 1 })
       .limit(batchLimit)
       .populate('postId', 'content mediaUrls')
       .populate('groupId', 'url externalId')
-      .lean()
+      .lean<PendingJobLean[]>()
       .exec();
 
     return jobs.map((job) => {
-      const post = job.postId as any;
-      const group = job.groupId as any;
-      const submittedAt = job.submittedAt ?? (job as any).createdAt;
+      const post = job.postId;
+      const group = job.groupId;
+      const submittedAt = job.submittedAt ?? job.createdAt;
 
       return {
         id: job._id.toString(),
         groupId: group._id.toString(),
         groupExternalId: group.externalId,
-        groupUrl: group.url,
+        groupUrl: group.url ?? '',
         status: FacebookSubmissionStatus.PENDING_APPROVAL,
         ...(job.postUrl ? { postUrl: job.postUrl } : {}),
         content: post.content,
         submittedAt: submittedAt?.toISOString() ?? new Date().toISOString(),
         mediaCount: Array.isArray(post.mediaUrls) ? post.mediaUrls.length : 0,
-        ...(job.lastCheckedAt ? { lastCheckedAt: job.lastCheckedAt.toISOString() } : {}),
-        ...(job.nextCheckAt ? { nextCheckAt: job.nextCheckAt.toISOString() } : {}),
+        ...(job.lastCheckedAt
+          ? { lastCheckedAt: job.lastCheckedAt.toISOString() }
+          : {}),
+        ...(job.nextCheckAt
+          ? { nextCheckAt: job.nextCheckAt.toISOString() }
+          : {}),
         syncAttempts: job.syncAttempts ?? 0,
         ...(job.lastSyncError ? { lastSyncError: job.lastSyncError } : {}),
       };
@@ -176,21 +240,41 @@ export class JobsController {
     @Query('limit') limit?: string,
     @Query('postId') postId?: string,
   ) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
     const parsedLimit = limit ? Number(limit) : 10;
     const batchLimit = Number.isFinite(parsedLimit)
       ? Math.min(50, Math.max(1, Math.floor(parsedLimit)))
       : 10;
     const now = new Date();
 
-    const posts = await this.postModel.find({ clerkUserId }).select('_id').lean().exec();
+    const posts = await this.postModel
+      .find({ clerkUserId })
+      .select('_id')
+      .lean<LeanId[]>()
+      .exec();
     const postIds = posts.map((post) => post._id);
     if (!postIds.length) return [];
     if (postId && !postIds.some((id) => id.toString() === postId)) return [];
 
-    const jobs = await this.jobModel
-      .find({ postId: postId ? postId : { $in: postIds }, ...getEngagementQueueFilter(now) } as any)
-      .sort({ lastEngagementSyncAt: 1, publishedDetectedAt: 1, createdAt: 1, _id: 1 })
+    const requestedPostId = postId
+      ? postIds.find((id) => id.toString() === postId)
+      : undefined;
+    const engagementQuery = this.jobModel.find({
+      ...getEngagementQueueFilter(now),
+      submissionStatus: FacebookSubmissionStatus.PUBLISHED,
+    });
+    const jobsQuery = requestedPostId
+      ? engagementQuery.where('postId').equals(requestedPostId)
+      : engagementQuery.where('postId').in(postIds);
+
+    const jobs = await jobsQuery
+      .sort({
+        lastEngagementSyncAt: 1,
+        publishedDetectedAt: 1,
+        createdAt: 1,
+        _id: 1,
+      })
       .limit(batchLimit)
       .lean()
       .exec();
@@ -216,7 +300,8 @@ export class JobsController {
     @Param('id') id: string,
     @Body() body: PostEngagementSyncResult,
   ) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
     if (!['SUCCESS', 'PARTIAL', 'CHECK_FAILED'].includes(body.status)) {
       throw new BadRequestException('Invalid engagement sync result');
     }
@@ -224,38 +309,51 @@ export class JobsController {
     const job = await this.jobModel.findById(id).populate('postId').exec();
     if (!job) throw new NotFoundException('Job not found');
     const post = job.postId as unknown as PostDocument;
-    if (post.clerkUserId !== clerkUserId) throw new UnauthorizedException('Not your job');
-    if (job.submissionStatus !== FacebookSubmissionStatus.PUBLISHED || !job.postUrl) {
+    if (post.clerkUserId !== clerkUserId)
+      throw new UnauthorizedException('Not your job');
+    if (
+      job.submissionStatus !== FacebookSubmissionStatus.PUBLISHED ||
+      !job.postUrl
+    ) {
       throw new BadRequestException('Job is not a published Facebook post');
     }
 
     const syncedAt = new Date();
     job.engagementSyncAttempts = (job.engagementSyncAttempts ?? 0) + 1;
     job.lastEngagementSyncAt = syncedAt;
-    const publishedAt = job.publishedDetectedAt ?? (job as any).createdAt ?? syncedAt;
+    const publishedAt =
+      job.publishedDetectedAt ?? getCreatedAt(job) ?? syncedAt;
     job.nextEngagementSyncAt = getNextEngagementSyncAt(
       publishedAt,
       syncedAt,
       body.status === 'CHECK_FAILED',
     );
     if (body.status === 'CHECK_FAILED') {
-      job.lastEngagementSyncError = body.reason?.slice(0, 500) || 'Engagement check failed';
+      job.lastEngagementSyncError =
+        body.reason?.slice(0, 500) || 'Engagement check failed';
     } else {
-      const previous = (job.engagement as Partial<NonNullable<PublishingJobDocument['engagement']>> | undefined) ?? {};
+      const previous =
+        (job.engagement as
+          | Partial<NonNullable<PublishingJobDocument['engagement']>>
+          | undefined) ?? {};
       if (body.reactionCount !== undefined || body.commentCount !== undefined) {
         job.engagement = {
-          ...(previous.reactionCount !== undefined || body.reactionCount !== undefined
+          ...(previous.reactionCount !== undefined ||
+          body.reactionCount !== undefined
             ? { reactionCount: body.reactionCount ?? previous.reactionCount }
             : {}),
-          ...(previous.commentCount !== undefined || body.commentCount !== undefined
+          ...(previous.commentCount !== undefined ||
+          body.commentCount !== undefined
             ? { commentCount: body.commentCount ?? previous.commentCount }
             : {}),
           lastSyncedAt: syncedAt,
         };
       }
-      job.lastEngagementSyncError = body.status === 'PARTIAL'
-        ? body.reason?.slice(0, 500) || 'One engagement counter was not detected'
-        : undefined;
+      job.lastEngagementSyncError =
+        body.status === 'PARTIAL'
+          ? body.reason?.slice(0, 500) ||
+            'One engagement counter was not detected'
+          : undefined;
     }
     await job.save();
     return job;
@@ -271,13 +369,15 @@ export class JobsController {
   async updatePendingSync(
     @Headers('x-clerk-user-id') clerkUserId: string,
     @Param('id') id: string,
-    @Body() body: {
+    @Body()
+    body: {
       status: 'PUBLISHED' | 'STILL_PENDING' | 'CHECK_FAILED';
       postUrl?: string;
       reason?: string;
     },
   ) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
     if (!['PUBLISHED', 'STILL_PENDING', 'CHECK_FAILED'].includes(body.status)) {
       throw new BadRequestException('Invalid pending sync result');
     }
@@ -291,14 +391,23 @@ export class JobsController {
     }
     const normalizedBodyPostUrl = normalizeFacebookGroupPostUrl(body.postUrl);
     if (job.postUrl) {
-      const normalizedExistingPostUrl = normalizeFacebookGroupPostUrl(job.postUrl);
-      if (normalizedExistingPostUrl && normalizedExistingPostUrl !== job.postUrl) {
+      const normalizedExistingPostUrl = normalizeFacebookGroupPostUrl(
+        job.postUrl,
+      );
+      if (
+        normalizedExistingPostUrl &&
+        normalizedExistingPostUrl !== job.postUrl
+      ) {
         job.postUrl = normalizedExistingPostUrl;
       }
     }
 
     if (job.submissionStatus === FacebookSubmissionStatus.PUBLISHED) {
-      if (isPendingFacebookPostUrl(job.postUrl) && (body.status === 'STILL_PENDING' || isPendingFacebookPostUrl(normalizedBodyPostUrl))) {
+      if (
+        isPendingFacebookPostUrl(job.postUrl) &&
+        (body.status === 'STILL_PENDING' ||
+          isPendingFacebookPostUrl(normalizedBodyPostUrl))
+      ) {
         const checkedAt = new Date();
         job.submissionStatus = FacebookSubmissionStatus.PENDING_APPROVAL;
         if (normalizedBodyPostUrl) job.postUrl = normalizedBodyPostUrl;
@@ -306,7 +415,7 @@ export class JobsController {
         job.syncAttempts = (job.syncAttempts ?? 0) + 1;
         job.lastSyncError = undefined;
         job.nextCheckAt = getNextPendingPostCheckAt(
-          job.submittedAt ?? (job as any).createdAt ?? checkedAt,
+          job.submittedAt ?? getCreatedAt(job) ?? checkedAt,
           checkedAt,
         );
         await job.save();
@@ -315,10 +424,9 @@ export class JobsController {
       if (
         body.status === 'PUBLISHED' &&
         normalizedBodyPostUrl &&
-        (
-          !job.postUrl ||
-          getFacebookPostIdentity(job.postUrl) === getFacebookPostIdentity(normalizedBodyPostUrl)
-        )
+        (!job.postUrl ||
+          getFacebookPostIdentity(job.postUrl) ===
+            getFacebookPostIdentity(normalizedBodyPostUrl))
       ) {
         const checkedAt = new Date();
         job.postUrl = normalizedBodyPostUrl;
@@ -329,6 +437,41 @@ export class JobsController {
         job.nextCheckAt = undefined;
         await job.save();
       }
+      return job;
+    }
+    if (
+      job.submissionStatus === FacebookSubmissionStatus.UNKNOWN &&
+      body.status === 'PUBLISHED' &&
+      normalizedBodyPostUrl
+    ) {
+      const checkedAt = new Date();
+      job.submissionStatus = FacebookSubmissionStatus.PUBLISHED;
+      job.postUrl = normalizedBodyPostUrl;
+      job.publishedDetectedAt ??= checkedAt;
+      job.lastCheckedAt = checkedAt;
+      job.syncAttempts = (job.syncAttempts ?? 0) + 1;
+      job.lastSyncError = undefined;
+      job.nextCheckAt = undefined;
+      await job.save();
+      return job;
+    }
+    if (
+      job.submissionStatus === FacebookSubmissionStatus.UNKNOWN &&
+      body.status === 'STILL_PENDING' &&
+      normalizedBodyPostUrl
+    ) {
+      const checkedAt = new Date();
+      job.submissionStatus = FacebookSubmissionStatus.PENDING_APPROVAL;
+      if (normalizedBodyPostUrl) job.postUrl = normalizedBodyPostUrl;
+      job.submittedAt ??= checkedAt;
+      job.lastCheckedAt = checkedAt;
+      job.syncAttempts = (job.syncAttempts ?? 0) + 1;
+      job.lastSyncError = undefined;
+      job.nextCheckAt = getNextPendingPostCheckAt(
+        job.submittedAt ?? getCreatedAt(job) ?? checkedAt,
+        checkedAt,
+      );
+      await job.save();
       return job;
     }
     if (job.submissionStatus !== FacebookSubmissionStatus.PENDING_APPROVAL) {
@@ -346,15 +489,17 @@ export class JobsController {
       job.lastSyncError = undefined;
       job.nextCheckAt = undefined;
     } else if (body.status === 'STILL_PENDING') {
+      if (normalizedBodyPostUrl) job.postUrl = normalizedBodyPostUrl;
       job.lastSyncError = undefined;
       job.nextCheckAt = getNextPendingPostCheckAt(
-        job.submittedAt ?? (job as any).createdAt ?? checkedAt,
+        job.submittedAt ?? getCreatedAt(job) ?? checkedAt,
         checkedAt,
       );
     } else {
-      job.lastSyncError = body.reason?.slice(0, 500) || 'Pending post check failed';
+      job.lastSyncError =
+        body.reason?.slice(0, 500) || 'Pending post check failed';
       job.nextCheckAt = getNextPendingPostCheckAt(
-        job.submittedAt ?? (job as any).createdAt ?? checkedAt,
+        job.submittedAt ?? getCreatedAt(job) ?? checkedAt,
         checkedAt,
         true,
       );
@@ -370,7 +515,8 @@ export class JobsController {
   async updateJobStatus(
     @Headers('x-clerk-user-id') clerkUserId: string,
     @Param('id') id: string,
-    @Body() body: {
+    @Body()
+    body: {
       status: string;
       error?: string;
       submissionResult?: {
@@ -380,12 +526,23 @@ export class JobsController {
       };
     },
   ) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
-    const allowedStatuses = new Set(['PENDING', 'RUNNING', 'SUCCESS', 'FAILED']);
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    const allowedStatuses = new Set([
+      'PENDING',
+      'RUNNING',
+      'SUCCESS',
+      'FAILED',
+    ]);
     if (!allowedStatuses.has(body.status)) {
       throw new BadRequestException('Invalid job status');
     }
-    if (body.submissionResult && !Object.values(FacebookSubmissionStatus).includes(body.submissionResult.status)) {
+    if (
+      body.submissionResult &&
+      !Object.values(FacebookSubmissionStatus).includes(
+        body.submissionResult.status,
+      )
+    ) {
       throw new BadRequestException('Invalid Facebook submission status');
     }
 
@@ -404,18 +561,23 @@ export class JobsController {
       job.submissionStatus === FacebookSubmissionStatus.PUBLISHED &&
       body.submissionResult.status !== FacebookSubmissionStatus.PUBLISHED
     ) {
-      throw new BadRequestException('Published Facebook posts cannot be downgraded');
+      throw new BadRequestException(
+        'Published Facebook posts cannot be downgraded',
+      );
     }
     job.status = body.status;
     job.error = body.status === 'FAILED' ? body.error : undefined;
     if (body.submissionResult) {
-      const normalizedSubmissionPostUrl = normalizeFacebookGroupPostUrl(body.submissionResult.postUrl);
+      const normalizedSubmissionPostUrl = normalizeFacebookGroupPostUrl(
+        body.submissionResult.postUrl,
+      );
       job.submissionStatus = body.submissionResult.status;
       // A later retry may report the status without repeating the permalink.
       // Never erase a URL that was already captured successfully.
       if (
         (body.submissionResult.status === FacebookSubmissionStatus.PUBLISHED ||
-          body.submissionResult.status === FacebookSubmissionStatus.PENDING_APPROVAL) &&
+          body.submissionResult.status ===
+            FacebookSubmissionStatus.PENDING_APPROVAL) &&
         normalizedSubmissionPostUrl
       ) {
         job.postUrl = normalizedSubmissionPostUrl;
@@ -423,11 +585,16 @@ export class JobsController {
       if (body.submissionResult.status === FacebookSubmissionStatus.UNKNOWN) {
         job.postUrl = undefined;
       }
-      job.submissionReason = body.submissionResult.status === FacebookSubmissionStatus.UNKNOWN
-        ? body.submissionResult.reason
-        : undefined;
+      job.submissionReason =
+        body.submissionResult.status === FacebookSubmissionStatus.UNKNOWN
+          ? body.submissionResult.reason
+          : undefined;
 
-      if (body.submissionResult.status === FacebookSubmissionStatus.PENDING_APPROVAL && !job.submittedAt) {
+      if (
+        body.submissionResult.status ===
+          FacebookSubmissionStatus.PENDING_APPROVAL &&
+        !job.submittedAt
+      ) {
         job.submittedAt = new Date();
         job.syncAttempts = 0;
         job.lastCheckedAt = undefined;
@@ -439,7 +606,7 @@ export class JobsController {
         job.publishedDetectedAt ??= new Date();
       }
     }
-    
+
     // Increment attempts if it just finished (success or fail)
     if (
       (body.status === 'SUCCESS' || body.status === 'FAILED') &&
@@ -460,7 +627,9 @@ export class JobsController {
 
   private async updateParentPostStatus(post: PostDocument) {
     const jobs = await this.jobModel
-      .find({ postId: post._id } as any)
+      .find()
+      .where('postId')
+      .equals(post._id)
       .select('status')
       .lean()
       .exec();
@@ -469,7 +638,9 @@ export class JobsController {
 
     const allSucceeded = jobs.every((job) => job.status === 'SUCCESS');
     const anyFailed = jobs.some((job) => job.status === 'FAILED');
-    const allFinished = jobs.every((job) => job.status === 'SUCCESS' || job.status === 'FAILED');
+    const allFinished = jobs.every(
+      (job) => job.status === 'SUCCESS' || job.status === 'FAILED',
+    );
 
     if (allSucceeded) {
       post.status = 'COMPLETED';

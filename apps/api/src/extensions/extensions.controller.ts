@@ -1,4 +1,12 @@
-import { Controller, Post, Body, HttpCode, HttpStatus, Headers, UnauthorizedException } from '@nestjs/common';
+import {
+  Controller,
+  Post,
+  Body,
+  HttpCode,
+  HttpStatus,
+  Headers,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { ExtensionsService } from './extensions.service';
 
 class SessionDto {
@@ -16,7 +24,8 @@ export class ExtensionsController {
   @Post('register')
   @HttpCode(HttpStatus.OK)
   async register(@Headers('x-clerk-user-id') clerkUserId: string) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
     return this.extensionsService.register(clerkUserId);
   }
 
@@ -26,7 +35,8 @@ export class ExtensionsController {
   @Post('heartbeat')
   @HttpCode(HttpStatus.OK)
   async heartbeat(@Headers('x-clerk-user-id') clerkUserId: string) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
     return this.extensionsService.heartbeat(clerkUserId);
   }
 
@@ -39,7 +49,11 @@ export class ExtensionsController {
     @Headers('x-clerk-user-id') clerkUserId: string,
     @Body() body: SessionDto,
   ) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
-    return this.extensionsService.updateSession(clerkUserId, body.sessionDetected);
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    return this.extensionsService.updateSession(
+      clerkUserId,
+      body.sessionDetected,
+    );
   }
 }

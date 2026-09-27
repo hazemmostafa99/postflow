@@ -171,9 +171,18 @@ function trackFacebookResponseCandidates(detail: FacebookResponseCandidateDetail
   if (!session.hasVideo) {
     for (const postUrl of postUrls) addPublishCandidate(session, 'response-post-url', postUrl, detail.requestUrl);
   } else if (postUrls.length) {
+    const pendingPostUrls = postUrls.filter((postUrl) => {
+      try {
+        return /^\/groups\/[^/]+\/pending_posts\/[A-Za-z0-9_-]+/i.test(new URL(postUrl, window.location.origin).pathname);
+      } catch {
+        return false;
+      }
+    });
+    for (const postUrl of pendingPostUrls) addPublishCandidate(session, 'response-post-url', postUrl, detail.requestUrl);
     console.log('[PostTracking] Ignoring direct network post URLs during video publish', {
       jobId: session.jobId,
-      postUrlCount: postUrls.length,
+      postUrlCount: postUrls.length - pendingPostUrls.length,
+      pendingPostUrlCount: pendingPostUrls.length,
       reason: 'video responses can include unrelated feed stories',
       requestUrl: detail.requestUrl,
     });
@@ -242,6 +251,33 @@ function getBestNetworkPostUrl(session: PublishTrackingSession): string | null {
       requestUrl: candidate.requestUrl,
     });
     return candidateUrl;
+  }
+  return null;
+}
+
+function getBestNetworkPendingPostUrl(session: PublishTrackingSession): string | null {
+  for (let index = session.candidates.length - 1; index >= 0; index--) {
+    const candidate = session.candidates[index];
+    if (candidate.source !== 'response-post-url') continue;
+    const normalizedCandidate = normalizeTrackedPostUrl(candidate.value);
+    if (!normalizedCandidate || !/\/pending_posts\//i.test(normalizedCandidate)) continue;
+    if (session.existingPostUrls.has(normalizedCandidate)) continue;
+    const candidateGroupId = extractFacebookGroupIdFromUrl(candidate.value);
+    const currentPageGroupId = extractFacebookGroupIdFromUrl(location.href);
+    if (
+      session.groupId &&
+      candidateGroupId &&
+      candidateGroupId.toLowerCase() !== session.groupId.toLowerCase() &&
+      (!currentPageGroupId || candidateGroupId.toLowerCase() !== currentPageGroupId.toLowerCase())
+    ) {
+      continue;
+    }
+    console.log('[PostTracking] Accepted network pending-post candidate', {
+      jobId: session.jobId,
+      postUrl: candidate.value,
+      requestUrl: candidate.requestUrl,
+    });
+    return candidate.value;
   }
   return null;
 }
@@ -774,6 +810,19 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     activeJobId = message.jobId;
     executeFacebookPost(message.jobId, message.post, message.group)
       .then((submissionResult) => {
+        if (isFacebookPublishFailureResult(submissionResult)) {
+          chrome.runtime.sendMessage({
+            type: 'JOB_FAILED',
+            jobId: message.jobId,
+            postId: message.post?._id,
+            error: formatFacebookPublishFailure(submissionResult),
+            publishStatus: submissionResult.status,
+            shouldPauseQueue: submissionResult.shouldPauseQueue ?? false,
+            detector: submissionResult.detector,
+          });
+          return;
+        }
+
         // We actually use chrome.runtime.sendMessage to communicate status
         // because the tab might navigate or reload, but the background script listens for it.
         chrome.runtime.sendMessage({
@@ -790,6 +839,26 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 // ── Job Execution (DOM Manipulation) ──
+
+function isFacebookPublishFailureResult(
+  result: FacebookPostSubmissionResult,
+): result is Extract<FacebookPostSubmissionResult, { status: FacebookPublishInterruptionStatus }> {
+  return [
+    'TEMPORARY_BLOCK',
+    'CAPTCHA_OR_CHALLENGE',
+    'CHECKPOINT_OR_VERIFICATION',
+    'LOGIN_REQUIRED',
+    'UNEXPECTED_INTERRUPTION',
+  ].includes(result.status);
+}
+
+function formatFacebookPublishFailure(result: Extract<FacebookPostSubmissionResult, { status: FacebookPublishInterruptionStatus }>): string {
+  return [
+    result.status,
+    result.reason,
+    result.detector ? `detector=${result.detector}` : '',
+  ].filter(Boolean).join(': ');
+}
 
 function extractFacebookGroupIdFromUrl(value?: string): string | undefined {
   if (!value) return undefined;
@@ -1011,7 +1080,7 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
             text: textOption.textContent?.trim().slice(0, 80),
           });
         } else {
-          console.warn('[PostFlow] Could not find Post/Text button in intermediate modal — proceeding anyway');
+          console.log('[PostFlow] No Post/Text option found in intermediate modal; proceeding to composer detection');
           recordPostingStep(jobId, 'intermediate_post_option_missing');
         }
       }
@@ -1306,6 +1375,12 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
         submittedMediaCount: mediaUrls.length,
         currentGroupId,
         initialPageUrl,
+        getInterruption: () => detectFacebookPublishingInterruption({
+          root: document,
+          hasVideo,
+          activeComposer: document.body.contains(dialog) ? dialog : null,
+          initialPageUrl,
+        }),
         getFailureReason: () => {
           const dialogText = document.body.contains(dialog) ? ((dialog as HTMLElement).innerText ?? '') : '';
           const pageText = (document.body.innerText ?? '').toLowerCase();
@@ -1314,13 +1389,24 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
             : null;
         },
         getSuccessEvidence: getPublishSuccessEvidence,
+        getPendingPostUrl: () => getBestNetworkPendingPostUrl(trackingSession),
         getNetworkPostUrl: () => getBestNetworkPostUrl(trackingSession),
+        onStateChange: (status, details = {}) => {
+          recordPostingStep(jobId, 'publish_state_changed', {
+            status,
+            detector: typeof details.detector === 'string' ? details.detector : undefined,
+            source: typeof details.source === 'string' ? details.source : undefined,
+            shouldPauseQueue: typeof details.shouldPauseQueue === 'boolean' ? details.shouldPauseQueue : undefined,
+          });
+        },
       });
 
       recordPostingStep(jobId, 'submission_result_detected', {
         status: submissionResult.status,
         postUrl: 'postUrl' in submissionResult ? submissionResult.postUrl : undefined,
-        reason: submissionResult.status === 'UNKNOWN' ? submissionResult.reason : undefined,
+        reason: 'reason' in submissionResult ? submissionResult.reason : undefined,
+        detector: 'detector' in submissionResult ? submissionResult.detector : undefined,
+        shouldPauseQueue: 'shouldPauseQueue' in submissionResult ? submissionResult.shouldPauseQueue : undefined,
         networkCandidates: trackingSession.candidates.length,
         videoIds: trackingSession.mediaVideoIds.size,
         uploadSessionIds: trackingSession.uploadSessionIds.size,

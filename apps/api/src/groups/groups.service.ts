@@ -1,8 +1,11 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { Group, GroupDocument } from '../schemas/group.schema';
-import { PublishingJob, PublishingJobDocument } from '../schemas/publishing-job.schema';
+import {
+  PublishingJob,
+  PublishingJobDocument,
+} from '../schemas/publishing-job.schema';
 
 export interface SyncGroupDto {
   externalId: string;
@@ -50,7 +53,10 @@ export class GroupsService {
    * Upsert a batch of groups for the authenticated user.
    * Called by the extension whenever new groups are discovered.
    */
-  async syncGroups(clerkUserId: string, groups: SyncGroupDto[]): Promise<{ synced: number; total?: number }> {
+  async syncGroups(
+    clerkUserId: string,
+    groups: SyncGroupDto[],
+  ): Promise<{ synced: number; total?: number }> {
     if (!groups.length) return { synced: 0 };
 
     const ops = groups.map((g) => {
@@ -77,15 +83,17 @@ export class GroupsService {
     });
 
     const result = await this.groupModel.bulkWrite(ops);
-    
+
     // Calculate total groups for this user to help with debugging mismatches
     const totalInDb = await this.groupModel.countDocuments({ clerkUserId });
-    
-    console.log(`[Backend] Synced ${result.upsertedCount + result.modifiedCount} groups for user ${clerkUserId}. Total DB count: ${totalInDb}`);
 
-    return { 
+    console.log(
+      `[Backend] Synced ${result.upsertedCount + result.modifiedCount} groups for user ${clerkUserId}. Total DB count: ${totalInDb}`,
+    );
+
+    return {
       synced: result.upsertedCount + result.modifiedCount,
-      total: totalInDb 
+      total: totalInDb,
     };
   }
 
@@ -98,7 +106,7 @@ export class GroupsService {
       .sort({ lastSeenAt: -1 })
       .lean()
       .exec();
-      
+
     return groups.map((g) => ({ ...g, _id: g._id.toString() }));
   }
 
@@ -114,7 +122,7 @@ export class GroupsService {
       .sort({ lastSeenAt: -1 })
       .lean()
       .exec();
-      
+
     return groups.map((g) => ({ ...g, _id: g._id.toString() }));
   }
 
@@ -150,10 +158,14 @@ export class GroupsService {
   }
 
   async deleteAllGroups(clerkUserId: string) {
-    const groups = await this.groupModel.find({ clerkUserId }).select('_id').lean().exec();
+    const groups = await this.groupModel
+      .find({ clerkUserId })
+      .select('_id')
+      .lean()
+      .exec();
     const groupIds = groups.map((group) => group._id);
     if (groupIds.length) {
-      await this.jobModel.deleteMany({ groupId: { $in: groupIds } } as any).exec();
+      await this.jobModel.deleteMany().where('groupId').in(groupIds).exec();
     }
     await this.groupModel.deleteMany({ clerkUserId }).exec();
   }

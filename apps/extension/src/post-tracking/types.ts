@@ -5,9 +5,31 @@
  * approval re-checking, and historical analytics belong to later phases.
  */
 type FacebookPostStatus =
+  | "PUBLISHING"
   | "PUBLISHED"
   | "PENDING_APPROVAL"
+  | "TEMPORARY_BLOCK"
+  | "CAPTCHA_OR_CHALLENGE"
+  | "CHECKPOINT_OR_VERIFICATION"
+  | "LOGIN_REQUIRED"
+  | "UNEXPECTED_INTERRUPTION"
   | "UNKNOWN";
+
+type FacebookPublishInterruptionStatus =
+  | "TEMPORARY_BLOCK"
+  | "CAPTCHA_OR_CHALLENGE"
+  | "CHECKPOINT_OR_VERIFICATION"
+  | "LOGIN_REQUIRED"
+  | "UNEXPECTED_INTERRUPTION";
+
+interface FacebookPublishInterruption {
+  status: FacebookPublishInterruptionStatus;
+  reason: string;
+  source: "dom" | "navigation" | "composer" | "network" | "unknown";
+  detector: string;
+  shouldPauseQueue: boolean;
+  diagnosticText?: string;
+}
 
 type FacebookPostSubmissionResult =
   | {
@@ -21,6 +43,13 @@ type FacebookPostSubmissionResult =
   | {
       status: "UNKNOWN";
       reason?: string;
+    }
+  | {
+      status: FacebookPublishInterruptionStatus;
+      reason: string;
+      source?: FacebookPublishInterruption["source"];
+      detector?: string;
+      shouldPauseQueue?: boolean;
     };
 
 /** Minimal backend record needed to re-check a pending Facebook submission. */
@@ -48,6 +77,7 @@ type PendingPostSyncResult =
     }
   | {
       status: "STILL_PENDING";
+      postUrl?: string;
     }
   | {
       status: "CHECK_FAILED";

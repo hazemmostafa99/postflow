@@ -6,10 +6,16 @@ import { resolve } from 'node:path';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { User, UserSchema } from './schemas/user.schema';
-import { ExtensionInstallation, ExtensionInstallationSchema } from './schemas/extension-installation.schema';
+import {
+  ExtensionInstallation,
+  ExtensionInstallationSchema,
+} from './schemas/extension-installation.schema';
 import { Group, GroupSchema } from './schemas/group.schema';
 import { Post, PostSchema } from './schemas/post.schema';
-import { PublishingJob, PublishingJobSchema } from './schemas/publishing-job.schema';
+import {
+  PublishingJob,
+  PublishingJobSchema,
+} from './schemas/publishing-job.schema';
 import { ExtensionsModule } from './extensions/extensions.module';
 import { GroupsModule } from './groups/groups.module';
 import { PostsModule } from './posts/posts.module';
@@ -25,14 +31,16 @@ const envFilePath = [
   resolve(process.cwd(), 'apps/api/.env'),
   resolve(__dirname, '..', '.env'),
   resolve(__dirname, '..', '..', '.env'),
-].filter((path, index, paths) => existsSync(path) && paths.indexOf(path) === index);
+].filter(
+  (path, index, paths) => existsSync(path) && paths.indexOf(path) === index,
+);
 
 @Module({
   imports: [
     ConfigModule.forRoot({ envFilePath, isGlobal: true }),
     MongooseModule.forRootAsync({
       imports: [ConfigModule],
-      useFactory: async (configService: ConfigService) => ({
+      useFactory: (configService: ConfigService) => ({
         uri: configService.get<string>('DATABASE_URL'),
       }),
       inject: [ConfigService],

@@ -62,7 +62,9 @@ export class PublishingJob {
   publishedDetectedAt?: Date;
 
   /** Latest visible Facebook engagement counters. Kept separate from approval-sync metadata. */
-  @Prop({ type: { reactionCount: Number, commentCount: Number, lastSyncedAt: Date } })
+  @Prop({
+    type: { reactionCount: Number, commentCount: Number, lastSyncedAt: Date },
+  })
   engagement?: {
     reactionCount?: number;
     commentCount?: number;

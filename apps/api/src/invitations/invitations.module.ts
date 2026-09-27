@@ -10,11 +10,15 @@ import { InvitationsController } from './invitations.controller';
 import { InvitationsService } from './invitations.service';
 
 @Module({
-  imports: [AuthModule, UsersModule, MongooseModule.forFeature([
-    { name: Invitation.name, schema: InvitationSchema },
-    { name: Team.name, schema: TeamSchema },
-    { name: User.name, schema: UserSchema },
-  ])],
+  imports: [
+    AuthModule,
+    UsersModule,
+    MongooseModule.forFeature([
+      { name: Invitation.name, schema: InvitationSchema },
+      { name: Team.name, schema: TeamSchema },
+      { name: User.name, schema: UserSchema },
+    ]),
+  ],
   controllers: [InvitationsController],
   providers: [ClerkInvitationsService, InvitationsService],
 })

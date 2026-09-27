@@ -11,16 +11,18 @@ export function isEligibleForEngagementSync(
   job: EngagementQueueCandidate,
   now = new Date(),
 ): boolean {
-  return job.status === 'SUCCESS'
-    && job.submissionStatus === 'PUBLISHED'
-    && Boolean(job.postUrl)
-    && (!job.nextEngagementSyncAt || job.nextEngagementSyncAt <= now);
+  return (
+    job.status === 'SUCCESS' &&
+    job.submissionStatus === 'PUBLISHED' &&
+    Boolean(job.postUrl) &&
+    (!job.nextEngagementSyncAt || job.nextEngagementSyncAt <= now)
+  );
 }
 
 export function getEngagementQueueFilter(now = new Date()) {
   return {
     status: 'SUCCESS',
-    submissionStatus: 'PUBLISHED',
+    submissionStatus: 'PUBLISHED' as const,
     postUrl: { $exists: true, $ne: '' },
     $or: [
       { nextEngagementSyncAt: { $exists: false } },

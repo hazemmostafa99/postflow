@@ -89,8 +89,13 @@
   }
 
   function extractPostUrls(text: string): string[] {
-    const normalized = text.replace(/\\\//g, '/');
-    const matches = normalized.match(new RegExp('https?://(?:www\\.)?facebook\\.com/groups/[^\\s"<>]+?/(?:posts|permalink|pending_posts)/[A-Za-z0-9_-]+[^\\s"<>]*', 'gi')) ?? [];
+    const normalized = text.replace(/\\\//g, '/').replace(/&amp;/g, '&');
+    const matches = [
+      ...Array.from(normalized.matchAll(/https?:\/\/(?:www\.)?facebook\.com\/groups\/[^\s"<>\\]+?\/(?:posts|permalink|pending_posts)\/[A-Za-z0-9_-]+[^\s"<>\\]*/gi), (match) => match[0]),
+      ...Array.from(normalized.matchAll(/\/\/(?:www\.)?facebook\.com\/groups\/[^\s"<>\\]+?\/(?:posts|permalink|pending_posts)\/[A-Za-z0-9_-]+[^\s"<>\\]*/gi), (match) => `https:${match[0]}`),
+      ...Array.from(normalized.matchAll(/(?:www\.)facebook\.com\/groups\/[^\s"<>\\]+?\/(?:posts|permalink|pending_posts)\/[A-Za-z0-9_-]+[^\s"<>\\]*/gi), (match) => `https://${match[0]}`),
+      ...Array.from(normalized.matchAll(/\/groups\/[^/\s"<>\\]+\/(?:posts|permalink|pending_posts)\/[A-Za-z0-9_-]+[^\s"<>\\]*/gi), (match) => `https://www.facebook.com${match[0]}`),
+    ];
     return Array.from(new Set(matches.map((value: string) => {
       try {
         const url = new URL(value.replace(/[\\"']+$/g, ''));

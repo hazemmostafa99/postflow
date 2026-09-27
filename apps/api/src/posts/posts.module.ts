@@ -4,7 +4,10 @@ import { PostsService } from './posts.service';
 import { PostsController } from './posts.controller';
 import { JobsController } from './jobs.controller';
 import { Post, PostSchema } from '../schemas/post.schema';
-import { PublishingJob, PublishingJobSchema } from '../schemas/publishing-job.schema';
+import {
+  PublishingJob,
+  PublishingJobSchema,
+} from '../schemas/publishing-job.schema';
 import { Group, GroupSchema } from '../schemas/group.schema';
 
 @Module({

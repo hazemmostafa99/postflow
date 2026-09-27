@@ -18,4 +18,6 @@ export class ExtensionInstallation {
   facebookSessionDetected: boolean;
 }
 
-export const ExtensionInstallationSchema = SchemaFactory.createForClass(ExtensionInstallation);
+export const ExtensionInstallationSchema = SchemaFactory.createForClass(
+  ExtensionInstallation,
+);

@@ -52,9 +52,11 @@ describe('calculatePostSchedule', () => {
       spacingMinutes: null,
     });
 
-    expect(result.every((item) => item.scheduledAt.getTime() === startTime.getTime())).toBe(
-      true,
-    );
+    expect(
+      result.every(
+        (item) => item.scheduledAt.getTime() === startTime.getTime(),
+      ),
+    ).toBe(true);
   });
 
   it('handles a single post', () => {

@@ -116,10 +116,14 @@ function checkPendingFacebookPost(
     expectedPostUrl: post.postUrl,
   });
 
-  if (!match) return { status: "STILL_PENDING" };
+  if (!match) {
+    return post.postUrl
+      ? { status: "STILL_PENDING", postUrl: post.postUrl }
+      : { status: "CHECK_FAILED", reason: "Pending post link was not found" };
+  }
   // A matching /pending_posts/ permalink confirms the post still exists in
   // Facebook's approval queue. It must not transition the job to PUBLISHED.
-  if (isFacebookPendingUrl(match.postUrl)) return { status: "STILL_PENDING" };
+  if (isFacebookPendingUrl(match.postUrl)) return { status: "STILL_PENDING", postUrl: match.postUrl };
   return {
     status: "PUBLISHED",
     ...(match.postUrl ? { postUrl: match.postUrl } : {}),
