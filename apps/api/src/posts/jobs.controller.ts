@@ -18,6 +18,7 @@ import {
   FacebookSubmissionStatus,
   PublishingJob,
   PublishingJobDocument,
+  PublishingJobStatus,
 } from '../schemas/publishing-job.schema';
 import { Post as PostSchema, PostDocument } from '../schemas/post.schema';
 import { getNextPendingPostCheckAt } from './pending-sync-schedule';
@@ -220,14 +221,20 @@ export class JobsController {
               },
             ],
             $or: [
-              { status: 'PENDING' },
-              { status: 'RUNNING', claimExpiresAt: { $lte: now } },
-              { status: 'RUNNING', claimExpiresAt: { $exists: false } },
+              { status: PublishingJobStatus.PENDING },
+              {
+                status: PublishingJobStatus.RUNNING,
+                claimExpiresAt: { $lte: now },
+              },
+              {
+                status: PublishingJobStatus.RUNNING,
+                claimExpiresAt: { $exists: false },
+              },
             ],
           } as any,
           {
             $set: {
-              status: 'RUNNING',
+              status: PublishingJobStatus.RUNNING,
               claimedByExtensionInstanceId: normalizedInstanceId,
               claimExpiresAt: leaseExpiresAt,
               startedAt: now,
@@ -245,7 +252,7 @@ export class JobsController {
       job = await this.jobModel
         .findOne({
           ...ownershipFilter,
-          status: 'PENDING',
+          status: PublishingJobStatus.PENDING,
           $or: [
             { scheduledFor: { $exists: false } },
             { scheduledFor: null },
@@ -411,6 +418,27 @@ export class JobsController {
         ? { nextEngagementSyncAt: job.nextEngagementSyncAt.toISOString() }
         : {}),
     }));
+  }
+
+  @Get(':id')
+  async getJob(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
+    @Param('id') id: string,
+  ) {
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    const job = await this.jobModel.findById(id).populate('postId').exec();
+    if (!job) throw new NotFoundException('Job not found');
+    const post = job.postId as unknown as PostDocument;
+    if (post.clerkUserId !== clerkUserId) {
+      throw new UnauthorizedException('Not your job');
+    }
+    await this.assertWorkerOwnsJob(clerkUserId, extensionInstanceId, job);
+    return {
+      id: job._id.toString(),
+      status: job.status,
+    };
   }
 
   /** POST /api/jobs/:id/engagement — persist counters extracted by the extension. */
@@ -654,11 +682,12 @@ export class JobsController {
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
-    const allowedStatuses = new Set([
-      'PENDING',
-      'RUNNING',
-      'SUCCESS',
-      'FAILED',
+    const allowedStatuses = new Set<string>([
+      PublishingJobStatus.PENDING,
+      PublishingJobStatus.RUNNING,
+      PublishingJobStatus.SUCCESS,
+      PublishingJobStatus.FAILED,
+      PublishingJobStatus.CANCELED,
     ]);
     if (!allowedStatuses.has(body.status)) {
       throw new BadRequestException('Invalid job status');
@@ -707,6 +736,20 @@ export class JobsController {
 
     const previousStatus = job.status;
     if (
+      body.status === PublishingJobStatus.CANCELED &&
+      previousStatus !== PublishingJobStatus.CANCEL_REQUESTED
+    ) {
+      throw new BadRequestException('Only cancel-requested jobs can be canceled');
+    }
+    if (
+      previousStatus === PublishingJobStatus.CANCEL_REQUESTED &&
+      body.status !== PublishingJobStatus.SUCCESS &&
+      body.status !== PublishingJobStatus.FAILED &&
+      body.status !== PublishingJobStatus.CANCELED
+    ) {
+      throw new BadRequestException('Job cancellation was requested');
+    }
+    if (
       body.submissionResult &&
       job.submissionStatus === FacebookSubmissionStatus.PUBLISHED &&
       body.submissionResult.status !== FacebookSubmissionStatus.PUBLISHED
@@ -716,18 +759,21 @@ export class JobsController {
       );
     }
     job.status = body.status;
-    job.error = body.status === 'FAILED' ? body.error : undefined;
-    if (normalizedInstanceId && body.status === 'RUNNING') {
+    job.error =
+      body.status === PublishingJobStatus.FAILED ? body.error : undefined;
+    if (normalizedInstanceId && body.status === PublishingJobStatus.RUNNING) {
       job.claimedByExtensionInstanceId = normalizedInstanceId;
       job.claimExpiresAt = new Date(Date.now() + JobsController.JOB_CLAIM_LEASE_MS);
     } else if (
       normalizedInstanceId &&
-      (body.status === 'SUCCESS' || body.status === 'FAILED')
+      (body.status === PublishingJobStatus.SUCCESS ||
+        body.status === PublishingJobStatus.FAILED ||
+        body.status === PublishingJobStatus.CANCELED)
     ) {
       job.claimedByExtensionInstanceId = undefined;
       job.claimExpiresAt = undefined;
     }
-    if (workerConnectionId && body.status === 'RUNNING') {
+    if (workerConnectionId && body.status === PublishingJobStatus.RUNNING) {
       await this.connectionModel.updateOne(
         { _id: workerConnectionId },
         {
@@ -739,7 +785,9 @@ export class JobsController {
       );
     } else if (
       workerConnectionId &&
-      (body.status === 'SUCCESS' || body.status === 'FAILED')
+      (body.status === PublishingJobStatus.SUCCESS ||
+        body.status === PublishingJobStatus.FAILED ||
+        body.status === PublishingJobStatus.CANCELED)
     ) {
       await this.connectionModel.updateOne(
         { _id: workerConnectionId },
@@ -820,13 +868,16 @@ export class JobsController {
 
     // Increment attempts if it just finished (success or fail)
     if (
-      (body.status === 'SUCCESS' || body.status === 'FAILED') &&
-      previousStatus !== 'SUCCESS' &&
-      previousStatus !== 'FAILED'
+      (body.status === PublishingJobStatus.SUCCESS ||
+        body.status === PublishingJobStatus.FAILED) &&
+      previousStatus !== PublishingJobStatus.SUCCESS &&
+      previousStatus !== PublishingJobStatus.FAILED
     ) {
       job.attempts = (job.attempts || 0) + 1;
       job.completedAt = new Date();
-    } else if (body.status === 'RUNNING') {
+    } else if (body.status === PublishingJobStatus.CANCELED) {
+      job.completedAt = new Date();
+    } else if (body.status === PublishingJobStatus.RUNNING) {
       job.startedAt = new Date();
     }
 
@@ -847,16 +898,42 @@ export class JobsController {
 
     if (!jobs.length) return;
 
-    const allSucceeded = jobs.every((job) => job.status === 'SUCCESS');
-    const anyFailed = jobs.some((job) => job.status === 'FAILED');
-    const allFinished = jobs.every(
-      (job) => job.status === 'SUCCESS' || job.status === 'FAILED',
+    const allSucceeded = jobs.every(
+      (job) => job.status === PublishingJobStatus.SUCCESS,
+    );
+    const anyFailed = jobs.some(
+      (job) => job.status === PublishingJobStatus.FAILED,
+    );
+    const allFinished = jobs.every((job) =>
+      [
+        PublishingJobStatus.SUCCESS,
+        PublishingJobStatus.FAILED,
+        PublishingJobStatus.CANCELED,
+      ].includes(job.status as PublishingJobStatus),
+    );
+    const allCanceled = jobs.every(
+      (job) => job.status === PublishingJobStatus.CANCELED,
+    );
+    const anyCanceled = jobs.some(
+      (job) => job.status === PublishingJobStatus.CANCELED,
+    );
+    const anyPaused = jobs.some(
+      (job) => job.status === PublishingJobStatus.PAUSED,
+    );
+    const anyCancelRequested = jobs.some(
+      (job) => job.status === PublishingJobStatus.CANCEL_REQUESTED,
     );
 
     if (allSucceeded) {
       post.status = 'COMPLETED';
+    } else if (allCanceled) {
+      post.status = 'CANCELED';
     } else if (allFinished && anyFailed) {
       post.status = 'PARTIAL_FAILURE';
+    } else if (allFinished && anyCanceled) {
+      post.status = 'CANCELED';
+    } else if (anyPaused && !anyCancelRequested) {
+      post.status = 'PAUSED';
     } else {
       post.status = 'PUBLISHING';
     }

@@ -845,7 +845,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         });
       })
       .catch((err) => {
-        chrome.runtime.sendMessage({ type: 'JOB_FAILED', jobId: message.jobId, postId: message.post?._id, error: err.message });
+        chrome.runtime.sendMessage({
+          type: err?.name === 'PostFlowJobCanceled' ? 'JOB_CANCELED' : 'JOB_FAILED',
+          jobId: message.jobId,
+          postId: message.post?._id,
+          error: err.message,
+        });
       });
   }
 });
@@ -1293,6 +1298,17 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
         existingPostUrls,
       });
       activePublishTrackingSession = trackingSession;
+
+      const latestJob = await chrome.runtime.sendMessage({
+        type: 'GET_JOB_STATUS',
+        jobId,
+      }).catch(() => null);
+      if (latestJob?.job?.status === 'CANCEL_REQUESTED') {
+        recordPostingStep(jobId, 'job_canceled_before_final_submit');
+        const cancelError = new Error('Canceled before clicking Facebook Post');
+        cancelError.name = 'PostFlowJobCanceled';
+        throw cancelError;
+      }
 
       (postButton as HTMLElement).click();
       trackingSession.acceptCandidatesAfter = Date.now();

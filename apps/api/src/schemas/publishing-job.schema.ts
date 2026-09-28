@@ -11,6 +11,16 @@ export enum FacebookSubmissionStatus {
   UNKNOWN = 'UNKNOWN',
 }
 
+export enum PublishingJobStatus {
+  PENDING = 'PENDING',
+  RUNNING = 'RUNNING',
+  SUCCESS = 'SUCCESS',
+  FAILED = 'FAILED',
+  PAUSED = 'PAUSED',
+  CANCELED = 'CANCELED',
+  CANCEL_REQUESTED = 'CANCEL_REQUESTED',
+}
+
 @Schema({ timestamps: true })
 export class PublishingJob {
   @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'Post', required: true })
@@ -27,7 +37,7 @@ export class PublishingJob {
   })
   facebookConnectionId?: Types.ObjectId;
 
-  @Prop({ required: true, default: 'PENDING' })
+  @Prop({ required: true, default: PublishingJobStatus.PENDING })
   status: string;
 
   /** Worker lease used to recover jobs after an extension restart. */

@@ -75,6 +75,39 @@ export class PostsController {
     return this.postsService.updatePostSchedule(clerkUserId, id, body);
   }
 
+  @Post(':id/pause')
+  @HttpCode(HttpStatus.OK)
+  async pause(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('id') id: string,
+  ) {
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    return this.postsService.pausePost(clerkUserId, id);
+  }
+
+  @Post(':id/resume')
+  @HttpCode(HttpStatus.OK)
+  async resume(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('id') id: string,
+  ) {
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    return this.postsService.resumePost(clerkUserId, id);
+  }
+
+  @Post(':id/cancel')
+  @HttpCode(HttpStatus.OK)
+  async cancel(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('id') id: string,
+  ) {
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    return this.postsService.cancelPost(clerkUserId, id);
+  }
+
   /** DELETE /api/posts - delete all posts and their publishing jobs */
   @Delete()
   @HttpCode(HttpStatus.NO_CONTENT)

@@ -9,6 +9,7 @@ import { Post, PostDocument } from '../schemas/post.schema';
 import {
   PublishingJob,
   PublishingJobDocument,
+  PublishingJobStatus,
 } from '../schemas/publishing-job.schema';
 import { Group, GroupDocument } from '../schemas/group.schema';
 import { calculatePostSchedule } from './post-flow-time-spacing';
@@ -32,6 +33,8 @@ export interface ListPostsOptions {
   page?: number;
   limit?: number;
 }
+
+type PostControlAction = 'pause' | 'resume' | 'cancel';
 
 type LeanJobSummary = {
   _id: Types.ObjectId;
@@ -150,7 +153,7 @@ export class PostsService {
       ...(group.facebookConnectionId
         ? { facebookConnectionId: group.facebookConnectionId }
         : {}),
-      status: 'PENDING',
+      status: PublishingJobStatus.PENDING,
       attempts: 0,
       flowOrder,
       ...(scheduledByGroupId.has(group._id.toString())
@@ -192,7 +195,7 @@ export class PostsService {
     }
 
     const pendingJobs = await this.jobModel
-      .find({ status: 'PENDING' })
+      .find({ status: PublishingJobStatus.PENDING })
       .where('postId')
       .equals(post._id)
       .sort({ flowOrder: 1, createdAt: 1, _id: 1 })
@@ -397,6 +400,91 @@ export class PostsService {
     };
   }
 
+  async pausePost(clerkUserId: string, postId: string) {
+    return this.applyPostControl(clerkUserId, postId, 'pause');
+  }
+
+  async resumePost(clerkUserId: string, postId: string) {
+    return this.applyPostControl(clerkUserId, postId, 'resume');
+  }
+
+  async cancelPost(clerkUserId: string, postId: string) {
+    return this.applyPostControl(clerkUserId, postId, 'cancel');
+  }
+
+  private async applyPostControl(
+    clerkUserId: string,
+    postId: string,
+    action: PostControlAction,
+  ) {
+    const post = await this.postModel
+      .findOne({ _id: postId, clerkUserId })
+      .exec();
+    if (!post) throw new NotFoundException('Post not found');
+    const postRef = post._id as unknown as Post;
+
+    let updatedJobs = 0;
+    if (action === 'pause') {
+      const result = await this.jobModel
+        .updateMany(
+          { postId: postRef, status: PublishingJobStatus.PENDING },
+          { $set: { status: PublishingJobStatus.PAUSED } },
+        )
+        .exec();
+      updatedJobs = result.modifiedCount ?? 0;
+    } else if (action === 'resume') {
+      const result = await this.jobModel
+        .updateMany(
+          { postId: postRef, status: PublishingJobStatus.PAUSED },
+          { $set: { status: PublishingJobStatus.PENDING } },
+        )
+        .exec();
+      updatedJobs = result.modifiedCount ?? 0;
+    } else {
+      const [queuedResult, runningResult] = await Promise.all([
+        this.jobModel
+          .updateMany(
+            {
+              postId: postRef,
+              status: {
+                $in: [
+                  PublishingJobStatus.PENDING,
+                  PublishingJobStatus.PAUSED,
+                ],
+              },
+            },
+            {
+              $set: {
+                status: PublishingJobStatus.CANCELED,
+                completedAt: new Date(),
+              },
+              $unset: {
+                claimedByExtensionInstanceId: 1,
+                claimExpiresAt: 1,
+              },
+            },
+          )
+          .exec(),
+        this.jobModel
+          .updateMany(
+            { postId: postRef, status: PublishingJobStatus.RUNNING },
+            { $set: { status: PublishingJobStatus.CANCEL_REQUESTED } },
+          )
+          .exec(),
+      ]);
+      updatedJobs =
+        (queuedResult.modifiedCount ?? 0) + (runningResult.modifiedCount ?? 0);
+    }
+
+    await this.updateParentPostStatus(post);
+
+    return {
+      post: { ...post.toObject(), _id: post._id.toString() },
+      action,
+      updatedJobs,
+    };
+  }
+
   async deleteAllPosts(clerkUserId: string) {
     const posts = await this.postModel
       .find({ clerkUserId })
@@ -408,5 +496,59 @@ export class PostsService {
       await this.jobModel.deleteMany().where('postId').in(postIds).exec();
     }
     await this.postModel.deleteMany({ clerkUserId }).exec();
+  }
+
+  private async updateParentPostStatus(post: PostDocument) {
+    const jobs = await this.jobModel
+      .find()
+      .where('postId')
+      .equals(post._id)
+      .select('status')
+      .lean()
+      .exec();
+
+    if (!jobs.length) return;
+
+    const allSucceeded = jobs.every(
+      (job) => job.status === PublishingJobStatus.SUCCESS,
+    );
+    const anyFailed = jobs.some(
+      (job) => job.status === PublishingJobStatus.FAILED,
+    );
+    const allFinished = jobs.every((job) =>
+      [
+        PublishingJobStatus.SUCCESS,
+        PublishingJobStatus.FAILED,
+        PublishingJobStatus.CANCELED,
+      ].includes(job.status as PublishingJobStatus),
+    );
+    const allCanceled = jobs.every(
+      (job) => job.status === PublishingJobStatus.CANCELED,
+    );
+    const anyCanceled = jobs.some(
+      (job) => job.status === PublishingJobStatus.CANCELED,
+    );
+    const anyPaused = jobs.some(
+      (job) => job.status === PublishingJobStatus.PAUSED,
+    );
+    const anyCancelRequested = jobs.some(
+      (job) => job.status === PublishingJobStatus.CANCEL_REQUESTED,
+    );
+
+    if (allSucceeded) {
+      post.status = 'COMPLETED';
+    } else if (allCanceled) {
+      post.status = 'CANCELED';
+    } else if (allFinished && anyFailed) {
+      post.status = 'PARTIAL_FAILURE';
+    } else if (allFinished && anyCanceled) {
+      post.status = 'CANCELED';
+    } else if (anyPaused && !anyCancelRequested) {
+      post.status = 'PAUSED';
+    } else {
+      post.status = 'PUBLISHING';
+    }
+
+    await post.save();
   }
 }

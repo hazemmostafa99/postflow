@@ -6,6 +6,7 @@ import { RefreshGroupStatusButton, RefreshPostStatusControls } from "@/component
 import { RefreshPostEngagementButton, RefreshAllPostEngagementButton } from "@/components/refresh-post-engagement-button";
 import { ScheduledTime } from "@/components/scheduled-time";
 import { PostScheduleEditor } from "@/components/post-schedule-editor";
+import { PostControlButtons } from "@/components/post-control-buttons";
 
 const API_BASE = process.env.API_URL || "http://localhost:8000";
 
@@ -83,6 +84,29 @@ function JobStatusBadge({ job }: { job: Job }) {
       </span>
     );
   }
+  if (status === "PAUSED") {
+    return (
+      <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-sky-500/10 text-sky-400 border border-sky-500/20">
+        <span className="w-1.5 h-1.5 rounded-full bg-sky-400" />
+        Paused
+      </span>
+    );
+  }
+  if (status === "CANCEL_REQUESTED") {
+    return (
+      <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-500/10 text-red-400 border border-red-500/20">
+        <span className="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse" />
+        Canceling
+      </span>
+    );
+  }
+  if (status === "CANCELED") {
+    return (
+      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-zinc-500/10 text-zinc-400 border border-zinc-500/20">
+        Canceled
+      </span>
+    );
+  }
   if (status === "FAILED") {
     return (
       <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-500/10 text-red-400 border border-red-500/20">
@@ -119,11 +143,20 @@ function OverallStatusBadge({ jobs }: { jobs: Job[] }) {
   const success = jobs.filter((j) => j.status === "SUCCESS").length;
   const failed = jobs.filter((j) => j.status === "FAILED").length;
   const pending = jobs.filter((j) => j.status === "PENDING" || j.status === "RUNNING").length;
+  const paused = jobs.filter((j) => j.status === "PAUSED").length;
+  const canceled = jobs.filter((j) => j.status === "CANCELED").length;
+  const cancelRequested = jobs.filter((j) => j.status === "CANCEL_REQUESTED").length;
   const pendingApproval = jobs.filter((j) => j.submissionStatus === "PENDING_APPROVAL").length;
   const unknown = jobs.filter((j) => j.submissionStatus === "UNKNOWN").length;
 
+  if (cancelRequested > 0) {
+    return <span className="text-red-500">Canceling current job</span>;
+  }
   if (pending > 0) {
     return <span className="text-amber-500">Publishing ({pending} remaining)</span>;
+  }
+  if (paused > 0) {
+    return <span className="text-sky-500">Paused ({paused} remaining)</span>;
   }
   if (pendingApproval > 0) {
     return <span className="text-amber-500">Pending approval ({pendingApproval})</span>;
@@ -136,6 +169,12 @@ function OverallStatusBadge({ jobs }: { jobs: Job[] }) {
   }
   if (failed === jobs.length) {
     return <span className="text-red-500">Failed</span>;
+  }
+  if (canceled === jobs.length) {
+    return <span className="text-zinc-500">Canceled</span>;
+  }
+  if (canceled > 0) {
+    return <span className="text-zinc-500">Stopped ({jobs.length - canceled}/{jobs.length})</span>;
   }
   return <span className="text-emerald-500">Published</span>;
 }
@@ -186,6 +225,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
           </div>
           <div className="flex flex-col items-start gap-3 text-sm font-medium sm:flex-row sm:flex-wrap sm:items-center lg:justify-end">
             <OverallStatusBadge jobs={post.jobs} />
+            <PostControlButtons postId={post._id} jobs={post.jobs} />
             {post.jobs.some((job) => job.submissionStatus === "PUBLISHED" && job.postUrl) && (
               <RefreshAllPostEngagementButton postId={post._id} />
             )}

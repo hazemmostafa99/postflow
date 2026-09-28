@@ -4,6 +4,7 @@ import Link from "next/link";
 import { AlertCircle, ArrowRight, Clock, FileText, Image as ImageIcon, Users } from "lucide-react";
 import { NewPostDialog } from "@/components/new-post-dialog";
 import { ScheduledTime } from "@/components/scheduled-time";
+import { PostControlButtons } from "@/components/post-control-buttons";
 
 const API_BASE = process.env.API_URL || "http://localhost:8000";
 const POSTS_PER_PAGE = 10;
@@ -84,14 +85,33 @@ function PostStatusBadge({ jobs }: { jobs: Job[] }) {
   const success = jobs.filter((j) => j.status === "SUCCESS").length;
   const failed = jobs.filter((j) => j.status === "FAILED").length;
   const pending = jobs.filter((j) => j.status === "PENDING" || j.status === "RUNNING").length;
+  const paused = jobs.filter((j) => j.status === "PAUSED").length;
+  const canceled = jobs.filter((j) => j.status === "CANCELED").length;
+  const cancelRequested = jobs.filter((j) => j.status === "CANCEL_REQUESTED").length;
   const pendingApproval = jobs.filter((j) => j.submissionStatus === "PENDING_APPROVAL").length;
   const unknown = jobs.filter((j) => j.submissionStatus === "UNKNOWN").length;
 
+  if (cancelRequested > 0) {
+    return (
+      <span className="inline-flex items-center gap-1.5 rounded-full border border-red-500/20 bg-red-500/10 px-2.5 py-0.5 text-xs font-medium text-red-600">
+        <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse" />
+        Canceling
+      </span>
+    );
+  }
   if (pending > 0) {
     return (
       <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/20 bg-amber-500/10 px-2.5 py-0.5 text-xs font-medium text-amber-600">
         <span className="h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse" />
         Pending ({pending})
+      </span>
+    );
+  }
+  if (paused > 0) {
+    return (
+      <span className="inline-flex items-center gap-1.5 rounded-full border border-sky-500/20 bg-sky-500/10 px-2.5 py-0.5 text-xs font-medium text-sky-600">
+        <span className="h-1.5 w-1.5 rounded-full bg-sky-500" />
+        Paused ({paused})
       </span>
     );
   }
@@ -121,6 +141,20 @@ function PostStatusBadge({ jobs }: { jobs: Job[] }) {
     return (
       <span className="inline-flex items-center rounded-full border border-red-500/20 bg-red-500/10 px-2.5 py-0.5 text-xs font-medium text-red-600">
         Failed
+      </span>
+    );
+  }
+  if (canceled === jobs.length) {
+    return (
+      <span className="inline-flex items-center rounded-full border border-zinc-500/20 bg-zinc-500/10 px-2.5 py-0.5 text-xs font-medium text-zinc-500">
+        Canceled
+      </span>
+    );
+  }
+  if (canceled > 0) {
+    return (
+      <span className="inline-flex items-center rounded-full border border-zinc-500/20 bg-zinc-500/10 px-2.5 py-0.5 text-xs font-medium text-zinc-500">
+        Stopped ({jobs.length - canceled}/{jobs.length})
       </span>
     );
   }
@@ -162,7 +196,7 @@ export default async function PostsPage({
   const postsResult = await fetchPosts(userId, page);
   const { posts, pagination } = postsResult;
   const visibleJobs = posts.reduce((total, post) => total + post.jobs.length, 0);
-  const activeJobs = posts.flatMap((post) => post.jobs).filter((job) => job.status === "PENDING" || job.status === "RUNNING").length;
+  const activeJobs = posts.flatMap((post) => post.jobs).filter((job) => job.status === "PENDING" || job.status === "RUNNING" || job.status === "CANCEL_REQUESTED").length;
 
   return (
     <div className="page-shell">
@@ -246,13 +280,16 @@ export default async function PostsPage({
                         <ScheduledTime value={scheduledFor} className="text-muted-foreground" />
                       </td>
                       <td className="px-4 py-4 text-right">
-                        <Link
-                          href={`/posts/${post._id}`}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-medium transition-colors hover:bg-accent"
-                        >
-                          View
-                          <ArrowRight className="h-3 w-3" />
-                        </Link>
+                        <div className="flex flex-col items-end gap-2">
+                          <PostControlButtons postId={post._id} jobs={post.jobs} compact />
+                          <Link
+                            href={`/posts/${post._id}`}
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-medium transition-colors hover:bg-accent"
+                          >
+                            View
+                            <ArrowRight className="h-3 w-3" />
+                          </Link>
+                        </div>
                       </td>
                     </tr>
                   );

@@ -139,6 +139,11 @@ async function updateJobStatus(
     };
   },
 ) {
+  if (body.status === 'RUNNING') {
+    await chrome.storage.local.set({ extensionWorkerStatus: 'PUBLISHING' });
+  } else if (body.status === 'SUCCESS' || body.status === 'FAILED' || body.status === 'CANCELED') {
+    await chrome.storage.local.set({ extensionWorkerStatus: 'IDLE' });
+  }
   return apiFetch(`/api/jobs/${jobId}/status`, body);
 }
 
@@ -182,6 +187,7 @@ async function sendHeartbeat() {
 type FacebookConnectionSessionResponse = {
   connection?: {
     status?: string;
+    workerStatus?: string;
     facebookUserId?: string;
     detectedFacebookUserId?: string;
   };
@@ -212,6 +218,7 @@ async function reportSession(sessionDetected: boolean, facebookUserId?: string |
     await chrome.storage.local.set({
       facebookIdentityVerified,
       facebookConnectionStatus,
+      extensionWorkerStatus: connection?.workerStatus ?? (facebookIdentityVerified ? 'IDLE' : 'UNKNOWN'),
       expectedFacebookUserId: connection?.facebookUserId ?? null,
       detectedFacebookUserId: connection?.detectedFacebookUserId ?? normalizedFacebookUserId ?? null,
     });
@@ -274,6 +281,10 @@ type ExtensionWorkerStatus =
   | 'MANUAL_INTERVENTION_REQUIRED';
 
 async function reportWorkerStatus(workerStatus: ExtensionWorkerStatus, reason?: string) {
+  await chrome.storage.local.set({
+    extensionWorkerStatus: workerStatus,
+    extensionWorkerReason: reason ? reason.slice(0, 500) : null,
+  });
   const result = await apiFetch('/api/extensions/status', {
     workerStatus,
     ...(reason ? { reason: reason.slice(0, 500) } : {}),
@@ -472,6 +483,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'TRIGGER_JOB_CHECK') {
     checkPendingJobs();
   }
+  if (message.type === 'GET_JOB_STATUS' && typeof message.jobId === 'string') {
+    void apiFetch(`/api/jobs/${message.jobId}`)
+      .then((job) => sendResponse({ ok: Boolean(job), job }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message ?? 'Could not fetch job status' }));
+    return true;
+  }
   if (message.type === 'RESUME_PUBLISH_QUEUE') {
     publishQueuePaused = null;
     void chrome.storage.local.remove('publishQueuePaused');
@@ -590,6 +607,16 @@ async function checkPendingJobs() {
       return;
     }
     console.log('[PostFlow] Target Facebook group page is loaded; waiting for content script', targetUrl);
+
+    const latestJob = await apiFetch(`/api/jobs/${job._id}`) as { status?: string } | null;
+    if (latestJob?.status === 'CANCEL_REQUESTED') {
+      console.warn('[PostFlow] Job was canceled before Facebook execution started:', job._id);
+      await updateJobStatus(job._id, { status: 'CANCELED' });
+      isProcessingJob = false;
+      activeExecution = null;
+      checkPendingJobs();
+      return;
+    }
 
       let sent = false;
       let sendInFlight = false;
@@ -889,6 +916,17 @@ chrome.runtime.onMessage.addListener((message, sender) => {
       isProcessingJob = false;
       activeExecution = null;
       if (!publishQueuePaused) checkPendingJobs();
+    })();
+  }
+  if (message.type === 'JOB_CANCELED') {
+    if (!isCurrentExecutionResult(message, sender)) return;
+    void (async () => {
+      console.warn('[PostFlow] Job canceled before Facebook submit:', message.jobId);
+      finishExecutionHandshake?.();
+      await updateJobStatus(message.jobId, { status: 'CANCELED' });
+      isProcessingJob = false;
+      activeExecution = null;
+      checkPendingJobs();
     })();
   }
 });
