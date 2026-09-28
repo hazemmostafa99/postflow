@@ -1,18 +1,10 @@
 import {
-  BadRequestException,
-  ConflictException,
   ForbiddenException,
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
-import {
-  Invitation,
-  InvitationDocument,
-  InvitationStatus,
-} from '../schemas/invitation.schema';
-import { Team, TeamDocument } from '../schemas/team.schema';
 import {
   User,
   UserDocument,
@@ -24,9 +16,6 @@ import {
 export class AuthorizationService {
   constructor(
     @InjectModel(User.name) private readonly userModel: Model<UserDocument>,
-    @InjectModel(Invitation.name)
-    private readonly invitationModel: Model<InvitationDocument>,
-    @InjectModel(Team.name) private readonly teamModel: Model<TeamDocument>,
   ) {}
 
   async requireActiveUser(clerkUserId: string): Promise<UserDocument> {
@@ -54,50 +43,25 @@ export class AuthorizationService {
     }
 
     const normalizedEmail = email?.trim().toLowerCase();
-    if (!normalizedEmail)
-      throw new UnauthorizedException('PostFlow user is not provisioned');
-
-    const invitation = await this.invitationModel
-      .findOne({ email: normalizedEmail, status: InvitationStatus.PENDING })
-      .sort({ createdAt: -1 })
-      .exec();
-    if (!invitation)
-      throw new UnauthorizedException('PostFlow user is not provisioned');
-    if (invitation.expiresAt < new Date()) {
-      invitation.status = InvitationStatus.EXPIRED;
-      await invitation.save();
-      throw new ForbiddenException('Invitation has expired');
+    if (normalizedEmail) {
+      const emailOwner = await this.userModel
+        .findOne({ email: normalizedEmail })
+        .exec();
+      if (emailOwner) {
+        if (emailOwner.status !== UserStatus.ACTIVE)
+          throw new ForbiddenException('PostFlow user is disabled');
+        emailOwner.clerkUserId = clerkUserId;
+        return emailOwner.save();
+      }
     }
 
-    await this.validateProvisioningAssignment(
-      invitation.role,
-      invitation.teamId,
-    );
-    const emailOwner = await this.userModel
-      .findOne({ email: normalizedEmail })
-      .exec();
-    if (emailOwner)
-      throw new ConflictException(
-        'This email already belongs to a PostFlow user',
-      );
-
-    const user = await new this.userModel({
+    return new this.userModel({
       clerkUserId,
       email: normalizedEmail,
-      role: invitation.role,
+      role: UserRole.SALES,
       status: UserStatus.ACTIVE,
-      teamId:
-        invitation.role === UserRole.ADMIN ||
-        invitation.role === UserRole.MANAGER
-          ? null
-          : invitation.teamId,
+      teamId: null,
     }).save();
-
-    invitation.status = InvitationStatus.ACCEPTED;
-    invitation.acceptedAt = new Date();
-    invitation.acceptedClerkUserId = clerkUserId;
-    await invitation.save();
-    return user;
   }
 
   async requireRole(
@@ -114,29 +78,5 @@ export class AuthorizationService {
     if (user.role === UserRole.ADMIN || user.role === UserRole.MANAGER) return;
     if (user.teamId !== teamId)
       throw new ForbiddenException('This team is outside your access scope');
-  }
-
-  private async validateProvisioningAssignment(
-    role: UserRole,
-    teamId?: string | null,
-  ) {
-    const teamRequired =
-      role === UserRole.SALES || role === UserRole.TEAM_LEADER;
-    if (teamRequired && !teamId)
-      throw new BadRequestException(`${role} users must belong to a team`);
-    if (!teamRequired && teamId)
-      throw new BadRequestException(`${role} users cannot belong to a team`);
-    if (!teamId) return;
-    if (!(await this.teamModel.exists({ _id: teamId })))
-      throw new BadRequestException('Team not found');
-    if (role === UserRole.TEAM_LEADER) {
-      const conflict = await this.userModel
-        .findOne({ teamId, role, status: UserStatus.ACTIVE })
-        .exec();
-      if (conflict)
-        throw new ConflictException(
-          'This team already has an active Team Leader',
-        );
-    }
   }
 }

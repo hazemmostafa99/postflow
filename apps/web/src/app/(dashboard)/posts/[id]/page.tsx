@@ -160,9 +160,9 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
     );
   }
   return (
-    <div className="max-w-4xl space-y-6">
+    <div className="page-shell">
       {/* Header */}
-      <div>
+      <div className="space-y-4">
         <Link
           href="/posts"
           className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors mb-4"
@@ -170,9 +170,21 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
           <ArrowLeft className="w-3.5 h-3.5" />
           Back to Posts
         </Link>
-          <div className="flex items-center justify-between">
+        <div className="flex flex-col gap-4 rounded-xl border border-border bg-card/85 p-4 shadow-sm sm:p-5 lg:flex-row lg:items-start lg:justify-between">
+          <div className="min-w-0">
             <h2 className="text-2xl font-bold tracking-tight">Post Details</h2>
-          <div className="flex items-center gap-4 text-sm font-medium">
+            <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-muted-foreground">
+              <div className="flex items-center gap-1.5">
+                <Clock className="h-4 w-4" />
+                Created {timeAgo(post.createdAt)}
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Users className="h-4 w-4" />
+                {post.jobs.length} target groups
+              </div>
+            </div>
+          </div>
+          <div className="flex flex-col items-start gap-3 text-sm font-medium sm:flex-row sm:flex-wrap sm:items-center lg:justify-end">
             <OverallStatusBadge jobs={post.jobs} />
             {post.jobs.some((job) => job.submissionStatus === "PUBLISHED" && job.postUrl) && (
               <RefreshAllPostEngagementButton postId={post._id} />
@@ -190,69 +202,144 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
             />
           </div>
         </div>
-        <div className="flex items-center gap-4 text-sm text-muted-foreground mt-2">
-          <div className="flex items-center gap-1.5">
-            <Clock className="w-4 h-4" />
-            Created {timeAgo(post.createdAt)}
-          </div>
-          <div className="flex items-center gap-1.5">
-            <Users className="w-4 h-4" />
-            {post.jobs.length} target groups
-          </div>
-        </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(280px,360px)_1fr]">
         {/* Content Column */}
-        <div className="md:col-span-1 space-y-4">
+        <section className="space-y-3">
           <h3 className="text-lg font-medium">Content</h3>
-          <div className="p-4 rounded-xl border border-border bg-card shadow-sm">
+          <div className="rounded-xl border border-border bg-card p-4 shadow-sm">
             {post.content ? (
-              <p className="text-sm whitespace-pre-wrap text-foreground">
+              <p className="whitespace-pre-wrap break-words text-sm leading-6 text-foreground">
                 {post.content}
               </p>
             ) : (
               <p className="text-sm text-muted-foreground">Media post</p>
             )}
             {post.mediaUrls?.length > 0 && (
-              <div className="mt-4 grid grid-cols-2 gap-2">
+              <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-2">
                 {post.mediaUrls.map((url, index) => (
                   url.startsWith("data:video/") ? (
                     <video
                       key={`${post._id}-media-${index}`}
                       src={url}
                       controls
-                      className="aspect-square w-full rounded-md border border-border object-cover"
+                      className="aspect-square w-full rounded-md border border-border bg-muted object-cover"
                     />
                   ) : (
                     <img
                       key={`${post._id}-media-${index}`}
                       src={url}
                       alt=""
-                      className="aspect-square w-full rounded-md border border-border object-cover"
+                      className="aspect-square w-full rounded-md border border-border bg-muted object-cover"
                     />
                   )
                 ))}
               </div>
             )}
           </div>
-        </div>
+        </section>
 
         {/* Jobs Column */}
-        <div className="md:col-span-2 space-y-4">
+        <section className="min-w-0 space-y-3">
           <div className="flex items-center justify-between">
             <h3 className="text-lg font-medium">Publishing Jobs</h3>
           </div>
-          
-          <div className="rounded-xl border border-border overflow-hidden bg-card shadow-sm">
-            <table className="w-full text-sm">
+
+          <div className="space-y-3 lg:hidden">
+            {post.jobs.map((job) => (
+              <article key={job._id} className="rounded-xl border border-border bg-card p-4 shadow-sm">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="min-w-0">
+                    <p className="break-words font-medium text-foreground">{job.groupId.name}</p>
+                    <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
+                      <a
+                        href={job.groupId.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+                      >
+                        View Group <ExternalLink className="h-3 w-3" />
+                      </a>
+                      {job.postUrl && (
+                        <a
+                          href={job.postUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-xs text-amber-600 hover:underline"
+                        >
+                          View Facebook post <ExternalLink className="h-3 w-3" />
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                  <JobStatusBadge job={job} />
+                </div>
+
+                {job.error && (
+                  <div className="mt-3 flex items-start gap-1.5 rounded-md border border-red-500/20 bg-red-500/10 px-2 py-1.5 text-xs text-red-500">
+                    <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span className="whitespace-pre-wrap break-words">{job.error}</span>
+                  </div>
+                )}
+
+                <div className="mt-4 grid gap-3 text-xs sm:grid-cols-3">
+                  <div>
+                    <p className="font-medium text-muted-foreground">Scheduled</p>
+                    <ScheduledTime value={job.scheduledFor} className="mt-1 block text-foreground" />
+                  </div>
+                  <div>
+                    <p className="font-medium text-muted-foreground">Engagement</p>
+                    {job.engagement ? (
+                      <div className="mt-1 space-y-1 text-foreground">
+                        <p>{job.engagement.reactionCount ?? "-"} reactions</p>
+                        <p>{job.engagement.commentCount ?? "-"} comments</p>
+                        <p className="text-muted-foreground">Updated {timeAgo(job.engagement.lastSyncedAt)}</p>
+                      </div>
+                    ) : (
+                      <p className="mt-1 text-foreground">Not synced</p>
+                    )}
+                    {job.lastEngagementSyncError && (
+                      <p className="mt-1 break-words text-red-500">{job.lastEngagementSyncError}</p>
+                    )}
+                  </div>
+                  <div>
+                    <p className="font-medium text-muted-foreground">Attempts</p>
+                    <p className="mt-1 text-foreground">{job.attempts > 0 ? job.attempts : "-"}</p>
+                  </div>
+                </div>
+
+                <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
+                  {job.submissionStatus === "PUBLISHED" && job.postUrl && (
+                    <RefreshPostEngagementButton postId={job._id} postUrl={job.postUrl} />
+                  )}
+                  {(job.submissionStatus === "PENDING_APPROVAL" ||
+                    (job.submissionStatus === "PUBLISHED" && (!job.postUrl || job.postUrl.includes("/pending_posts/")))) && (
+                    <RefreshGroupStatusButton job={{
+                      id: job._id,
+                      groupId: job.groupId._id,
+                      groupExternalId: job.groupId.externalId,
+                      groupUrl: job.groupId.url,
+                      content: post.content,
+                      submittedAt: job.submittedAt ?? post.createdAt,
+                      postUrl: job.postUrl,
+                    }} />
+                  )}
+                </div>
+              </article>
+            ))}
+          </div>
+
+          <div className="hidden overflow-hidden rounded-xl border border-border bg-card shadow-sm lg:block">
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[760px] text-sm">
               <thead>
                 <tr className="border-b border-border bg-muted/40">
-                  <th className="text-left px-4 py-3 font-medium text-muted-foreground">Group</th>
-                  <th className="text-left px-4 py-3 font-medium text-muted-foreground">Scheduled</th>
-                  <th className="text-left px-4 py-3 font-medium text-muted-foreground">Status</th>
-                  <th className="text-left px-4 py-3 font-medium text-muted-foreground">Engagement</th>
-                  <th className="text-right px-4 py-3 font-medium text-muted-foreground">Attempts</th>
+                  <th className="px-4 py-3 text-left font-medium text-muted-foreground">Group</th>
+                  <th className="px-4 py-3 text-left font-medium text-muted-foreground">Scheduled</th>
+                  <th className="px-4 py-3 text-left font-medium text-muted-foreground">Status</th>
+                  <th className="px-4 py-3 text-left font-medium text-muted-foreground">Engagement</th>
+                  <th className="px-4 py-3 text-right font-medium text-muted-foreground">Attempts</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-border">
@@ -264,7 +351,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                           {job.groupId.name}
                         </span>
                         {job.error && (
-                          <div className="mt-2 flex max-w-[200px] items-start gap-1.5 rounded-md border border-red-500/20 bg-red-500/10 px-2 py-1.5 text-xs text-red-300 sm:max-w-[360px]">
+                          <div className="mt-2 flex max-w-[360px] items-start gap-1.5 rounded-md border border-red-500/20 bg-red-500/10 px-2 py-1.5 text-xs text-red-500">
                             <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                             <span className="whitespace-pre-wrap break-words">{job.error}</span>
                           </div>
@@ -314,8 +401,8 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                       {job.engagement ? (
                         <div className="space-y-1 text-xs">
                           <div className="flex gap-3 text-foreground">
-                            <span>{job.engagement.reactionCount ?? "—"} reactions</span>
-                            <span>{job.engagement.commentCount ?? "—"} comments</span>
+                            <span>{job.engagement.reactionCount ?? "-"} reactions</span>
+                            <span>{job.engagement.commentCount ?? "-"} comments</span>
                           </div>
                           <div className="text-muted-foreground">
                             Updated {timeAgo(job.engagement.lastSyncedAt)}
@@ -325,7 +412,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                         <span className="text-xs text-muted-foreground">Not synced</span>
                       )}
                       {job.lastEngagementSyncError && (
-                        <div className="mt-1 max-w-56 text-xs text-red-400">{job.lastEngagementSyncError}</div>
+                        <div className="mt-1 max-w-56 break-words text-xs text-red-500">{job.lastEngagementSyncError}</div>
                       )}
                     </td>
                     <td className="px-4 py-3 align-top pt-4 text-right text-muted-foreground">
@@ -334,9 +421,10 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                   </tr>
                 ))}
               </tbody>
-            </table>
+              </table>
+            </div>
           </div>
-        </div>
+        </section>
       </div>
 
       <PostScheduleEditor
