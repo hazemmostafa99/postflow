@@ -101,7 +101,12 @@ function extractAndStore() {
   if (!userId) return;
 
   try {
-    chrome.storage.local.set({ webAppConnected: true, webAppLastSeenAt: Date.now() });
+    chrome.storage.local.set({
+      webAppConnected: true,
+      webAppLastSeenAt: Date.now(),
+      webAppLastUrl: window.location.origin,
+      webAppLastDashboardUrl: window.location.href,
+    });
     // Read what we had before to detect a first-time store or user change
     chrome.storage.local.get('clerkUserId', (prev) => {
       if (chrome.runtime.lastError) { isContextValid = false; return; }
@@ -150,7 +155,11 @@ const webAppPresenceInterval = window.setInterval(() => {
     window.clearInterval(webAppPresenceInterval);
     return;
   }
-  chrome.storage.local.set({ webAppConnected: true, webAppLastSeenAt: Date.now() });
+  chrome.storage.local.set({
+    webAppConnected: true,
+    webAppLastSeenAt: Date.now(),
+    webAppLastUrl: window.location.origin,
+  });
 }, 30_000);
 
 // Listen for manual sync requests dispatched by the Web App dashboard

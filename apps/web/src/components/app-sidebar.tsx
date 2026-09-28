@@ -1,5 +1,5 @@
 import * as React from "react"
-import { Send, LayoutDashboard, FileText, Users, UserCog } from "lucide-react"
+import { Send, LayoutDashboard, FileText, Users, UserCog, Link2 } from "lucide-react"
 
 import {
   Sidebar,
@@ -18,11 +18,14 @@ import Link from "next/link"
 const items = [
   { title: "Overview", url: "/", icon: LayoutDashboard },
   { title: "Posts", url: "/posts", icon: FileText },
+  { title: "Connections", url: "/connections", icon: Link2 },
   { title: "Users", url: "/users", icon: UserCog },
   { title: "Teams", url: "/teams", icon: Users },
 ]
 
 export function AppSidebar({ role, ...props }: React.ComponentProps<typeof Sidebar> & { role?: string }) {
+  const visibleItems = items.filter((item) => item.title !== "Users" || role === "ADMIN" || role === "MANAGER");
+
   return (
     <Sidebar variant="sidebar" {...props}>
       <SidebarHeader className="flex h-16 justify-center border-b border-sidebar-border px-4">
@@ -37,9 +40,9 @@ export function AppSidebar({ role, ...props }: React.ComponentProps<typeof Sideb
         <SidebarGroup>
           <SidebarGroupContent>
             <SidebarMenu className="mt-4 gap-1 px-2">
-              {items.map((item) => (
+              {visibleItems.map((item) => (
                 <SidebarMenuItem key={item.title}>
-                  <SidebarMenuButton render={<Link href={item.url} />}>
+                  <SidebarMenuButton render={<Link href={item.url} prefetch={false} />}>
                     <item.icon />
                     <span>{item.title}</span>
                   </SidebarMenuButton>

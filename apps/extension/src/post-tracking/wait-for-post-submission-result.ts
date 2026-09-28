@@ -5,10 +5,16 @@ interface WaitForPostSubmissionResultOptions {
   timeout: number;
   interval: number;
   existingPostElements?: ReadonlySet<Element>;
+  existingPostUrls?: ReadonlySet<string>;
+  submittedMediaCount?: number;
   currentGroupId?: string;
   initialPageUrl?: string;
   getFailureReason?: () => string | null;
+  getInterruption?: () => FacebookPublishInterruption | null;
   getSuccessEvidence?: () => string | null;
+  getPendingPostUrl?: () => string | null;
+  getNetworkPostUrl?: () => string | null;
+  onStateChange?: (status: FacebookPostStatus, details?: Record<string, unknown>) => void;
 }
 
 function waitForTrackingDelay(milliseconds: number): Promise<void> {
@@ -20,7 +26,7 @@ function getCurrentPagePostUrl(currentGroupId?: string, initialPageUrl?: string)
     if (!initialPageUrl) return null;
     const url = new URL(window.location.href);
     const path = url.pathname.replace(/\/$/, "");
-    if (!/^\/groups\/[^/]+\/(?:posts|permalink|pending_posts)\/\d+/i.test(path)) return null;
+    if (!/^\/groups\/[^/]+\/(?:posts|permalink|pending_posts)\/[A-Za-z0-9_-]+/i.test(path)) return null;
     if (initialPageUrl) {
       const initialPath = new URL(initialPageUrl, window.location.origin).pathname.replace(/\/$/, "");
       if (initialPath.toLowerCase() === path.toLowerCase()) return null;
@@ -44,31 +50,72 @@ async function waitForPostSubmissionResult({
   timeout,
   interval,
   existingPostElements,
+  existingPostUrls,
+  submittedMediaCount,
   currentGroupId,
   initialPageUrl,
   getFailureReason,
+  getInterruption,
   getSuccessEvidence,
+  getPendingPostUrl,
+  getNetworkPostUrl,
+  onStateChange,
 }: WaitForPostSubmissionResultOptions): Promise<FacebookPostSubmissionResult> {
   const startedAt = Date.now();
   const timeoutMs = Math.max(0, timeout);
   const intervalMs = Math.max(1, interval);
   let successEvidence: string | null = null;
   let successEvidenceAt: number | null = null;
+  let lastReportedState: FacebookPostStatus | null = null;
 
   console.log("[PostTracking] Waiting for Facebook submission result");
 
+  const reportState = (status: FacebookPostStatus, details: Record<string, unknown> = {}) => {
+    if (lastReportedState === status) return;
+    lastReportedState = status;
+    onStateChange?.(status, details);
+  };
+
+  reportState("PUBLISHING", { phase: "waiting-for-result" } as Record<string, unknown>);
+
   while (Date.now() - startedAt < timeoutMs) {
     try {
+      const interruption = getInterruption?.();
+      if (interruption) {
+        reportState(interruption.status, {
+          detector: interruption.detector,
+          source: interruption.source,
+          shouldPauseQueue: interruption.shouldPauseQueue,
+        });
+        console.warn("[PostTracking] Facebook publishing interruption detected", {
+          status: interruption.status,
+          detector: interruption.detector,
+          source: interruption.source,
+          shouldPauseQueue: interruption.shouldPauseQueue,
+        });
+        return {
+          status: interruption.status,
+          reason: interruption.reason,
+          source: interruption.source,
+          detector: interruption.detector,
+          shouldPauseQueue: interruption.shouldPauseQueue,
+        };
+      }
+
       const pending = detectPendingApprovalMessage(root);
       if (pending.detected) {
+        const networkPendingPostUrl = getPendingPostUrl?.() ?? null;
         const postSurface = pending.surface.closest('[role="article"], [data-pagelet*="FeedUnit"]');
-        const directPostUrl = extractPostPermalink(pending.surface, currentGroupId)
+        const directPostUrl = networkPendingPostUrl
+          ?? extractPostPermalink(pending.surface, currentGroupId)
           ?? (postSurface ? extractPostPermalink(postSurface, currentGroupId) : null);
         const pendingPost = directPostUrl ? { postUrl: directPostUrl } : findPublishedPost({
           root,
           submittedText,
           submittedAt,
           existingPostElements,
+          existingPostUrls,
+          submittedMediaCount,
           currentGroupId,
         });
         console.log("[PostTracking] Pending approval detected", {
@@ -89,6 +136,8 @@ async function waitForPostSubmissionResult({
         submittedText,
         submittedAt,
         existingPostElements,
+        existingPostUrls,
+        submittedMediaCount,
         currentGroupId,
       });
       if (publishedPost) {
@@ -101,6 +150,14 @@ async function waitForPostSubmissionResult({
           status: "PUBLISHED",
           ...((publishedPost.postUrl ?? verifiedPageUrl) ? { postUrl: publishedPost.postUrl ?? verifiedPageUrl } : {}),
         };
+      }
+
+      const networkPostUrl = getNetworkPostUrl?.();
+      if (networkPostUrl) {
+        console.log("[PostTracking] Published post URL detected from Facebook response", {
+          postUrl: networkPostUrl,
+        });
+        return { status: "PUBLISHED", postUrl: networkPostUrl };
       }
 
       const navigatedPostUrl = getCurrentPagePostUrl(currentGroupId, initialPageUrl);

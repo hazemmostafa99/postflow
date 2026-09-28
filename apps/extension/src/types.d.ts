@@ -3,6 +3,7 @@ interface FacebookGroup {
   numericId?: string; // Facebook's internal numeric group ID
   name: string;
   url: string;
+  nameSource?: 'dom' | 'graphql';
 }
 
 interface PostFlowPostingTimingConfig {
@@ -20,6 +21,7 @@ interface PostFlowPostingTimingConfig {
   keyboardFallbackDelayMs: number;
   postButtonEnableTimeoutMs: number;
   publishConfirmationTimeoutMs: number;
+  videoPublishConfirmationTimeoutMs: number;
   publishPollIntervalMs: number;
   mediaButtonDelayMs: number;
   mediaInputTimeoutMs: number;

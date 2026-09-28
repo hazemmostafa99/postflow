@@ -2,20 +2,61 @@
 
 import './posting-config.js';
 
-const API_BASE_URL = 'https://api.fitcure.online';
+import { API_BASE_URL, BUILD_ENV } from './env.js';
+
+console.info(`[PostFlow] ${BUILD_ENV === 'production' ? 'PROD' : 'DEV'} environment | API: ${API_BASE_URL}`);
+
 const HEARTBEAT_ALARM = 'postflow-heartbeat';
 const HEARTBEAT_INTERVAL_MINUTES = 1;
+const REGISTER_RETRY_ALARM = 'postflow-register-retry';
+const REGISTER_RETRY_DELAY_MINUTES = 1;
 const PENDING_POST_SYNC_ALARM = 'postflow-pending-post-sync';
 const PENDING_POST_SYNC_INTERVAL_MINUTES = 10;
 const ENGAGEMENT_SYNC_ALARM = 'postflow-engagement-sync';
 const ENGAGEMENT_SYNC_INTERVAL_MINUTES = 30;
+const EXTENSION_INSTANCE_ID_KEY = 'extensionInstanceId';
+const EXTENSION_NAME_KEY = 'extensionName';
+const TAB_ACTION_RETRY_COUNT = 6;
+const TAB_ACTION_RETRY_DELAY_MS = 500;
 const POSTING_TIMING = (globalThis as { PostFlowPostingTiming?: PostFlowPostingTimingConfig }).PostFlowPostingTiming!;
 
 // ── Helpers ──
 
+let extensionInstanceIdPromise: Promise<string> | null = null;
+
+function createExtensionInstanceId(): string {
+  const randomId = globalThis.crypto?.randomUUID?.()
+    ?? `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+  return `pfi_${randomId}`;
+}
+
+async function getExtensionInstanceId(): Promise<string> {
+  if (!extensionInstanceIdPromise) {
+    extensionInstanceIdPromise = (async () => {
+      const result = await chrome.storage.local.get(EXTENSION_INSTANCE_ID_KEY);
+      const existing = result[EXTENSION_INSTANCE_ID_KEY];
+      if (typeof existing === 'string' && existing.trim()) return existing;
+
+      const extensionInstanceId = createExtensionInstanceId();
+      await chrome.storage.local.set({ [EXTENSION_INSTANCE_ID_KEY]: extensionInstanceId });
+      console.log('[PostFlow] Created extension instance ID:', extensionInstanceId);
+      return extensionInstanceId;
+    })();
+  }
+
+  return extensionInstanceIdPromise;
+}
+
 async function getClerkUserId(): Promise<string | null> {
   const result = await chrome.storage.local.get('clerkUserId');
   return (result.clerkUserId as string) ?? null;
+}
+
+async function getExtensionName(): Promise<string> {
+  const result = await chrome.storage.local.get(EXTENSION_NAME_KEY);
+  return typeof result[EXTENSION_NAME_KEY] === 'string'
+    ? result[EXTENSION_NAME_KEY].trim()
+    : '';
 }
 
 async function apiFetch(path: string, body?: Record<string, unknown>, method?: string) {
@@ -24,43 +65,66 @@ async function apiFetch(path: string, body?: Record<string, unknown>, method?: s
     return null;
   }
 
-  const clerkUserId = await getClerkUserId();
+  const [clerkUserId, extensionInstanceId] = await Promise.all([
+    getClerkUserId(),
+    getExtensionInstanceId(),
+  ]);
   if (!clerkUserId) {
     console.warn('[PostFlow] No user ID found — skipping API call:', path);
     return null;
   }
 
   const httpMethod = method || (body ? 'POST' : 'GET');
-  const url = `${API_BASE_URL}${path}`;
-
-  try {
-    const response = await fetch(url, {
-      method: httpMethod,
-      headers: {
-        'Content-Type': 'application/json',
-        'x-clerk-user-id': clerkUserId,
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-
-    // Handle empty responses (like 200 OK with no JSON)
-    const text = await response.text();
-    if (!response.ok) {
-      console.warn('[PostFlow] API error', {
-        status: response.status,
-        method: httpMethod,
-        path,
-        url,
-        response: text.slice(0, 300),
-      });
-      return null;
+  const urls = [`${API_BASE_URL}${path}`];
+  if (BUILD_ENV === 'development') {
+    try {
+      const apiUrl = new URL(API_BASE_URL);
+      if (apiUrl.hostname === 'localhost') {
+        urls.push(`${apiUrl.protocol}//127.0.0.1:${apiUrl.port}${path}`);
+      }
+    } catch {
+      // The build script validates API_BASE_URL; keep the primary URL if it is malformed.
     }
-
-    return text ? JSON.parse(text) : null;
-  } catch (err) {
-    console.error('[PostFlow] Network error:', { method: httpMethod, path, url, err });
-    return null;
   }
+
+  let lastError: unknown;
+  for (const url of urls) {
+    try {
+      const response = await fetch(url, {
+        method: httpMethod,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-clerk-user-id': clerkUserId,
+          'x-extension-instance-id': extensionInstanceId,
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+
+      // Handle empty responses (like 200 OK with no JSON)
+      const text = await response.text();
+      if (!response.ok) {
+        console.warn('[PostFlow] API error', {
+          status: response.status,
+          method: httpMethod,
+          path,
+          url,
+          response: text.slice(0, 300),
+        });
+        return null;
+      }
+
+      return text ? JSON.parse(text) : null;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  const errorMessage = lastError instanceof Error ? lastError.message : String(lastError);
+  console.error(
+    `[PostFlow] Network error: ${httpMethod} ${urls[0]} (${path}) - ${errorMessage}`,
+    lastError,
+  );
+  return null;
 }
 
 async function updateJobStatus(
@@ -75,22 +139,44 @@ async function updateJobStatus(
     };
   },
 ) {
+  if (body.status === 'RUNNING') {
+    await chrome.storage.local.set({ extensionWorkerStatus: 'PUBLISHING' });
+  } else if (body.status === 'SUCCESS' || body.status === 'FAILED' || body.status === 'CANCELED') {
+    await chrome.storage.local.set({ extensionWorkerStatus: 'IDLE' });
+  }
   return apiFetch(`/api/jobs/${jobId}/status`, body);
 }
 
 // ── Registration ──
 
 async function registerExtension() {
-  const result = await apiFetch('/api/extensions/register', undefined, 'POST');
+  const extensionName = await getExtensionName();
+  const result = await apiFetch(
+    '/api/extensions/register',
+    extensionName ? { extensionName } : undefined,
+    'POST',
+  );
   if (result) {
+    await chrome.alarms.clear(REGISTER_RETRY_ALARM);
     console.log('[PostFlow] Registered with backend:', result._id);
+    void refreshFacebookSession();
+    return true;
   }
+  chrome.alarms.create(REGISTER_RETRY_ALARM, {
+    delayInMinutes: REGISTER_RETRY_DELAY_MINUTES,
+  });
+  return false;
 }
 
 // ── Heartbeat ──
 
 async function sendHeartbeat() {
-  const result = await apiFetch('/api/extensions/heartbeat', undefined, 'POST');
+  const extensionName = await getExtensionName();
+  const result = await apiFetch(
+    '/api/extensions/heartbeat',
+    extensionName ? { extensionName } : undefined,
+    'POST',
+  );
   if (result) {
     console.log('[PostFlow] Heartbeat sent at', new Date().toISOString());
   }
@@ -98,11 +184,139 @@ async function sendHeartbeat() {
 
 // ── Session reporting ──
 
-async function reportSession(sessionDetected: boolean) {
-  const result = await apiFetch('/api/extensions/session', { sessionDetected });
-  if (result) {
-    console.log('[PostFlow] Session status reported:', sessionDetected);
+type FacebookConnectionSessionResponse = {
+  connection?: {
+    status?: string;
+    workerStatus?: string;
+    facebookUserId?: string;
+    detectedFacebookUserId?: string;
+  };
+};
+
+let facebookIdentityVerified = false;
+let facebookConnectionStatus = 'UNKNOWN';
+let facebookIdentityCheckPromise: Promise<boolean> | null = null;
+
+async function reportSession(sessionDetected: boolean, facebookUserId?: string | null) {
+  const normalizedFacebookUserId = typeof facebookUserId === 'string' && facebookUserId.trim()
+    ? facebookUserId.trim()
+    : undefined;
+  const verificationPromise = (async () => {
+    const result = await apiFetch('/api/extensions/session', {
+      sessionDetected,
+      ...(normalizedFacebookUserId ? { facebookUserId: normalizedFacebookUserId } : {}),
+    }) as FacebookConnectionSessionResponse | null;
+    const connection = result?.connection;
+    facebookConnectionStatus = connection?.status ?? 'UNKNOWN';
+    facebookIdentityVerified = Boolean(
+      sessionDetected &&
+      connection?.status === 'CONNECTED' &&
+      connection.facebookUserId &&
+      connection.detectedFacebookUserId &&
+      connection.facebookUserId === connection.detectedFacebookUserId,
+    );
+    await chrome.storage.local.set({
+      facebookIdentityVerified,
+      facebookConnectionStatus,
+      extensionWorkerStatus: connection?.workerStatus ?? (facebookIdentityVerified ? 'IDLE' : 'UNKNOWN'),
+      expectedFacebookUserId: connection?.facebookUserId ?? null,
+      detectedFacebookUserId: connection?.detectedFacebookUserId ?? normalizedFacebookUserId ?? null,
+    });
+
+    if (facebookIdentityVerified) {
+      console.log('[PostFlow] Facebook identity verified:', connection?.facebookUserId);
+      void checkPendingJobs();
+    } else {
+      console.warn('[PostFlow] Facebook identity verification failed', {
+        sessionDetected,
+        facebookUserId: normalizedFacebookUserId,
+        status: facebookConnectionStatus,
+        expectedFacebookUserId: connection?.facebookUserId,
+      });
+    }
+    return facebookIdentityVerified;
+  })();
+  facebookIdentityCheckPromise = verificationPromise;
+  return verificationPromise;
+}
+
+async function refreshFacebookSession() {
+  try {
+    const cookie = await chrome.cookies.get({
+      url: 'https://www.facebook.com/',
+      name: 'c_user',
+    });
+    const rawValue = cookie?.value?.trim() ?? '';
+    let facebookUserId: string | null = null;
+    try {
+      const decodedValue = decodeURIComponent(rawValue);
+      facebookUserId = /^\d+$/.test(decodedValue) ? decodedValue : null;
+    } catch {
+      facebookUserId = /^\d+$/.test(rawValue) ? rawValue : null;
+    }
+    return reportSession(Boolean(facebookUserId), facebookUserId);
+  } catch (error) {
+    console.warn('[PostFlow] Could not read Facebook session cookie', error);
+    return false;
   }
+}
+
+chrome.cookies.onChanged.addListener((changeInfo) => {
+  const domain = changeInfo.cookie.domain.replace(/^\./, '').toLowerCase();
+  const isFacebookDomain = domain === 'facebook.com' || domain.endsWith('.facebook.com');
+  if (changeInfo.cookie.name !== 'c_user' || !isFacebookDomain) return;
+  void refreshFacebookSession();
+});
+
+type ExtensionWorkerStatus =
+  | 'ONLINE'
+  | 'OFFLINE'
+  | 'IDLE'
+  | 'PUBLISHING'
+  | 'BLOCKED'
+  | 'LOGIN_REQUIRED'
+  | 'ACCOUNT_MISMATCH'
+  | 'CHECKPOINT_OR_VERIFICATION'
+  | 'CAPTCHA_OR_CHALLENGE'
+  | 'MANUAL_INTERVENTION_REQUIRED';
+
+async function reportWorkerStatus(workerStatus: ExtensionWorkerStatus, reason?: string) {
+  await chrome.storage.local.set({
+    extensionWorkerStatus: workerStatus,
+    extensionWorkerReason: reason ? reason.slice(0, 500) : null,
+  });
+  const result = await apiFetch('/api/extensions/status', {
+    workerStatus,
+    ...(reason ? { reason: reason.slice(0, 500) } : {}),
+  });
+  if (result) {
+    console.log('[PostFlow] Worker status reported:', workerStatus);
+  }
+}
+
+function workerStatusForPublishFailure(status: unknown): ExtensionWorkerStatus {
+  switch (status) {
+    case 'TEMPORARY_BLOCK':
+      return 'BLOCKED';
+    case 'CAPTCHA_OR_CHALLENGE':
+      return 'CAPTCHA_OR_CHALLENGE';
+    case 'CHECKPOINT_OR_VERIFICATION':
+      return 'CHECKPOINT_OR_VERIFICATION';
+    case 'LOGIN_REQUIRED':
+      return 'LOGIN_REQUIRED';
+    default:
+      return 'MANUAL_INTERVENTION_REQUIRED';
+  }
+}
+
+async function waitForVerifiedFacebookIdentity(timeoutMs = 5000): Promise<boolean> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (facebookIdentityVerified) return true;
+    if (facebookIdentityCheckPromise) return facebookIdentityCheckPromise;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return false;
 }
 
 // ── Group storage (existing logic) ──
@@ -110,6 +324,13 @@ async function reportSession(sessionDetected: boolean) {
 let pendingGroupSync: Promise<unknown> = Promise.resolve();
 
 async function syncGroupsToBackend(groups: FacebookGroup[]) {
+  if (!(await waitForVerifiedFacebookIdentity())) {
+    console.warn('[PostFlow] Refusing group sync until Facebook identity is verified', {
+      status: facebookConnectionStatus,
+    });
+    await chrome.storage.local.set({ groupsSyncStatus: 'identity-required' });
+    return null;
+  }
   const result = await apiFetch('/api/groups/sync', {
     groups: groups.map((g) => ({
       externalId: g.id,
@@ -131,11 +352,55 @@ async function syncGroupsToBackend(groups: FacebookGroup[]) {
   return result;
 }
 
+function normalizeStoredGroupName(text: string): string {
+  return text
+    .replace(/[\u200e\u200f\u202a-\u202e]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isNoisyStoredGroupName(text: string): boolean {
+  const normalized = normalizeStoredGroupName(text).toLowerCase();
+  return [
+    'غير مقروءة',
+    'مطلوب الموافقة',
+    'approval required',
+    'requires approval',
+    'unread',
+    'new post',
+    'learn more about this group',
+    'about this group',
+  ].some((needle) => normalized.includes(needle.toLowerCase()));
+}
+
+function shouldReplaceStoredGroupName(prev: FacebookGroup | undefined, next: FacebookGroup): boolean {
+  if (!prev) return true;
+
+  const nextName = normalizeStoredGroupName(next.name);
+  const prevName = normalizeStoredGroupName(prev.name);
+  if (!nextName || nextName.length < 2) return false;
+
+  return (
+    isNoisyStoredGroupName(prevName) ||
+    prevName === prev.id ||
+    prevName === prev.numericId ||
+    (
+      next.nameSource === 'graphql' &&
+      prevName.length > nextName.length + 20
+    )
+  );
+}
+
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'postflow-content') return;
 
   port.onMessage.addListener(async (message) => {
     if (message.type !== 'GROUPS_DETECTED') return;
+
+    if (!(await waitForVerifiedFacebookIdentity())) {
+      console.warn('[PostFlow] Ignoring groups detected before Facebook identity verification');
+      return;
+    }
 
     const incoming = message.groups as FacebookGroup[];
 
@@ -146,10 +411,12 @@ chrome.runtime.onConnect.addListener((port) => {
     for (const g of existing) merged.set(g.id, g);
     for (const g of incoming) {
       const prev = merged.get(g.id);
+      const replaceName = shouldReplaceStoredGroupName(prev, g);
       merged.set(g.id, {
         ...prev,
         ...g,
-        name: prev?.name ?? g.name,
+        name: replaceName ? normalizeStoredGroupName(g.name) : prev?.name ?? normalizeStoredGroupName(g.name),
+        nameSource: replaceName ? g.nameSource : prev?.nameSource ?? g.nameSource,
         numericId: g.numericId ?? prev?.numericId,
         url: `https://www.facebook.com/groups/${g.id}/`,
       });
@@ -186,12 +453,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'FACEBOOK_SESSION_STATUS') {
-    reportSession(message.sessionDetected as boolean);
+    void reportSession(
+      message.sessionDetected as boolean,
+      typeof message.facebookUserId === 'string' ? message.facebookUserId : null,
+    );
   }
 
   if (message.type === 'TRIGGER_GROUP_SYNC') {
     (async () => {
       try {
+        if (!(await waitForVerifiedFacebookIdentity())) {
+          await chrome.storage.local.set({ groupsSyncStatus: 'identity-required' });
+          sendResponse({ ok: false, error: 'Facebook identity verification required' });
+          return;
+        }
         await chrome.storage.local.set({ groupsSyncStatus: 'syncing' });
         // 1. Immediately flush whatever is already cached in storage to the backend.
         //    This handles the race condition where groups were discovered before the
@@ -232,7 +507,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     })();
     return true; // Keep message channel open for sendResponse
   }
+  if (message.type === 'SAVE_EXTENSION_NAME') {
+    void (async () => {
+      const extensionName = typeof message.extensionName === 'string'
+        ? message.extensionName.trim()
+        : '';
+      await chrome.storage.local.set({ [EXTENSION_NAME_KEY]: extensionName });
+      const registered = await registerExtension();
+      sendResponse({ ok: registered });
+    })().catch((error) => {
+      console.error('[PostFlow] Could not save extension name:', error);
+      sendResponse({ ok: false, error: 'Could not save extension name' });
+    });
+    return true;
+  }
   if (message.type === 'TRIGGER_JOB_CHECK') {
+    checkPendingJobs();
+  }
+  if (message.type === 'GET_JOB_STATUS' && typeof message.jobId === 'string') {
+    void apiFetch(`/api/jobs/${message.jobId}`)
+      .then((job) => sendResponse({ ok: Boolean(job), job }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message ?? 'Could not fetch job status' }));
+    return true;
+  }
+  if (message.type === 'RESUME_PUBLISH_QUEUE') {
+    publishQueuePaused = null;
+    void chrome.storage.local.remove('publishQueuePaused');
+    void reportWorkerStatus('IDLE');
     checkPendingJobs();
   }
 });
@@ -242,11 +543,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 let isProcessingJob = false;
 let isCheckingPendingPost = false;
 let isFacebookSyncBusy = false;
+let publishQueuePaused: {
+  reason: string;
+  status?: string;
+  jobId?: string;
+  pausedAt: number;
+} | null = null;
 let pendingCheckSequence = 0;
 let finishExecutionHandshake: (() => void) | null = null;
-let activeExecution: { jobId: string; tabId: number } | null = null;
+let activeExecution: {
+  jobId: string;
+  tabId: number;
+  group?: any;
+  post?: any;
+} | null = null;
+
+void chrome.storage.local.get('publishQueuePaused').then((result) => {
+  const paused = result.publishQueuePaused as Partial<NonNullable<typeof publishQueuePaused>> | undefined;
+  if (paused && typeof paused.reason === 'string' && typeof paused.pausedAt === 'number') {
+    publishQueuePaused = {
+      reason: paused.reason,
+      status: typeof paused.status === 'string' ? paused.status : undefined,
+      jobId: typeof paused.jobId === 'string' ? paused.jobId : undefined,
+      pausedAt: paused.pausedAt,
+    };
+    console.warn('[PostFlow] Restored paused publishing queue state', publishQueuePaused);
+  }
+}).catch(() => undefined);
 
 async function checkPendingJobs() {
+  if (!facebookIdentityVerified) {
+    console.log('[PostFlow] Publishing blocked until Facebook identity is verified', {
+      status: facebookConnectionStatus,
+    });
+    return;
+  }
+  if (publishQueuePaused) {
+    console.warn('[PostFlow] Publishing queue is paused; skipping job check', publishQueuePaused);
+    return;
+  }
   if (isProcessingJob || isFacebookSyncBusy) {
     console.log('[PostFlow] Skipping job check while Facebook navigation is busy', {
       isProcessingJob,
@@ -281,21 +616,7 @@ async function checkPendingJobs() {
       return;
     }
     
-    // Check if we already have an active Facebook tab we can reuse
-    const tabs = await chrome.tabs.query({ url: '*://*.facebook.com/*' });
-    let fbTab = tabs[0];
-    if (fbTab && fbTab.id) {
-      try {
-        await chrome.tabs.update(fbTab.id, { url: targetUrl, active: true });
-      } catch (navigationError) {
-        // A tab can reject navigation while it is closing or already moving
-        // between Facebook documents. Use a fresh tab as a safe fallback.
-        console.warn('[PostFlow] Existing Facebook tab rejected navigation; opening a new tab', navigationError);
-        fbTab = await chrome.tabs.create({ url: targetUrl, active: true });
-      }
-    } else {
-      fbTab = await chrome.tabs.create({ url: targetUrl, active: true });
-    }
+    const fbTab = await openFacebookGroupTab(targetUrl);
 
     const tabId = fbTab.id;
     if (!tabId) {
@@ -305,7 +626,12 @@ async function checkPendingJobs() {
       return;
     }
     const readyTabId = tabId;
-    activeExecution = { jobId: job._id, tabId: readyTabId };
+    activeExecution = {
+      jobId: job._id,
+      tabId: readyTabId,
+      group: job.groupId,
+      post: job.postId,
+    };
 
     // tabs.update/tabs.create resolves before the old Facebook document has
     // necessarily been replaced. Sending EXECUTE_JOB immediately can make
@@ -322,6 +648,16 @@ async function checkPendingJobs() {
       return;
     }
     console.log('[PostFlow] Target Facebook group page is loaded; waiting for content script', targetUrl);
+
+    const latestJob = await apiFetch(`/api/jobs/${job._id}`) as { status?: string } | null;
+    if (latestJob?.status === 'CANCEL_REQUESTED') {
+      console.warn('[PostFlow] Job was canceled before Facebook execution started:', job._id);
+      await updateJobStatus(job._id, { status: 'CANCELED' });
+      isProcessingJob = false;
+      activeExecution = null;
+      checkPendingJobs();
+      return;
+    }
 
       let sent = false;
       let sendInFlight = false;
@@ -430,6 +766,49 @@ function getSafeFacebookGroupUrl(group: any, fallback?: string): string | null {
   return `https://www.facebook.com/groups/${groupId}/`;
 }
 
+async function openFacebookGroupTab(targetUrl: string): Promise<chrome.tabs.Tab> {
+  const tabs = await chrome.tabs.query({ url: '*://*.facebook.com/*' });
+  const existingTab = tabs.find((tab) => tab.id !== undefined);
+  let lastError: unknown;
+
+  if (existingTab?.id !== undefined) {
+    for (let attempt = 0; attempt < TAB_ACTION_RETRY_COUNT; attempt += 1) {
+      try {
+        const updatedTab = await chrome.tabs.update(existingTab.id, {
+          url: targetUrl,
+          active: true,
+        });
+        if (updatedTab) return updatedTab;
+        throw new Error('Facebook tab navigation returned no tab');
+      } catch (error) {
+        lastError = error;
+        console.warn('[PostFlow] Facebook tab navigation is temporarily unavailable; retrying', {
+          attempt: attempt + 1,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        await new Promise((resolve) => setTimeout(resolve, TAB_ACTION_RETRY_DELAY_MS));
+      }
+    }
+  }
+
+  for (let attempt = 0; attempt < TAB_ACTION_RETRY_COUNT; attempt += 1) {
+    try {
+      return await chrome.tabs.create({ url: targetUrl, active: true });
+    } catch (error) {
+      lastError = error;
+      console.warn('[PostFlow] Facebook tab creation is temporarily unavailable; retrying', {
+        attempt: attempt + 1,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      await new Promise((resolve) => setTimeout(resolve, TAB_ACTION_RETRY_DELAY_MS));
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('Could not open a Facebook tab');
+}
+
 async function waitForFacebookTabDocument(tabId: number, targetUrl: string, timeoutMs: number): Promise<boolean> {
   const startedAt = Date.now();
   let targetPath = '';
@@ -484,6 +863,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
     if (!isCurrentExecutionResult(message, sender)) return;
     void (async () => {
       console.log('[PostFlow] Job succeeded:', message.jobId);
+      const completedExecution = activeExecution;
       finishExecutionHandshake?.();
       await updateJobStatus(message.jobId, {
         status: 'SUCCESS',
@@ -491,6 +871,64 @@ chrome.runtime.onMessage.addListener((message, sender) => {
       });
       isProcessingJob = false;
       activeExecution = null;
+
+      const completedMediaUrls = Array.isArray(completedExecution?.post?.mediaUrls)
+        ? completedExecution.post.mediaUrls
+        : [];
+      const completedPostHasVideo = completedMediaUrls.some((url: unknown) => typeof url === 'string' && url.startsWith('data:video/'));
+      const shouldRunAutomaticPostLinkCheck = Boolean(
+        completedExecution?.group &&
+        completedExecution.post &&
+        (
+          (
+            message.submissionResult?.status === 'PUBLISHED' &&
+            !message.submissionResult.postUrl
+          ) ||
+          (
+            message.submissionResult?.status === 'UNKNOWN' &&
+            completedPostHasVideo
+          )
+        ),
+      );
+
+      if (shouldRunAutomaticPostLinkCheck && completedExecution?.group && completedExecution.post) {
+        const syncPost: PendingFacebookPost = {
+          id: message.jobId,
+          groupId: String(completedExecution.group._id ?? completedExecution.group.id ?? ''),
+          groupExternalId: completedExecution.group.externalId,
+          groupUrl: completedExecution.group.url,
+          status: 'PENDING_APPROVAL',
+          content: completedExecution.post.content,
+          submittedAt: new Date().toISOString(),
+          mediaCount: Array.isArray(completedExecution.post.mediaUrls)
+            ? completedExecution.post.mediaUrls.length
+            : 0,
+        };
+        console.log('[PostFlow] Starting automatic post-link check after publish result', {
+          jobId: message.jobId,
+          publishStatus: message.submissionResult?.status,
+          hasVideo: completedPostHasVideo,
+        });
+        const syncResult = await checkSinglePendingPost(syncPost);
+        const shouldPersistAutomaticPostLinkCheck = message.submissionResult?.status === 'PENDING_APPROVAL' ||
+          syncResult.status === 'PUBLISHED' ||
+          (
+            message.submissionResult?.status === 'UNKNOWN' &&
+            completedPostHasVideo &&
+            syncResult.status === 'STILL_PENDING' &&
+            Boolean(syncResult.postUrl)
+          );
+        const updated = shouldPersistAutomaticPostLinkCheck
+          ? await persistPendingSyncResult(syncPost, syncResult)
+          : false;
+        console.log('[PostFlow] Automatic post-link check finished', {
+          jobId: message.jobId,
+          status: syncResult.status,
+          updated,
+          persisted: shouldPersistAutomaticPostLinkCheck,
+        });
+      }
+
       checkPendingJobs();
     })();
   }
@@ -499,7 +937,34 @@ chrome.runtime.onMessage.addListener((message, sender) => {
     void (async () => {
       console.error('[PostFlow] Job failed:', message.jobId, message.error);
       finishExecutionHandshake?.();
+      if (message.shouldPauseQueue || message.publishStatus) {
+        void reportWorkerStatus(
+          workerStatusForPublishFailure(message.publishStatus),
+          message.error,
+        );
+      }
+      if (message.shouldPauseQueue) {
+        publishQueuePaused = {
+          reason: message.error ?? 'Facebook publishing requires manual attention',
+          status: message.publishStatus,
+          jobId: message.jobId,
+          pausedAt: Date.now(),
+        };
+        await chrome.storage.local.set({ publishQueuePaused });
+        console.warn('[PostFlow] Publishing queue paused for manual attention', publishQueuePaused);
+      }
       await updateJobStatus(message.jobId, { status: 'FAILED', error: message.error });
+      isProcessingJob = false;
+      activeExecution = null;
+      if (!publishQueuePaused) checkPendingJobs();
+    })();
+  }
+  if (message.type === 'JOB_CANCELED') {
+    if (!isCurrentExecutionResult(message, sender)) return;
+    void (async () => {
+      console.warn('[PostFlow] Job canceled before Facebook submit:', message.jobId);
+      finishExecutionHandshake?.();
+      await updateJobStatus(message.jobId, { status: 'CANCELED' });
       isProcessingJob = false;
       activeExecution = null;
       checkPendingJobs();
@@ -542,7 +1007,7 @@ async function checkSinglePendingPost(post: PendingFacebookPost, lockAlreadyHeld
     if (post.postUrl) {
       try {
         const savedUrl = new URL(post.postUrl);
-        if (/^\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/\d+/i.test(savedUrl.pathname)) {
+        if (/^\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/[A-Za-z0-9_-]+/i.test(savedUrl.pathname)) {
           checkUrl = savedUrl.href;
         }
       } catch {
@@ -603,12 +1068,12 @@ async function waitForFacebookTabAfterNavigation(tabId: number, targetUrl: strin
   let targetPath = '';
   let targetGroupPath = '';
   let targetPostIdentity = '';
-  const targetIsPost = /\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/\d+/i.test(targetUrl);
+  const targetIsPost = /\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/[A-Za-z0-9_-]+/i.test(targetUrl);
   try {
     const parsedTarget = new URL(targetUrl);
     targetPath = parsedTarget.pathname.replace(/\/+$/, '').toLowerCase();
     targetGroupPath = parsedTarget.pathname.match(/^\/groups\/[^/]+/i)?.[0].toLowerCase() ?? '';
-    targetPostIdentity = parsedTarget.pathname.match(/^\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/(\d+)/i)?.[1] ?? '';
+    targetPostIdentity = parsedTarget.pathname.match(/^\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/([A-Za-z0-9_-]+)/i)?.[1] ?? '';
   } catch {
     return false;
   }
@@ -618,7 +1083,7 @@ async function waitForFacebookTabAfterNavigation(tabId: number, targetUrl: strin
       const tab = await chrome.tabs.get(tabId);
       const currentUrl = tab.url ?? '';
       const currentPath = currentUrl ? new URL(currentUrl).pathname.replace(/\/+$/, '').toLowerCase() : '';
-      const currentPostIdentity = currentPath.match(/^\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/(\d+)/i)?.[1] ?? '';
+      const currentPostIdentity = currentPath.match(/^\/groups\/[^/]+\/(?:posts|pending_posts|permalink)\/([A-Za-z0-9_-]+)/i)?.[1] ?? '';
       const landedOnTarget = currentPath === targetPath ||
         (targetIsPost && currentPath === targetGroupPath) ||
         (targetIsPost && targetPostIdentity && currentPostIdentity === targetPostIdentity);
@@ -848,8 +1313,12 @@ chrome.alarms.create(PENDING_POST_SYNC_ALARM, {
 void chrome.alarms.clear(ENGAGEMENT_SYNC_ALARM);
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === REGISTER_RETRY_ALARM) {
+    void registerExtension();
+  }
   if (alarm.name === HEARTBEAT_ALARM) {
     sendHeartbeat();
+    void refreshFacebookSession();
     checkPendingJobs(); // Also check jobs on heartbeat
   }
   if (alarm.name === PENDING_POST_SYNC_ALARM) {
@@ -858,6 +1327,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 // ── Startup ──
+
+void registerExtension();
 
 chrome.runtime.onStartup.addListener(() => {
   registerExtension();

@@ -1,5 +1,5 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-import { Document, Schema as MongooseSchema } from 'mongoose';
+import { Document, Schema as MongooseSchema, Types } from 'mongoose';
 import { Post } from './post.schema';
 import { Group } from './group.schema';
 
@@ -11,6 +11,16 @@ export enum FacebookSubmissionStatus {
   UNKNOWN = 'UNKNOWN',
 }
 
+export enum PublishingJobStatus {
+  PENDING = 'PENDING',
+  RUNNING = 'RUNNING',
+  SUCCESS = 'SUCCESS',
+  FAILED = 'FAILED',
+  PAUSED = 'PAUSED',
+  CANCELED = 'CANCELED',
+  CANCEL_REQUESTED = 'CANCEL_REQUESTED',
+}
+
 @Schema({ timestamps: true })
 export class PublishingJob {
   @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'Post', required: true })
@@ -19,11 +29,30 @@ export class PublishingJob {
   @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'Group', required: true })
   groupId: Group;
 
-  @Prop({ required: true, default: 'PENDING' })
+  /** Facebook connection responsible for executing this job. */
+  @Prop({
+    type: MongooseSchema.Types.ObjectId,
+    ref: 'FacebookConnection',
+    index: true,
+  })
+  facebookConnectionId?: Types.ObjectId;
+
+  @Prop({ required: true, default: PublishingJobStatus.PENDING })
   status: string;
+
+  /** Worker lease used to recover jobs after an extension restart. */
+  @Prop()
+  claimedByExtensionInstanceId?: string;
+
+  @Prop()
+  claimExpiresAt?: Date;
 
   @Prop({ required: true, default: 0 })
   attempts: number;
+
+  /** Stable position inside the Post Flow, used when recalculating schedules. */
+  @Prop({ default: 0 })
+  flowOrder: number;
 
   @Prop()
   error?: string;
@@ -58,7 +87,9 @@ export class PublishingJob {
   publishedDetectedAt?: Date;
 
   /** Latest visible Facebook engagement counters. Kept separate from approval-sync metadata. */
-  @Prop({ type: { reactionCount: Number, commentCount: Number, lastSyncedAt: Date } })
+  @Prop({
+    type: { reactionCount: Number, commentCount: Number, lastSyncedAt: Date },
+  })
   engagement?: {
     reactionCount?: number;
     commentCount?: number;

@@ -7,9 +7,9 @@ export default function AccessDeniedPage() {
     <main className="flex min-h-screen items-center justify-center bg-background px-6">
       <div className="w-full max-w-md rounded-xl border border-border bg-card p-8 text-center shadow-sm">
         <ShieldX className="mx-auto h-10 w-10 text-destructive" />
-        <h1 className="mt-5 text-2xl font-semibold">Access not provisioned</h1>
+        <h1 className="mt-5 text-2xl font-semibold">Access unavailable</h1>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">
-          Your Clerk account is valid, but you do not have an active PostFlow invitation. Contact an administrator.
+          Your account is signed in, but PostFlow could not activate access for it. Contact an administrator if this keeps happening.
         </p>
         <div className="mt-6 flex justify-center gap-3">
           <SignOutButton>

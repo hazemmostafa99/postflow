@@ -11,11 +11,13 @@ export async function GET(request: Request) {
   const search = searchParams.get("search") ?? "";
   const page = searchParams.get("page") ?? "";
   const limit = searchParams.get("limit") ?? "";
+  const connectionId = searchParams.get("connectionId") ?? "";
 
   const url = new URL(`${API_BASE}/api/groups`);
   if (search) url.searchParams.set("search", search);
   if (page) url.searchParams.set("page", page);
   if (limit) url.searchParams.set("limit", limit);
+  if (connectionId) url.searchParams.set("connectionId", connectionId);
 
   let response: Response;
   try {

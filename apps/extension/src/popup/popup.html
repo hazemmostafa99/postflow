@@ -16,11 +16,36 @@
       <span class="page-status" id="status">Checking...</span>
     </header>
 
+    <section class="identity-panel" aria-label="Extension profile name">
+      <div class="identity-summary">
+        <div class="identity-avatar" aria-hidden="true">PF</div>
+        <div class="identity-copy">
+          <p class="eyebrow">Worker profile</p>
+          <h2 id="profile-name">Unnamed profile</h2>
+        </div>
+        <button class="edit-name-button" id="edit-name" type="button" aria-label="Rename profile" title="Rename profile">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 20h9" />
+            <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+          </svg>
+        </button>
+      </div>
+      <div class="name-editor" id="name-editor" hidden>
+        <label for="extension-name">Profile name</label>
+        <div class="name-row">
+          <input id="extension-name" maxlength="60" placeholder="e.g. Client A" />
+          <button class="save-name-button" id="save-name" type="button">Save</button>
+          <button class="cancel-name-button" id="cancel-name" type="button">Cancel</button>
+        </div>
+      </div>
+      <p class="name-status" id="name-status" aria-live="polite"></p>
+    </section>
+
     <section class="status-grid" aria-label="Sync status">
       <article class="status-card">
         <span class="status-dot" id="web-app-dot"></span>
         <div>
-          <p>Web app</p>
+          <p>Web</p>
           <strong id="web-app-status">Checking...</strong>
         </div>
       </article>
@@ -37,18 +62,40 @@
       <span>Refresh groups</span>
     </button>
 
-    <section class="groups-panel">
+    <div class="quick-actions" aria-label="Quick links">
+      <button class="secondary-button" id="open-dashboard" type="button">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="3" y="3" width="7" height="7" rx="1.5" />
+          <rect x="14" y="3" width="7" height="7" rx="1.5" />
+          <rect x="14" y="14" width="7" height="7" rx="1.5" />
+          <rect x="3" y="14" width="7" height="7" rx="1.5" />
+        </svg>
+        Dashboard
+      </button>
+      <button class="secondary-button" id="open-facebook-groups" type="button">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+          <circle cx="9" cy="7" r="4" />
+          <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+          <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+        </svg>
+        FB Groups
+      </button>
+    </div>
+
+    <section class="groups-panel" aria-label="Group sync summary">
       <div class="section-heading">
         <div>
-          <p class="eyebrow">Detected groups</p>
-          <h2>Facebook Groups</h2>
+          <p class="eyebrow">Group status</p>
+          <h2 id="groups-summary">No groups detected.</h2>
+          <p class="last-sync-inline">Last synced <strong id="last-sync-status">Never</strong></p>
         </div>
         <span class="count-pill" id="group-count">0</span>
       </div>
-      <div id="groups">
-        <p class="empty">
-          No groups detected.
-        </p>
+      <div class="group-summary-line">
+        <span>Detected <strong id="detected-count">0</strong></span>
+        <span>Synced <strong id="synced-count">0</strong></span>
+        <span>Not synced <strong id="not-synced-count">0</strong></span>
       </div>
     </section>
   </main>

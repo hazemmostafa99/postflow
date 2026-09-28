@@ -44,6 +44,12 @@ const EXCLUDED_NAME_SUBSTRINGS = [
   "تعرف على المزيد",
   "learn more about this group",
   "about this group",
+  "غير مقروءة",
+  "مطلوب الموافقة",
+  "approval required",
+  "requires approval",
+  "unread",
+  "new post",
 ];
 
 // ── State ──
@@ -71,6 +77,248 @@ const groups = new Map<string, FacebookGroup>();
 let lastSentSignature = "";
 let isExecutingJob = false;
 let activeJobId: string | null = null;
+
+interface FacebookResponseCandidateDetail {
+  requestUrl?: string;
+  postUrls?: unknown[];
+  storyFbids?: unknown[];
+  videoIds?: unknown[];
+  uploadSessionIds?: unknown[];
+}
+
+type PublishCandidateSource = 'response-post-url' | 'response-story-fbid';
+
+interface PublishTrackingCandidate {
+  source: PublishCandidateSource;
+  value: string;
+  requestUrl?: string;
+  observedAt: number;
+}
+
+interface PublishTrackingSession {
+  jobId: string;
+  groupId?: string;
+  submittedAt: number;
+  acceptCandidatesAfter: number;
+  hasVideo: boolean;
+  existingPostUrls: ReadonlySet<string>;
+  candidates: PublishTrackingCandidate[];
+  candidateKeys: Set<string>;
+  mediaVideoIds: Set<string>;
+  uploadSessionIds: Set<string>;
+}
+
+let activePublishTrackingSession: PublishTrackingSession | null = null;
+
+function createPublishTrackingSession(options: {
+  jobId: string;
+  groupId?: string;
+  submittedAt: number;
+  hasVideo: boolean;
+  existingPostUrls: ReadonlySet<string>;
+}): PublishTrackingSession {
+  const session: PublishTrackingSession = {
+    ...options,
+    acceptCandidatesAfter: 0,
+    candidates: [],
+    candidateKeys: new Set(),
+    mediaVideoIds: new Set(),
+    uploadSessionIds: new Set(),
+  };
+  console.log('[PostTracking] Publish tracking session started', {
+    jobId: session.jobId,
+    groupId: session.groupId,
+    hasVideo: session.hasVideo,
+    existingPostUrlCount: session.existingPostUrls.size,
+  });
+  return session;
+}
+
+function normalizeTrackedPostUrl(value: string): string | null {
+  try {
+    const url = new URL(value, window.location.origin);
+    const path = url.pathname.replace(/\/+$/, '');
+    if (!/^\/groups\/[^/]+\/(?:posts|permalink|pending_posts)\/[A-Za-z0-9_-]+/i.test(path)) return null;
+    url.search = '';
+    url.hash = '';
+    return url.href.replace(/\/$/, '').toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function addPublishCandidate(
+  session: PublishTrackingSession,
+  source: PublishCandidateSource,
+  value: string,
+  requestUrl?: string,
+): void {
+  const key = `${source}:${value}`;
+  if (session.candidateKeys.has(key)) return;
+  session.candidateKeys.add(key);
+  session.candidates.push({ source, value, requestUrl, observedAt: Date.now() });
+}
+
+function trackFacebookResponseCandidates(detail: FacebookResponseCandidateDetail): void {
+  const session = activePublishTrackingSession;
+  if (!session) return;
+
+  const postUrls = Array.isArray(detail.postUrls)
+    ? detail.postUrls.filter((url): url is string => typeof url === 'string')
+    : [];
+  const storyFbids = Array.isArray(detail.storyFbids)
+    ? detail.storyFbids.filter((value): value is string => typeof value === 'string' && /^\d+$/.test(value))
+    : [];
+  const videoIds = Array.isArray(detail.videoIds)
+    ? detail.videoIds.filter((value): value is string => typeof value === 'string' && /^\d+$/.test(value))
+    : [];
+  const uploadSessionIds = Array.isArray(detail.uploadSessionIds)
+    ? detail.uploadSessionIds.filter((value): value is string => typeof value === 'string' && /^\d+$/.test(value))
+    : [];
+
+  if (!session.hasVideo) {
+    for (const postUrl of postUrls) addPublishCandidate(session, 'response-post-url', postUrl, detail.requestUrl);
+  } else if (postUrls.length) {
+    const currentPageGroupId = extractFacebookGroupIdFromUrl(location.href)?.toLowerCase();
+    const sameGroupPostUrls = postUrls.filter((postUrl) => {
+      try {
+        const parsedUrl = new URL(postUrl, window.location.origin);
+        const path = parsedUrl.pathname;
+        if (!/^\/groups\/[^/]+\/(?:posts|permalink|pending_posts)\/[A-Za-z0-9_-]+/i.test(path)) return false;
+        const candidateGroupId = extractFacebookGroupIdFromUrl(postUrl)?.toLowerCase();
+        return Boolean(
+          candidateGroupId &&
+          (candidateGroupId === session.groupId?.toLowerCase() || candidateGroupId === currentPageGroupId),
+        );
+      } catch {
+        return false;
+      }
+    });
+    for (const postUrl of sameGroupPostUrls) addPublishCandidate(session, 'response-post-url', postUrl, detail.requestUrl);
+    console.log('[PostTracking] Ignoring direct network post URLs during video publish', {
+      jobId: session.jobId,
+      ignoredPostUrlCount: postUrls.length - sameGroupPostUrls.length,
+      acceptedSameGroupPostUrlCount: sameGroupPostUrls.length,
+      reason: 'video responses can include unrelated feed stories; same-group links are retained',
+      requestUrl: detail.requestUrl,
+    });
+  }
+  for (const storyFbid of storyFbids) addPublishCandidate(session, 'response-story-fbid', storyFbid, detail.requestUrl);
+  for (const videoId of videoIds) session.mediaVideoIds.add(videoId);
+  for (const uploadSessionId of uploadSessionIds) session.uploadSessionIds.add(uploadSessionId);
+
+  if (postUrls.length || storyFbids.length || videoIds.length || uploadSessionIds.length) {
+    console.log('[PostTracking] Facebook network candidates observed', {
+      jobId: session.jobId,
+      postUrlCount: postUrls.length,
+      storyFbidCount: storyFbids.length,
+      videoIdCount: videoIds.length,
+      uploadSessionIdCount: uploadSessionIds.length,
+      requestUrl: detail.requestUrl,
+    });
+  }
+}
+
+function getBestNetworkPostUrl(session: PublishTrackingSession): string | null {
+  for (let index = session.candidates.length - 1; index >= 0; index--) {
+    const candidate = session.candidates[index];
+    if (candidate.observedAt < session.acceptCandidatesAfter) continue;
+    const candidateUrl = candidate.source === 'response-story-fbid' && session.groupId
+      ? 'https://www.facebook.com/groups/' + session.groupId + '/posts/' + candidate.value + '/'
+      : candidate.value;
+    const normalizedCandidate = normalizeTrackedPostUrl(candidateUrl);
+    if (!normalizedCandidate) {
+      console.log('[PostTracking] Rejected network candidate', {
+        jobId: session.jobId,
+        source: candidate.source,
+        reason: 'not-a-group-post-url',
+      });
+      continue;
+    }
+    if (session.existingPostUrls.has(normalizedCandidate)) {
+      console.log('[PostTracking] Rejected network candidate', {
+        jobId: session.jobId,
+        source: candidate.source,
+        reason: 'already-present-before-submit',
+      });
+      continue;
+    }
+    const candidateGroupId = extractFacebookGroupIdFromUrl(candidateUrl);
+    const currentPageGroupId = extractFacebookGroupIdFromUrl(location.href);
+    if (
+      candidate.source === 'response-post-url' &&
+      session.groupId &&
+      candidateGroupId &&
+      candidateGroupId.toLowerCase() !== session.groupId.toLowerCase() &&
+      (!currentPageGroupId || candidateGroupId.toLowerCase() !== currentPageGroupId.toLowerCase())
+    ) {
+      console.log('[PostTracking] Rejected network candidate', {
+        jobId: session.jobId,
+        source: candidate.source,
+        reason: 'different-group',
+        candidateGroupId,
+        expectedGroupId: session.groupId,
+      });
+      continue;
+    }
+    console.log('[PostTracking] Accepted network candidate', {
+      jobId: session.jobId,
+      source: candidate.source,
+      postUrl: candidateUrl,
+      requestUrl: candidate.requestUrl,
+    });
+    return candidateUrl;
+  }
+  return null;
+}
+
+function getBestNetworkPendingPostUrl(session: PublishTrackingSession): string | null {
+  for (let index = session.candidates.length - 1; index >= 0; index--) {
+    const candidate = session.candidates[index];
+    if (candidate.observedAt < session.acceptCandidatesAfter) continue;
+    if (candidate.source !== 'response-post-url') continue;
+    const normalizedCandidate = normalizeTrackedPostUrl(candidate.value);
+    if (!normalizedCandidate || !/\/pending_posts\//i.test(normalizedCandidate)) continue;
+    if (session.existingPostUrls.has(normalizedCandidate)) continue;
+    const candidateGroupId = extractFacebookGroupIdFromUrl(candidate.value);
+    const currentPageGroupId = extractFacebookGroupIdFromUrl(location.href);
+    if (
+      session.groupId &&
+      candidateGroupId &&
+      candidateGroupId.toLowerCase() !== session.groupId.toLowerCase() &&
+      (!currentPageGroupId || candidateGroupId.toLowerCase() !== currentPageGroupId.toLowerCase())
+    ) {
+      continue;
+    }
+    console.log('[PostTracking] Accepted network pending-post candidate', {
+      jobId: session.jobId,
+      postUrl: candidate.value,
+      requestUrl: candidate.requestUrl,
+    });
+    return candidate.value;
+  }
+  return null;
+}
+
+function injectFacebookResponseSpy(): void {
+  const script = document.createElement('script');
+  script.src = chrome.runtime.getURL('dist/graphql-spy.js');
+  script.onload = () => script.remove();
+  (document.head || document.documentElement).appendChild(script);
+}
+
+window.addEventListener('postflow:facebook-response', ((event: CustomEvent<FacebookResponseCandidateDetail>) => {
+  if (!isExecutingJob) return;
+  trackFacebookResponseCandidates(event.detail ?? {});
+}) as EventListener, false);
+
+window.addEventListener('message', ((event: MessageEvent<FacebookResponseCandidateDetail & { source?: string; type?: string }>) => {
+  if (event.source !== window || event.data?.source !== 'postflow-graphql-spy' || event.data.type !== 'facebook-response') return;
+  if (!isExecutingJob) return;
+  trackFacebookResponseCandidates(event.data);
+}) as EventListener, false);
+
+injectFacebookResponseSpy();
 
 // ── Cleanup registry ──
 
@@ -148,41 +396,40 @@ function canonicalizeGroupUrl(id: string): string {
   return `https://www.facebook.com/groups/${id}/`;
 }
 
-// ── Strategy 1: DOM extraction (aria-label first) ──
+// ── Strategy 1: DOM extraction ──
+
+function normalizeGroupNameCandidate(text: string): string {
+  return text
+    .replace(/[\u200e\u200f\u202a-\u202e]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isNoisyGroupName(text: string): boolean {
+  const normalized = normalizeGroupNameCandidate(text).toLowerCase();
+  return EXCLUDED_NAME_SUBSTRINGS.some((s) => normalized.includes(s.toLowerCase()));
+}
 
 function isValidName(text: string): boolean {
-  if (!text || text.length < 2 || text.length > 150) return false;
-  if (EXCLUDED_NAMES.has(text)) return false;
-  const lower = text.toLowerCase();
-  return !EXCLUDED_NAME_SUBSTRINGS.some((s) => lower.includes(s.toLowerCase()));
+  const normalized = normalizeGroupNameCandidate(text);
+  if (!normalized || normalized.length < 2 || normalized.length > 150) return false;
+  if (EXCLUDED_NAMES.has(normalized)) return false;
+  return !isNoisyGroupName(normalized);
+}
+
+function bestNameFromText(text?: string | null): string | null {
+  if (!text) return null;
+  for (const line of text.split(/\r?\n/)) {
+    const candidate = normalizeGroupNameCandidate(line);
+    if (isValidName(candidate)) return candidate;
+  }
+  const candidate = normalizeGroupNameCandidate(text);
+  return isValidName(candidate) ? candidate : null;
 }
 
 function extractNameFromLink(link: HTMLAnchorElement): string | null {
-  // 1. aria-label on the link itself — most reliable on Facebook
-  const ariaLabel = link.getAttribute("aria-label")?.trim();
-  if (ariaLabel && isValidName(ariaLabel)) {
-    return ariaLabel;
-  }
-
-  // 2. innerText of the link — works for sidebar and card titles
-  const text = link.innerText.trim();
-  if (text && isValidName(text)) {
-    return text;
-  }
-
-  // 3. aria-label on nearest parent (up to 5 levels)
-  let parent = link.parentElement;
-  let depth = 0;
-  while (parent && depth < 5) {
-    const parentAria = parent.getAttribute("aria-label")?.trim();
-    if (parentAria && isValidName(parentAria)) {
-      return parentAria;
-    }
-    parent = parent.parentElement;
-    depth++;
-  }
-
-  return null;
+  // Facebook often puts notification text in aria-label, so prefer visible title text.
+  return bestNameFromText(link.innerText) ?? bestNameFromText(link.getAttribute("aria-label"));
 }
 
 function extractGroupFromLink(link: HTMLAnchorElement): FacebookGroup | null {
@@ -195,7 +442,7 @@ function extractGroupFromLink(link: HTMLAnchorElement): FacebookGroup | null {
   // If the slug is all digits, it IS the numeric ID
   const numericId = /^\d+$/.test(id) ? id : undefined;
 
-  return { id, numericId, name, url: canonicalizeGroupUrl(id) };
+  return { id, numericId, name, url: canonicalizeGroupUrl(id), nameSource: "dom" };
 }
 
 function addGroup(group: FacebookGroup): boolean {
@@ -203,26 +450,39 @@ function addGroup(group: FacebookGroup): boolean {
 
   const existing = groups.get(group.id);
   const url = canonicalizeGroupUrl(group.id);
+  const cleanName = normalizeGroupNameCandidate(group.name);
 
   if (!existing) {
-    groups.set(group.id, { ...group, url });
+    groups.set(group.id, { ...group, name: cleanName, url });
     console.log("[PostFlow] Group:", group.name);
     return true;
   }
 
-  // Keep the first trusted name. Opening a group page to publish should not rename it.
+  const shouldReplaceName =
+    isValidName(cleanName) &&
+    (
+      isNoisyGroupName(existing.name) ||
+      existing.name === existing.id ||
+      existing.name === existing.numericId ||
+      (
+        group.nameSource === "graphql" &&
+        normalizeGroupNameCandidate(existing.name).length > cleanName.length + 20
+      )
+    );
   const updatedNumericId = group.numericId ?? existing.numericId;
   const hasChanges =
     existing.url !== url ||
-    existing.numericId !== updatedNumericId;
+    existing.numericId !== updatedNumericId ||
+    shouldReplaceName;
 
   if (hasChanges) {
     groups.set(group.id, {
       ...existing,
       ...group,
-      name: existing.name,
+      name: shouldReplaceName ? cleanName : existing.name,
       url,
       numericId: updatedNumericId,
+      nameSource: shouldReplaceName ? group.nameSource : existing.nameSource ?? group.nameSource,
     });
     return true;
   }
@@ -424,7 +684,13 @@ function collectGroupsFromGraphQLText(text: string): void {
       if (!id && typeof record.vanity === 'string' && record.vanity) id = record.vanity;
       if (!id && numericId) id = numericId;
       if (id && !EXCLUDED_SLUGS.has(id) && isValidName(record.name)) {
-        found.push({ id, numericId, name: record.name, url: canonicalizeGroupUrl(id) });
+        found.push({
+          id,
+          numericId,
+          name: normalizeGroupNameCandidate(record.name),
+          url: canonicalizeGroupUrl(id),
+          nameSource: "graphql",
+        });
         return found;
       }
     }
@@ -580,6 +846,19 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     activeJobId = message.jobId;
     executeFacebookPost(message.jobId, message.post, message.group)
       .then((submissionResult) => {
+        if (isFacebookPublishFailureResult(submissionResult)) {
+          chrome.runtime.sendMessage({
+            type: 'JOB_FAILED',
+            jobId: message.jobId,
+            postId: message.post?._id,
+            error: formatFacebookPublishFailure(submissionResult),
+            publishStatus: submissionResult.status,
+            shouldPauseQueue: submissionResult.shouldPauseQueue ?? false,
+            detector: submissionResult.detector,
+          });
+          return;
+        }
+
         // We actually use chrome.runtime.sendMessage to communicate status
         // because the tab might navigate or reload, but the background script listens for it.
         chrome.runtime.sendMessage({
@@ -590,12 +869,37 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         });
       })
       .catch((err) => {
-        chrome.runtime.sendMessage({ type: 'JOB_FAILED', jobId: message.jobId, postId: message.post?._id, error: err.message });
+        chrome.runtime.sendMessage({
+          type: err?.name === 'PostFlowJobCanceled' ? 'JOB_CANCELED' : 'JOB_FAILED',
+          jobId: message.jobId,
+          postId: message.post?._id,
+          error: err.message,
+        });
       });
   }
 });
 
 // ── Job Execution (DOM Manipulation) ──
+
+function isFacebookPublishFailureResult(
+  result: FacebookPostSubmissionResult,
+): result is Extract<FacebookPostSubmissionResult, { status: FacebookPublishInterruptionStatus }> {
+  return [
+    'TEMPORARY_BLOCK',
+    'CAPTCHA_OR_CHALLENGE',
+    'CHECKPOINT_OR_VERIFICATION',
+    'LOGIN_REQUIRED',
+    'UNEXPECTED_INTERRUPTION',
+  ].includes(result.status);
+}
+
+function formatFacebookPublishFailure(result: Extract<FacebookPostSubmissionResult, { status: FacebookPublishInterruptionStatus }>): string {
+  return [
+    result.status,
+    result.reason,
+    result.detector ? `detector=${result.detector}` : '',
+  ].filter(Boolean).join(': ');
+}
 
 function extractFacebookGroupIdFromUrl(value?: string): string | undefined {
   if (!value) return undefined;
@@ -817,7 +1121,7 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
             text: textOption.textContent?.trim().slice(0, 80),
           });
         } else {
-          console.warn('[PostFlow] Could not find Post/Text button in intermediate modal — proceeding anyway');
+          console.log('[PostFlow] No Post/Text option found in intermediate modal; proceeding to composer detection');
           recordPostingStep(jobId, 'intermediate_post_option_missing');
         }
       }
@@ -1001,10 +1305,37 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
       const existingPostElements = new Set<Element>([
         ...document.querySelectorAll('[role="article"], [data-pagelet*="FeedUnit"]'),
       ]);
+      const existingPostUrls = new Set(
+        Array.from(existingPostElements)
+          .map((element) => extractPostPermalink(element, currentGroupId))
+          .filter((url): url is string => Boolean(url))
+          .map((url) => normalizeTrackedPostUrl(url) ?? url.replace(/\/$/, '').toLowerCase()),
+      );
       const submittedAt = Date.now();
       const initialPageUrl = location.href;
+      const hasVideo = mediaUrls.some((url: string) => url.startsWith('data:video/'));
+      const trackingSession = createPublishTrackingSession({
+        jobId,
+        groupId: currentGroupId,
+        submittedAt,
+        hasVideo,
+        existingPostUrls,
+      });
+      activePublishTrackingSession = trackingSession;
+
+      const latestJob = await chrome.runtime.sendMessage({
+        type: 'GET_JOB_STATUS',
+        jobId,
+      }).catch(() => null);
+      if (latestJob?.job?.status === 'CANCEL_REQUESTED') {
+        recordPostingStep(jobId, 'job_canceled_before_final_submit');
+        const cancelError = new Error('Canceled before clicking Facebook Post');
+        cancelError.name = 'PostFlowJobCanceled';
+        throw cancelError;
+      }
 
       (postButton as HTMLElement).click();
+      trackingSession.acceptCandidatesAfter = Date.now();
       console.log('[PostFlow] Post button clicked, waiting for publish confirmation...');
       recordPostingStep(jobId, 'post_button_clicked');
 
@@ -1049,7 +1380,24 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
           element.getAttribute('title') ?? '',
         ].join(' ');
       };
+      const videoProcessingCues = [
+        'processing your video',
+        'your video is being processed',
+        'we are processing the video',
+        'we\'re processing the video',
+        'جارٍ معالجة الفيديو',
+        'تجري الآن معالجة الفيديو',
+      ];
+      const isVideoProcessingVisible = () => {
+        if (!hasVideo) return false;
+        const pageText = (document.body.innerText ?? '').toLowerCase();
+        return videoProcessingCues.some((cue) => pageText.includes(cue.toLowerCase()));
+      };
       const getPublishSuccessEvidence = () => {
+        // This is an intermediate confirmation. Do not finish the job until
+        // Facebook renders the submitted post/permalink or the longer video
+        // polling window expires.
+        if (isVideoProcessingVisible()) return 'Facebook accepted the video and is processing it';
         const semanticSurfaces = Array.from(document.querySelectorAll(
           '[role="alert"], [role="status"], [aria-live], [data-visualcompletion="ignore-dynamic"]',
         ));
@@ -1071,11 +1419,21 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
         root: document,
         submittedText: post.content ?? '',
         submittedAt,
-        timeout: POSTING_TIMING.publishConfirmationTimeoutMs,
+        timeout: hasVideo
+          ? POSTING_TIMING.videoPublishConfirmationTimeoutMs
+          : POSTING_TIMING.publishConfirmationTimeoutMs,
         interval: POSTING_TIMING.publishPollIntervalMs,
         existingPostElements,
+        existingPostUrls,
+        submittedMediaCount: mediaUrls.length,
         currentGroupId,
         initialPageUrl,
+        getInterruption: () => detectFacebookPublishingInterruption({
+          root: document,
+          hasVideo,
+          activeComposer: document.body.contains(dialog) ? dialog : null,
+          initialPageUrl,
+        }),
         getFailureReason: () => {
           const dialogText = document.body.contains(dialog) ? ((dialog as HTMLElement).innerText ?? '') : '';
           const pageText = (document.body.innerText ?? '').toLowerCase();
@@ -1084,13 +1442,37 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
             : null;
         },
         getSuccessEvidence: getPublishSuccessEvidence,
+        getPendingPostUrl: () => getBestNetworkPendingPostUrl(trackingSession),
+        getNetworkPostUrl: () => getBestNetworkPostUrl(trackingSession),
+        onStateChange: (status, details = {}) => {
+          recordPostingStep(jobId, 'publish_state_changed', {
+            status,
+            detector: typeof details.detector === 'string' ? details.detector : undefined,
+            source: typeof details.source === 'string' ? details.source : undefined,
+            shouldPauseQueue: typeof details.shouldPauseQueue === 'boolean' ? details.shouldPauseQueue : undefined,
+          });
+        },
       });
 
       recordPostingStep(jobId, 'submission_result_detected', {
         status: submissionResult.status,
         postUrl: 'postUrl' in submissionResult ? submissionResult.postUrl : undefined,
-        reason: submissionResult.status === 'UNKNOWN' ? submissionResult.reason : undefined,
+        reason: 'reason' in submissionResult ? submissionResult.reason : undefined,
+        detector: 'detector' in submissionResult ? submissionResult.detector : undefined,
+        shouldPauseQueue: 'shouldPauseQueue' in submissionResult ? submissionResult.shouldPauseQueue : undefined,
+        networkCandidates: trackingSession.candidates.length,
+        videoIds: trackingSession.mediaVideoIds.size,
+        uploadSessionIds: trackingSession.uploadSessionIds.size,
       });
+      console.log('[PostTracking] Publish tracking session ended', {
+        jobId,
+        status: submissionResult.status,
+        postUrl: 'postUrl' in submissionResult ? submissionResult.postUrl : undefined,
+        networkCandidates: trackingSession.candidates.length,
+        videoIds: Array.from(trackingSession.mediaVideoIds),
+        uploadSessionIds: Array.from(trackingSession.uploadSessionIds),
+      });
+      if (activePublishTrackingSession === trackingSession) activePublishTrackingSession = null;
       resolve(submissionResult);
       return;
 
@@ -1134,6 +1516,7 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
       recordPostingStep(jobId, 'job_failed_in_content_script', { error: err?.message ?? String(err) });
       reject(err);
     } finally {
+      if (activeJobId === jobId) activePublishTrackingSession = null;
       isExecutingJob = false;
       activeJobId = null;
     }
@@ -1154,7 +1537,7 @@ function clickLikeUser(element: HTMLElement) {
 }
 
 function dataUrlToFile(dataUrl: string, index: number): File {
-  const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.*)$/);
+  const match = dataUrl.match(/^data:((?:image|video)\/[a-zA-Z0-9.+-]+);base64,(.*)$/);
   if (!match) {
     throw new Error('Unsupported media format');
   }
@@ -1241,7 +1624,9 @@ async function attachMediaToDialog(dialog: Element, mediaUrls: string[]) {
       const alt = image.alt.toLowerCase();
       return src.startsWith('blob:') || src.startsWith('data:') || alt.includes('photo') || alt.includes('image');
     });
-    return hasPreviewImage ||
+    const videos = Array.from(dialog.querySelectorAll<HTMLVideoElement>('video'));
+    const hasPreviewVideo = videos.some((video) => video.currentSrc || video.src);
+    return hasPreviewImage || hasPreviewVideo ||
       text.includes('photos/videos') ||
       text.includes('photo/video') ||
       text.includes('edit all') ||

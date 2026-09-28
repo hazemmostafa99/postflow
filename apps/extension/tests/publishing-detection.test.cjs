@@ -41,7 +41,7 @@ function setupSubmission(html, locationHref = 'https://www.facebook.com/groups/1
       getComputedStyle: () => ({ display: '', visibility: '', opacity: '1' }),
     },
   });
-  for (const file of ['detect-pending-approval.ts', 'find-published-post.ts', 'wait-for-post-submission-result.ts']) {
+  for (const file of ['detect-pending-approval.ts', 'find-published-post.ts', 'facebook-interruption-detector.ts', 'wait-for-post-submission-result.ts']) {
     const source = readFileSync(resolve(__dirname, '../src/post-tracking', file), 'utf8');
     vm.runInContext(ts.transpile(source, { target: ts.ScriptTarget.ES2020 }), context);
   }
@@ -100,6 +100,35 @@ test('new matching post is accepted before Facebook hydrates its timestamp', () 
     currentGroupId: '123',
   });
   assert.equal(result?.postUrl, 'https://www.facebook.com/groups/123/posts/new-without-time/');
+});
+
+test('a re-rendered old post permalink is not treated as the submitted post', () => {
+  const app = setup(article({ post: 'old-rerendered', text: 'video post' }));
+  const result = app.context.findPublishedPost({
+    root: app.document,
+    submittedText: 'video post',
+    submittedAt: Date.parse('2026-09-19T12:00:00.000Z'),
+    existingPostElements: new Set(),
+    existingPostUrls: new Set(['https://www.facebook.com/groups/123/posts/old-rerendered']),
+    currentGroupId: '123',
+  });
+  assert.equal(result, null);
+});
+
+test('media-only posts can match a newly inserted post with media', () => {
+  const app = setup(`<div role="article">
+    <a href="https://www.facebook.com/groups/123/posts/video-new/">permalink</a>
+    <video src="blob:video-preview"></video>
+  </div>`);
+  const result = app.context.findPublishedPost({
+    root: app.document,
+    submittedText: '',
+    submittedAt: Date.parse('2026-09-19T12:00:00.000Z'),
+    existingPostElements: new Set(),
+    submittedMediaCount: 1,
+    currentGroupId: '123',
+  });
+  assert.equal(result?.postUrl, 'https://www.facebook.com/groups/123/posts/video-new/');
 });
 
 test('publish detection only accepts permalinks from the target group', () => {
@@ -207,6 +236,83 @@ test('Facebook redirect captures the new post URL when the post article is not h
   assert.deepEqual(JSON.parse(JSON.stringify(result)), { status: 'PUBLISHED', postUrl: 'https://www.facebook.com/groups/123/posts/999/' });
 });
 
+test('pending approval captures a network pending_posts URL when the DOM has no permalink yet', async () => {
+  const app = setupSubmission('<div role="status">Your post is pending admin approval</div>');
+  const result = await app.context.waitForPostSubmissionResult({
+    root: app.document,
+    submittedText: '',
+    submittedAt: Date.parse('2026-09-19T12:00:00.000Z'),
+    timeout: 3000,
+    interval: 500,
+    existingPostElements: new Set(),
+    submittedMediaCount: 1,
+    currentGroupId: '123',
+    getPendingPostUrl: () => 'https://www.facebook.com/groups/123/pending_posts/video-pending-1/',
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+    status: 'PENDING_APPROVAL',
+    postUrl: 'https://www.facebook.com/groups/123/pending_posts/video-pending-1/',
+  });
+});
+
+test('temporary block dialog pauses publishing instead of retrying', async () => {
+  const app = setupSubmission('<div role="dialog">You are temporarily blocked from performing this action. Try again later.</div>');
+  const result = await app.context.waitForPostSubmissionResult({
+    root: app.document,
+    submittedText: 'blocked post',
+    submittedAt: Date.parse('2026-09-19T12:00:00.000Z'),
+    timeout: 3000,
+    interval: 500,
+    existingPostElements: new Set(),
+    currentGroupId: '123',
+    getInterruption: () => app.context.detectFacebookPublishingInterruption({ root: app.document }),
+  });
+  assert.equal(result.status, 'TEMPORARY_BLOCK');
+  assert.equal(result.shouldPauseQueue, true);
+});
+
+test('Arabic temporary block dialog pauses publishing', () => {
+  const app = setupSubmission('<div role="dialog">تم حظرك مؤقتًا من استخدام هذه الميزة. حاول مرة أخرى لاحقًا.</div>');
+  const result = app.context.detectFacebookPublishingInterruption({ root: app.document });
+  assert.equal(result.status, 'TEMPORARY_BLOCK');
+  assert.equal(result.shouldPauseQueue, true);
+});
+
+test('captcha challenge is classified as manual intervention', async () => {
+  const app = setupSubmission('<div role="dialog" aria-modal="true">Complete this security check to verify you are human. CAPTCHA</div>');
+  const result = app.context.detectFacebookPublishingInterruption({ root: app.document });
+  assert.equal(result.status, 'CAPTCHA_OR_CHALLENGE');
+  assert.equal(result.shouldPauseQueue, true);
+});
+
+test('Arabic security challenge is classified as manual intervention', () => {
+  const app = setupSubmission('<div role="dialog" aria-modal="true">أكمل فحص الأمان للتحقق من أنك إنسان ولست روبوتًا.</div>');
+  const result = app.context.detectFacebookPublishingInterruption({ root: app.document });
+  assert.equal(result.status, 'CAPTCHA_OR_CHALLENGE');
+  assert.equal(result.shouldPauseQueue, true);
+});
+
+test('checkpoint URL is classified before DOM text', () => {
+  const app = setupSubmission('<main>Facebook</main>', 'https://www.facebook.com/checkpoint/123/');
+  const result = app.context.detectFacebookPublishingInterruption({ root: app.document });
+  assert.equal(result.status, 'CHECKPOINT_OR_VERIFICATION');
+  assert.equal(result.source, 'navigation');
+});
+
+test('Arabic identity confirmation is classified as checkpoint verification', () => {
+  const app = setupSubmission('<div role="dialog">ساعدنا في تأكيد أنه أنت. يرجى تأكيد هويتك لحماية حسابك.</div>');
+  const result = app.context.detectFacebookPublishingInterruption({ root: app.document });
+  assert.equal(result.status, 'CHECKPOINT_OR_VERIFICATION');
+  assert.equal(result.shouldPauseQueue, true);
+});
+
+test('login URL pauses publishing as login required', () => {
+  const app = setupSubmission('<main>Log in to Facebook</main>', 'https://www.facebook.com/login/?next=%2Fgroups%2F123%2F');
+  const result = app.context.detectFacebookPublishingInterruption({ root: app.document });
+  assert.equal(result.status, 'LOGIN_REQUIRED');
+  assert.equal(result.shouldPauseQueue, true);
+});
+
 test('pending sync selects the newest matching post permalink', () => {
   const app = setupPending([
     article({ post: 'older', text: 'same pending text', datetime: '2026-09-19T12:00:00.000Z' }),
@@ -248,7 +354,27 @@ test('a pending_posts permalink remains pending instead of becoming published', 
     content: 'still waiting',
     submittedAt: '2026-09-19T12:00:00.000Z',
   });
-  assert.deepEqual(JSON.parse(JSON.stringify(result)), { status: 'STILL_PENDING' });
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+    status: 'STILL_PENDING',
+    postUrl: 'https://www.facebook.com/groups/123/pending_posts/777003/',
+  });
+});
+
+test('pending sync without a match or saved pending URL does not mark still pending', () => {
+  const app = setupPending('<main></main>');
+  const result = app.context.checkPendingFacebookPost({
+    id: 'job-no-url',
+    groupId: 'group-1',
+    groupExternalId: '123',
+    groupUrl: 'https://www.facebook.com/groups/123/',
+    status: 'PENDING_APPROVAL',
+    content: 'missing pending video',
+    submittedAt: '2026-09-19T12:00:00.000Z',
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+    status: 'CHECK_FAILED',
+    reason: 'Pending post link was not found',
+  });
 });
 
 test('approved post page with the saved post id becomes published before article hydration', () => {

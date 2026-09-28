@@ -43,6 +43,9 @@ const postingTiming: PostFlowPostingTimingConfig = {
   // Max time to watch for success/error signals after clicking Facebook's Post button.
   publishConfirmationTimeoutMs: 15000,
 
+  // Facebook may keep a video-processing notice visible before the final post card/permalink appears.
+  videoPublishConfirmationTimeoutMs: 60000,
+
   // How often to re-check the dialog/page while waiting for publish confirmation.
   publishPollIntervalMs: 500,
 

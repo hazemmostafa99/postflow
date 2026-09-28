@@ -22,7 +22,11 @@ export class Invitation {
   @Prop({ type: String, default: null })
   teamId?: string | null;
 
-  @Prop({ required: true, enum: InvitationStatus, default: InvitationStatus.PENDING })
+  @Prop({
+    required: true,
+    enum: InvitationStatus,
+    default: InvitationStatus.PENDING,
+  })
   status: InvitationStatus;
 
   @Prop({ type: String, default: null })

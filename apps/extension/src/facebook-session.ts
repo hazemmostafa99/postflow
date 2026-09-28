@@ -7,14 +7,30 @@
  * Reports the session status to the background service worker.
  */
 
-function isFacebookLoggedIn(): boolean {
-  return document.cookie.split(';').some((c) => c.trim().startsWith('c_user='));
+function getFacebookUserId(): string | null {
+  const cookie = document.cookie
+    .split(';')
+    .map((value) => value.trim())
+    .find((value) => value.startsWith('c_user='));
+  if (!cookie) return null;
+
+  const value = cookie.slice('c_user='.length);
+  try {
+    const decoded = decodeURIComponent(value);
+    return /^\d+$/.test(decoded) ? decoded : null;
+  } catch {
+    return /^\d+$/.test(value) ? value : null;
+  }
 }
 
-const sessionDetected = isFacebookLoggedIn();
-console.log('[PostFlow] Facebook session detected:', sessionDetected);
+const facebookUserId = getFacebookUserId();
+const sessionDetected = Boolean(facebookUserId);
+console.log('[PostFlow] Facebook session detected:', sessionDetected, {
+  facebookUserId,
+});
 
 chrome.runtime.sendMessage({
   type: 'FACEBOOK_SESSION_STATUS',
   sessionDetected,
+  facebookUserId,
 });

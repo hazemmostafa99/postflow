@@ -1,9 +1,19 @@
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { AuthorizationService } from '../auth/authorization.service';
 import { Team, TeamDocument } from '../schemas/team.schema';
-import { User, UserDocument, UserRole, UserStatus } from '../schemas/user.schema';
+import {
+  User,
+  UserDocument,
+  UserRole,
+  UserStatus,
+} from '../schemas/user.schema';
 
 @Injectable()
 export class TeamsService {
@@ -15,7 +25,12 @@ export class TeamsService {
 
   async list(clerkUserId: string) {
     const user = await this.authorization.requireActiveUser(clerkUserId);
-    const filter = user.role === UserRole.ADMIN ? {} : user.role === UserRole.MANAGER ? { managerId: user._id.toString() } : { _id: user.teamId };
+    const filter =
+      user.role === UserRole.ADMIN
+        ? {}
+        : user.role === UserRole.MANAGER
+          ? { managerId: user._id.toString() }
+          : { _id: user.teamId };
     const teams = await this.teamModel.find(filter).sort({ name: 1 }).exec();
     return Promise.all(teams.map((team) => this.decorate(team)));
   }
@@ -34,14 +49,23 @@ export class TeamsService {
     if (!cleanName) throw new BadRequestException('Team name is required');
     await this.validateManager(managerId);
     try {
-      return await new this.teamModel({ name: cleanName, managerId: managerId || null }).save();
+      const team = new this.teamModel({
+        name: cleanName,
+        managerId: managerId || null,
+      });
+      return await team.save();
     } catch (error) {
-      if ((error as { code?: number }).code === 11000) throw new ConflictException('A team with this name already exists');
+      if ((error as { code?: number }).code === 11000)
+        throw new ConflictException('A team with this name already exists');
       throw error;
     }
   }
 
-  async update(clerkUserId: string, id: string, body: { name?: string; managerId?: string | null }) {
+  async update(
+    clerkUserId: string,
+    id: string,
+    body: { name?: string; managerId?: string | null },
+  ) {
     await this.authorization.requireRole(clerkUserId, UserRole.ADMIN);
     const patch: { name?: string; managerId?: string | null } = {};
     if (body.name !== undefined) {
@@ -53,16 +77,25 @@ export class TeamsService {
       await this.validateManager(body.managerId);
       patch.managerId = body.managerId || null;
     }
-    const team = await this.teamModel.findByIdAndUpdate(id, patch, { returnDocument: 'after' }).exec();
+    const team = await this.teamModel
+      .findByIdAndUpdate(id, patch, { returnDocument: 'after' })
+      .exec();
     if (!team) throw new NotFoundException('Team not found');
     return team;
   }
 
   async removeMember(clerkUserId: string, teamId: string, userId: string) {
-    const requester = await this.authorization.requireRole(clerkUserId, UserRole.ADMIN, UserRole.MANAGER);
+    const requester = await this.authorization.requireRole(
+      clerkUserId,
+      UserRole.ADMIN,
+      UserRole.MANAGER,
+    );
     const team = await this.teamModel.findById(teamId).exec();
     if (!team) throw new NotFoundException('Team not found');
-    if (requester.role === UserRole.MANAGER && team.managerId !== requester._id.toString()) {
+    if (
+      requester.role === UserRole.MANAGER &&
+      team.managerId !== requester._id.toString()
+    ) {
       throw new NotFoundException('Team not found');
     }
     const user = await this.userModel.findOne({ _id: userId, teamId }).exec();
@@ -76,36 +109,53 @@ export class TeamsService {
     await this.authorization.requireRole(clerkUserId, UserRole.ADMIN);
     const team = await this.teamModel.findByIdAndDelete(id).exec();
     if (!team) throw new NotFoundException('Team not found');
-    await this.userModel.updateMany(
-      { teamId: id, role: UserRole.TEAM_LEADER },
-      { $set: { role: UserRole.SALES } },
-    ).exec();
-    await this.userModel.updateMany(
-      { teamId: id },
-      { $set: { teamId: null } },
-    ).exec();
+    await this.userModel
+      .updateMany(
+        { teamId: id, role: UserRole.TEAM_LEADER },
+        { $set: { role: UserRole.SALES } },
+      )
+      .exec();
+    await this.userModel
+      .updateMany({ teamId: id }, { $set: { teamId: null } })
+      .exec();
     return { deleted: true, id };
   }
 
   private async decorate(team: TeamDocument) {
-    const members = await this.userModel.find({ teamId: team._id.toString(), status: UserStatus.ACTIVE }).select('-__v').lean().exec();
-    const manager = team.managerId ? await this.userModel.findById(team.managerId).select('-__v').lean().exec() : null;
-    const data = team.toObject();
+    const members = await this.userModel
+      .find({ teamId: team._id.toString(), status: UserStatus.ACTIVE })
+      .select('-__v')
+      .lean()
+      .exec();
+    const manager = team.managerId
+      ? await this.userModel
+          .findById(team.managerId)
+          .select('-__v')
+          .lean()
+          .exec()
+      : null;
     return {
-      ...data,
       _id: team._id.toString(),
+      name: team.name,
+      managerId: team.managerId ?? null,
       manager,
-      teamLeader: members.find((member) => member.role === UserRole.TEAM_LEADER) ?? null,
+      teamLeader:
+        members.find((member) => member.role === UserRole.TEAM_LEADER) ?? null,
       members,
       sales: members.filter((member) => member.role === UserRole.SALES),
-      salesCount: members.filter((member) => member.role === UserRole.SALES).length,
+      salesCount: members.filter((member) => member.role === UserRole.SALES)
+        .length,
     };
   }
 
   private async validateManager(managerId?: string | null) {
     if (!managerId) return;
     const manager = await this.userModel.findById(managerId).exec();
-    if (!manager || manager.role !== UserRole.MANAGER || manager.status !== UserStatus.ACTIVE) {
+    if (
+      !manager ||
+      manager.role !== UserRole.MANAGER ||
+      manager.status !== UserStatus.ACTIVE
+    ) {
       throw new BadRequestException('A valid active Manager is required');
     }
   }

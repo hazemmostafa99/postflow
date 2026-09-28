@@ -3,7 +3,10 @@ const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
 
 /** Normal refresh cadence based on the age of the published Facebook post. */
-export function getEngagementSyncDelayMs(publishedAt: Date, now = new Date()): number {
+export function getEngagementSyncDelayMs(
+  publishedAt: Date,
+  now = new Date(),
+): number {
   const ageMs = Math.max(0, now.getTime() - publishedAt.getTime());
   if (ageMs < HOUR_MS) return 15 * MINUTE_MS;
   if (ageMs < 6 * HOUR_MS) return 30 * MINUTE_MS;

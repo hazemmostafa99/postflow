@@ -3,7 +3,6 @@ import {
   Post,
   Get,
   Delete,
-  Param,
   Body,
   Headers,
   Query,
@@ -14,7 +13,7 @@ import {
 import { GroupsService, SyncGroupDto } from './groups.service';
 
 class SyncGroupsDto {
-  groups: SyncGroupDto[];
+  groups!: SyncGroupDto[];
 }
 
 @Controller('api/groups')
@@ -29,10 +28,16 @@ export class GroupsController {
   @HttpCode(HttpStatus.OK)
   async sync(
     @Headers('x-clerk-user-id') clerkUserId: string,
+    @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Body() body: SyncGroupsDto,
   ) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
-    return this.groupsService.syncGroups(clerkUserId, body.groups ?? []);
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    return this.groupsService.syncGroups(
+      clerkUserId,
+      body.groups ?? [],
+      extensionInstanceId,
+    );
   }
 
   /**
@@ -45,27 +50,34 @@ export class GroupsController {
     @Query('search') search?: string,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
+    @Query('connectionId') connectionId?: string,
   ) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
     if (page || limit) {
       return this.groupsService.listGroups(clerkUserId, {
         search,
         page: page ? Number(page) : undefined,
         limit: limit ? Number(limit) : undefined,
+        connectionId,
       });
     }
     if (search?.trim()) {
-      return this.groupsService.searchGroups(clerkUserId, search.trim());
+      return this.groupsService.searchGroups(
+        clerkUserId,
+        search.trim(),
+        connectionId,
+      );
     }
-    return this.groupsService.getGroups(clerkUserId);
+    return this.groupsService.getGroups(clerkUserId, connectionId);
   }
 
   /** DELETE /api/groups - delete all synced groups and their jobs */
   @Delete()
   @HttpCode(HttpStatus.NO_CONTENT)
   async removeAll(@Headers('x-clerk-user-id') clerkUserId: string) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
     await this.groupsService.deleteAllGroups(clerkUserId);
   }
-
 }

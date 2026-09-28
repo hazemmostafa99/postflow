@@ -1,8 +1,17 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { ForbiddenException, Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
+import { Types } from 'mongoose';
 import { Group, GroupDocument } from '../schemas/group.schema';
-import { PublishingJob, PublishingJobDocument } from '../schemas/publishing-job.schema';
+import {
+  PublishingJob,
+  PublishingJobDocument,
+} from '../schemas/publishing-job.schema';
+import {
+  FacebookConnection,
+  FacebookConnectionDocument,
+  FacebookConnectionStatus,
+} from '../schemas/facebook-connection.schema';
 
 export interface SyncGroupDto {
   externalId: string;
@@ -15,16 +24,30 @@ export interface ListGroupsOptions {
   search?: string;
   page?: number;
   limit?: number;
+  connectionId?: string;
 }
 
 const UI_NAME_SUBSTRINGS = [
   'تعرف على المزيد',
   'learn more about this group',
   'about this group',
+  'غير مقروءة',
+  'مطلوب الموافقة',
+  'approval required',
+  'requires approval',
+  'unread',
+  'new post',
 ];
 
+function normalizeGroupName(name: string): string {
+  return (name ?? '')
+    .replace(/[\u200e\u200f\u202a-\u202e]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function isUiGroupName(name: string): boolean {
-  const trimmed = name?.trim() ?? '';
+  const trimmed = normalizeGroupName(name);
   if (!trimmed) return true;
   const lower = trimmed.toLowerCase();
   return UI_NAME_SUBSTRINGS.some((s) => lower.includes(s.toLowerCase()));
@@ -44,77 +67,131 @@ export class GroupsService {
     private readonly groupModel: Model<GroupDocument>,
     @InjectModel(PublishingJob.name)
     private readonly jobModel: Model<PublishingJobDocument>,
+    @InjectModel(FacebookConnection.name)
+    private readonly connectionModel: Model<FacebookConnectionDocument>,
   ) {}
+
+  private async assertVerifiedConnection(
+    clerkUserId: string,
+    extensionInstanceId?: string,
+  ): Promise<FacebookConnectionDocument | null> {
+    const normalizedInstanceId = extensionInstanceId?.trim();
+    if (!normalizedInstanceId) return null;
+
+    const connection = await this.connectionModel
+      .findOne({ clerkUserId, extensionInstanceId: normalizedInstanceId })
+      .lean()
+      .exec();
+    const verified = Boolean(
+      connection?.status === FacebookConnectionStatus.CONNECTED &&
+      connection.facebookSessionDetected &&
+      connection.facebookUserId &&
+      connection.detectedFacebookUserId &&
+      connection.facebookUserId === connection.detectedFacebookUserId,
+    );
+    if (!verified) {
+      throw new ForbiddenException(
+        'Facebook identity must be verified before syncing groups.',
+      );
+    }
+    return connection as FacebookConnectionDocument;
+  }
 
   /**
    * Upsert a batch of groups for the authenticated user.
    * Called by the extension whenever new groups are discovered.
    */
-  async syncGroups(clerkUserId: string, groups: SyncGroupDto[]): Promise<{ synced: number; total?: number }> {
+  async syncGroups(
+    clerkUserId: string,
+    groups: SyncGroupDto[],
+    extensionInstanceId?: string,
+  ): Promise<{ synced: number; total?: number }> {
+    const connection = await this.assertVerifiedConnection(
+      clerkUserId,
+      extensionInstanceId,
+    );
+    const connectionId = connection?._id;
     if (!groups.length) return { synced: 0 };
 
-    const ops = groups.map((g) => {
-      const url = canonicalizeGroupUrl(g.externalId, g.url);
-      const skipName = isUiGroupName(g.name);
-      return {
+    const ops = groups
+      .map((g) => {
+        const url = canonicalizeGroupUrl(g.externalId, g.url);
+        const cleanName = normalizeGroupName(g.name);
+        const skipName = isUiGroupName(cleanName);
+        if (skipName) return null;
+        return {
         updateOne: {
-          filter: { clerkUserId, externalId: g.externalId },
+          filter: {
+            clerkUserId,
+            externalId: g.externalId,
+            ...(connectionId ? { facebookConnectionId: connectionId } : {}),
+          },
           update: {
             $set: {
               url,
               lastSeenAt: new Date(),
               status: 'ACTIVE',
+              ...(skipName ? {} : { name: cleanName }),
             },
             $setOnInsert: {
               clerkUserId,
               externalId: g.externalId,
-              name: skipName ? g.externalId : g.name,
+              ...(connectionId ? { facebookConnectionId: connectionId } : {}),
             },
           },
           upsert: true,
         },
-      };
-    });
+        };
+      })
+      .filter((op): op is NonNullable<typeof op> => op !== null);
+
+    if (!ops.length) return { synced: 0 };
 
     const result = await this.groupModel.bulkWrite(ops);
-    
-    // Calculate total groups for this user to help with debugging mismatches
-    const totalInDb = await this.groupModel.countDocuments({ clerkUserId });
-    
-    console.log(`[Backend] Synced ${result.upsertedCount + result.modifiedCount} groups for user ${clerkUserId}. Total DB count: ${totalInDb}`);
 
-    return { 
+    // Calculate total groups for this user to help with debugging mismatches
+    const totalInDb = await this.groupModel.countDocuments({
+      clerkUserId,
+      ...(connectionId ? { facebookConnectionId: connectionId } : {}),
+    });
+
+    console.log(
+      `[Backend] Synced ${result.upsertedCount + result.modifiedCount} groups for user ${clerkUserId}. Total DB count: ${totalInDb}`,
+    );
+
+    return {
       synced: result.upsertedCount + result.modifiedCount,
-      total: totalInDb 
+      total: totalInDb,
     };
   }
 
   /**
    * Return all groups belonging to the given user.
    */
-  async getGroups(clerkUserId: string) {
+  async getGroups(clerkUserId: string, connectionId?: string) {
+    const filter = this.getGroupFilter(clerkUserId, connectionId);
     const groups = await this.groupModel
-      .find({ clerkUserId })
+      .find(filter)
       .sort({ lastSeenAt: -1 })
       .lean()
       .exec();
-      
+
     return groups.map((g) => ({ ...g, _id: g._id.toString() }));
   }
 
   /**
    * Search groups by name (case-insensitive).
    */
-  async searchGroups(clerkUserId: string, query: string) {
+  async searchGroups(clerkUserId: string, query: string, connectionId?: string) {
     const groups = await this.groupModel
       .find({
-        clerkUserId,
+        ...this.getGroupFilter(clerkUserId, connectionId),
         name: { $regex: query, $options: 'i' },
       })
       .sort({ lastSeenAt: -1 })
       .lean()
       .exec();
-      
+
     return groups.map((g) => ({ ...g, _id: g._id.toString() }));
   }
 
@@ -123,7 +200,7 @@ export class GroupsService {
     const limit = Math.min(100, Math.max(1, options.limit ?? 20));
     const search = options.search?.trim();
     const filter = {
-      clerkUserId,
+      ...this.getGroupFilter(clerkUserId, options.connectionId),
       ...(search ? { name: { $regex: search, $options: 'i' } } : {}),
     };
 
@@ -149,11 +226,26 @@ export class GroupsService {
     };
   }
 
+  private getGroupFilter(clerkUserId: string, connectionId?: string) {
+    if (!connectionId?.trim()) return { clerkUserId };
+    if (!Types.ObjectId.isValid(connectionId)) {
+      throw new ForbiddenException('Invalid Facebook connection ID.');
+    }
+    return {
+      clerkUserId,
+      facebookConnectionId: new Types.ObjectId(connectionId),
+    };
+  }
+
   async deleteAllGroups(clerkUserId: string) {
-    const groups = await this.groupModel.find({ clerkUserId }).select('_id').lean().exec();
+    const groups = await this.groupModel
+      .find({ clerkUserId })
+      .select('_id')
+      .lean()
+      .exec();
     const groupIds = groups.map((group) => group._id);
     if (groupIds.length) {
-      await this.jobModel.deleteMany({ groupId: { $in: groupIds } } as any).exec();
+      await this.jobModel.deleteMany().where('groupId').in(groupIds).exec();
     }
     await this.groupModel.deleteMany({ clerkUserId }).exec();
   }

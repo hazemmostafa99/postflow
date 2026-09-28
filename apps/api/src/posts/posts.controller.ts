@@ -1,6 +1,7 @@
 import {
   Controller,
   Post,
+  Patch,
   Get,
   Delete,
   Param,
@@ -11,7 +12,11 @@ import {
   Query,
   UnauthorizedException,
 } from '@nestjs/common';
-import { PostsService, CreatePostDto } from './posts.service';
+import {
+  PostsService,
+  CreatePostDto,
+  UpdatePostScheduleDto,
+} from './posts.service';
 
 @Controller('api/posts')
 export class PostsController {
@@ -24,7 +29,8 @@ export class PostsController {
     @Headers('x-clerk-user-id') clerkUserId: string,
     @Body() body: CreatePostDto,
   ) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
     return this.postsService.createPost(clerkUserId, body);
   }
 
@@ -35,7 +41,8 @@ export class PostsController {
     @Query('page') page?: string,
     @Query('limit') limit?: string,
   ) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
     if (page || limit) {
       return this.postsService.listPosts(clerkUserId, {
         page: page ? Number(page) : undefined,
@@ -51,16 +58,62 @@ export class PostsController {
     @Headers('x-clerk-user-id') clerkUserId: string,
     @Param('id') id: string,
   ) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
     return this.postsService.getPost(clerkUserId, id);
+  }
+
+  /** PATCH /api/posts/:id/schedule — reschedule future jobs only. */
+  @Patch(':id/schedule')
+  async updateSchedule(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('id') id: string,
+    @Body() body: UpdatePostScheduleDto,
+  ) {
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    return this.postsService.updatePostSchedule(clerkUserId, id, body);
+  }
+
+  @Post(':id/pause')
+  @HttpCode(HttpStatus.OK)
+  async pause(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('id') id: string,
+  ) {
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    return this.postsService.pausePost(clerkUserId, id);
+  }
+
+  @Post(':id/resume')
+  @HttpCode(HttpStatus.OK)
+  async resume(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('id') id: string,
+  ) {
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    return this.postsService.resumePost(clerkUserId, id);
+  }
+
+  @Post(':id/cancel')
+  @HttpCode(HttpStatus.OK)
+  async cancel(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('id') id: string,
+  ) {
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    return this.postsService.cancelPost(clerkUserId, id);
   }
 
   /** DELETE /api/posts - delete all posts and their publishing jobs */
   @Delete()
   @HttpCode(HttpStatus.NO_CONTENT)
   async removeAll(@Headers('x-clerk-user-id') clerkUserId: string) {
-    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
     await this.postsService.deleteAllPosts(clerkUserId);
   }
-
 }
