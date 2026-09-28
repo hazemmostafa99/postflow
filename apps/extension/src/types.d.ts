@@ -3,6 +3,7 @@ interface FacebookGroup {
   numericId?: string; // Facebook's internal numeric group ID
   name: string;
   url: string;
+  nameSource?: 'dom' | 'graphql';
 }
 
 interface PostFlowPostingTimingConfig {

@@ -352,6 +352,45 @@ async function syncGroupsToBackend(groups: FacebookGroup[]) {
   return result;
 }
 
+function normalizeStoredGroupName(text: string): string {
+  return text
+    .replace(/[\u200e\u200f\u202a-\u202e]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isNoisyStoredGroupName(text: string): boolean {
+  const normalized = normalizeStoredGroupName(text).toLowerCase();
+  return [
+    'غير مقروءة',
+    'مطلوب الموافقة',
+    'approval required',
+    'requires approval',
+    'unread',
+    'new post',
+    'learn more about this group',
+    'about this group',
+  ].some((needle) => normalized.includes(needle.toLowerCase()));
+}
+
+function shouldReplaceStoredGroupName(prev: FacebookGroup | undefined, next: FacebookGroup): boolean {
+  if (!prev) return true;
+
+  const nextName = normalizeStoredGroupName(next.name);
+  const prevName = normalizeStoredGroupName(prev.name);
+  if (!nextName || nextName.length < 2) return false;
+
+  return (
+    isNoisyStoredGroupName(prevName) ||
+    prevName === prev.id ||
+    prevName === prev.numericId ||
+    (
+      next.nameSource === 'graphql' &&
+      prevName.length > nextName.length + 20
+    )
+  );
+}
+
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'postflow-content') return;
 
@@ -372,10 +411,12 @@ chrome.runtime.onConnect.addListener((port) => {
     for (const g of existing) merged.set(g.id, g);
     for (const g of incoming) {
       const prev = merged.get(g.id);
+      const replaceName = shouldReplaceStoredGroupName(prev, g);
       merged.set(g.id, {
         ...prev,
         ...g,
-        name: prev?.name ?? g.name,
+        name: replaceName ? normalizeStoredGroupName(g.name) : prev?.name ?? normalizeStoredGroupName(g.name),
+        nameSource: replaceName ? g.nameSource : prev?.nameSource ?? g.nameSource,
         numericId: g.numericId ?? prev?.numericId,
         url: `https://www.facebook.com/groups/${g.id}/`,
       });

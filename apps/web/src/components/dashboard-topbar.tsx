@@ -45,7 +45,7 @@ export function DashboardTopbar({ role }: { role?: string }) {
           </button>
         )}
         {pathname === "/" && (
-          <Link href="/posts" className="inline-flex h-9 items-center justify-center rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90">
+          <Link href="/posts" prefetch={false} className="inline-flex h-9 items-center justify-center rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90">
             View posts
           </Link>
         )}

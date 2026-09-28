@@ -31,10 +31,23 @@ const UI_NAME_SUBSTRINGS = [
   'تعرف على المزيد',
   'learn more about this group',
   'about this group',
+  'غير مقروءة',
+  'مطلوب الموافقة',
+  'approval required',
+  'requires approval',
+  'unread',
+  'new post',
 ];
 
+function normalizeGroupName(name: string): string {
+  return (name ?? '')
+    .replace(/[\u200e\u200f\u202a-\u202e]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function isUiGroupName(name: string): boolean {
-  const trimmed = name?.trim() ?? '';
+  const trimmed = normalizeGroupName(name);
   if (!trimmed) return true;
   const lower = trimmed.toLowerCase();
   return UI_NAME_SUBSTRINGS.some((s) => lower.includes(s.toLowerCase()));
@@ -100,10 +113,13 @@ export class GroupsService {
     const connectionId = connection?._id;
     if (!groups.length) return { synced: 0 };
 
-    const ops = groups.map((g) => {
-      const url = canonicalizeGroupUrl(g.externalId, g.url);
-      const skipName = isUiGroupName(g.name);
-      return {
+    const ops = groups
+      .map((g) => {
+        const url = canonicalizeGroupUrl(g.externalId, g.url);
+        const cleanName = normalizeGroupName(g.name);
+        const skipName = isUiGroupName(cleanName);
+        if (skipName) return null;
+        return {
         updateOne: {
           filter: {
             clerkUserId,
@@ -115,18 +131,21 @@ export class GroupsService {
               url,
               lastSeenAt: new Date(),
               status: 'ACTIVE',
+              ...(skipName ? {} : { name: cleanName }),
             },
             $setOnInsert: {
               clerkUserId,
               externalId: g.externalId,
-              name: skipName ? g.externalId : g.name,
               ...(connectionId ? { facebookConnectionId: connectionId } : {}),
             },
           },
           upsert: true,
         },
-      };
-    });
+        };
+      })
+      .filter((op): op is NonNullable<typeof op> => op !== null);
+
+    if (!ops.length) return { synced: 0 };
 
     const result = await this.groupModel.bulkWrite(ops);
 

@@ -44,6 +44,12 @@ const EXCLUDED_NAME_SUBSTRINGS = [
   "تعرف على المزيد",
   "learn more about this group",
   "about this group",
+  "غير مقروءة",
+  "مطلوب الموافقة",
+  "approval required",
+  "requires approval",
+  "unread",
+  "new post",
 ];
 
 // ── State ──
@@ -390,41 +396,40 @@ function canonicalizeGroupUrl(id: string): string {
   return `https://www.facebook.com/groups/${id}/`;
 }
 
-// ── Strategy 1: DOM extraction (aria-label first) ──
+// ── Strategy 1: DOM extraction ──
+
+function normalizeGroupNameCandidate(text: string): string {
+  return text
+    .replace(/[\u200e\u200f\u202a-\u202e]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isNoisyGroupName(text: string): boolean {
+  const normalized = normalizeGroupNameCandidate(text).toLowerCase();
+  return EXCLUDED_NAME_SUBSTRINGS.some((s) => normalized.includes(s.toLowerCase()));
+}
 
 function isValidName(text: string): boolean {
-  if (!text || text.length < 2 || text.length > 150) return false;
-  if (EXCLUDED_NAMES.has(text)) return false;
-  const lower = text.toLowerCase();
-  return !EXCLUDED_NAME_SUBSTRINGS.some((s) => lower.includes(s.toLowerCase()));
+  const normalized = normalizeGroupNameCandidate(text);
+  if (!normalized || normalized.length < 2 || normalized.length > 150) return false;
+  if (EXCLUDED_NAMES.has(normalized)) return false;
+  return !isNoisyGroupName(normalized);
+}
+
+function bestNameFromText(text?: string | null): string | null {
+  if (!text) return null;
+  for (const line of text.split(/\r?\n/)) {
+    const candidate = normalizeGroupNameCandidate(line);
+    if (isValidName(candidate)) return candidate;
+  }
+  const candidate = normalizeGroupNameCandidate(text);
+  return isValidName(candidate) ? candidate : null;
 }
 
 function extractNameFromLink(link: HTMLAnchorElement): string | null {
-  // 1. aria-label on the link itself — most reliable on Facebook
-  const ariaLabel = link.getAttribute("aria-label")?.trim();
-  if (ariaLabel && isValidName(ariaLabel)) {
-    return ariaLabel;
-  }
-
-  // 2. innerText of the link — works for sidebar and card titles
-  const text = link.innerText.trim();
-  if (text && isValidName(text)) {
-    return text;
-  }
-
-  // 3. aria-label on nearest parent (up to 5 levels)
-  let parent = link.parentElement;
-  let depth = 0;
-  while (parent && depth < 5) {
-    const parentAria = parent.getAttribute("aria-label")?.trim();
-    if (parentAria && isValidName(parentAria)) {
-      return parentAria;
-    }
-    parent = parent.parentElement;
-    depth++;
-  }
-
-  return null;
+  // Facebook often puts notification text in aria-label, so prefer visible title text.
+  return bestNameFromText(link.innerText) ?? bestNameFromText(link.getAttribute("aria-label"));
 }
 
 function extractGroupFromLink(link: HTMLAnchorElement): FacebookGroup | null {
@@ -437,7 +442,7 @@ function extractGroupFromLink(link: HTMLAnchorElement): FacebookGroup | null {
   // If the slug is all digits, it IS the numeric ID
   const numericId = /^\d+$/.test(id) ? id : undefined;
 
-  return { id, numericId, name, url: canonicalizeGroupUrl(id) };
+  return { id, numericId, name, url: canonicalizeGroupUrl(id), nameSource: "dom" };
 }
 
 function addGroup(group: FacebookGroup): boolean {
@@ -445,26 +450,39 @@ function addGroup(group: FacebookGroup): boolean {
 
   const existing = groups.get(group.id);
   const url = canonicalizeGroupUrl(group.id);
+  const cleanName = normalizeGroupNameCandidate(group.name);
 
   if (!existing) {
-    groups.set(group.id, { ...group, url });
+    groups.set(group.id, { ...group, name: cleanName, url });
     console.log("[PostFlow] Group:", group.name);
     return true;
   }
 
-  // Keep the first trusted name. Opening a group page to publish should not rename it.
+  const shouldReplaceName =
+    isValidName(cleanName) &&
+    (
+      isNoisyGroupName(existing.name) ||
+      existing.name === existing.id ||
+      existing.name === existing.numericId ||
+      (
+        group.nameSource === "graphql" &&
+        normalizeGroupNameCandidate(existing.name).length > cleanName.length + 20
+      )
+    );
   const updatedNumericId = group.numericId ?? existing.numericId;
   const hasChanges =
     existing.url !== url ||
-    existing.numericId !== updatedNumericId;
+    existing.numericId !== updatedNumericId ||
+    shouldReplaceName;
 
   if (hasChanges) {
     groups.set(group.id, {
       ...existing,
       ...group,
-      name: existing.name,
+      name: shouldReplaceName ? cleanName : existing.name,
       url,
       numericId: updatedNumericId,
+      nameSource: shouldReplaceName ? group.nameSource : existing.nameSource ?? group.nameSource,
     });
     return true;
   }
@@ -666,7 +684,13 @@ function collectGroupsFromGraphQLText(text: string): void {
       if (!id && typeof record.vanity === 'string' && record.vanity) id = record.vanity;
       if (!id && numericId) id = numericId;
       if (id && !EXCLUDED_SLUGS.has(id) && isValidName(record.name)) {
-        found.push({ id, numericId, name: record.name, url: canonicalizeGroupUrl(id) });
+        found.push({
+          id,
+          numericId,
+          name: normalizeGroupNameCandidate(record.name),
+          url: canonicalizeGroupUrl(id),
+          nameSource: "graphql",
+        });
         return found;
       }
     }

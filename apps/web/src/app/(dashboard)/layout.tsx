@@ -13,8 +13,12 @@ export default async function DashboardLayout({
 }) {
   const { userId } = await auth();
   if (!userId) redirect("/sign-in");
-  const user = await currentUser().catch(() => null);
-  if (!user) redirect("/sign-out");
+  // The session ID is the source of truth for authentication. A temporary
+  // failure while loading the profile must not destroy an otherwise valid session.
+  const user = await currentUser().catch((error) => {
+    console.error("[Auth] Unable to load the current Clerk user", error);
+    return null;
+  });
   const email = user?.primaryEmailAddress?.emailAddress ?? user?.emailAddresses[0]?.emailAddress;
 
   const accessResponse = await fetch(`${API_BASE}/api/auth/me`, {
