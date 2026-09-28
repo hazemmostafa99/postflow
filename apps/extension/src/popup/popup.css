@@ -59,6 +59,132 @@ h2 {
   text-align: center;
 }
 
+.identity-panel {
+  margin-top: 16px;
+  padding: 11px 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.identity-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.identity-avatar {
+  display: grid;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border-radius: 8px;
+  color: #1d4ed8;
+  background: #eff6ff;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.identity-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.identity-copy .eyebrow {
+  margin-bottom: 2px;
+}
+
+.identity-copy h2 {
+  overflow: hidden;
+  margin: 0;
+  color: #111827;
+  font-size: 14px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.edit-name-button,
+.cancel-name-button {
+  padding: 7px 9px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  color: #374151;
+  background: #ffffff;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.edit-name-button:hover,
+.cancel-name-button:hover {
+  border-color: #2563eb;
+  color: #1d4ed8;
+}
+
+.name-editor {
+  margin-top: 11px;
+}
+
+.name-editor label {
+  display: block;
+  margin-bottom: 7px;
+  color: #374151;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.name-row {
+  display: flex;
+  gap: 8px;
+}
+
+.name-row input {
+  min-width: 0;
+  flex: 1;
+  padding: 8px 9px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  color: #111827;
+  background: #ffffff;
+  font: inherit;
+  font-size: 12px;
+}
+
+.name-row input:focus {
+  outline: 2px solid rgba(37, 99, 235, 0.2);
+  border-color: #2563eb;
+}
+
+.save-name-button {
+  padding: 8px 11px;
+  border: 0;
+  border-radius: 6px;
+  color: #ffffff;
+  background: #2563eb;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.save-name-button:hover {
+  background: #1d4ed8;
+}
+
+.save-name-button:disabled {
+  background: #94a3b8;
+  cursor: wait;
+}
+
+.name-status {
+  min-height: 16px;
+  margin: 6px 0 0;
+  color: #6b7280;
+  font-size: 11px;
+}
+
 .status-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;

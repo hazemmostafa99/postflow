@@ -23,6 +23,12 @@ import { Post as PostSchema, PostDocument } from '../schemas/post.schema';
 import { getNextPendingPostCheckAt } from './pending-sync-schedule';
 import { getNextEngagementSyncAt } from './engagement-sync-schedule';
 import { getEngagementQueueFilter } from './engagement-eligibility';
+import {
+  FacebookConnection,
+  FacebookConnectionDocument,
+  FacebookConnectionStatus,
+  FacebookConnectionWorkerStatus,
+} from '../schemas/facebook-connection.schema';
 
 type PostEngagementSyncResult = {
   status: 'SUCCESS' | 'PARTIAL' | 'CHECK_FAILED';
@@ -112,18 +118,74 @@ function getFacebookPostIdentity(value?: string): string | undefined {
 
 @Controller('api/jobs')
 export class JobsController {
+  private static readonly JOB_CLAIM_LEASE_MS = 15 * 60 * 1000;
+
   constructor(
     @InjectModel(PublishingJob.name)
     private readonly jobModel: Model<PublishingJobDocument>,
     @InjectModel(PostSchema.name)
     private readonly postModel: Model<PostDocument>,
+    @InjectModel(FacebookConnection.name)
+    private readonly connectionModel: Model<FacebookConnectionDocument>,
   ) {}
+
+  private async getVerifiedWorkerConnection(
+    clerkUserId: string,
+    extensionInstanceId?: string,
+  ): Promise<FacebookConnectionDocument | null> {
+    const normalizedInstanceId = extensionInstanceId?.trim();
+    if (!normalizedInstanceId) return null;
+    const connection = await this.connectionModel
+      .findOne({ clerkUserId, extensionInstanceId: normalizedInstanceId })
+      .lean()
+      .exec();
+    const verified = Boolean(
+      connection?.status === FacebookConnectionStatus.CONNECTED &&
+      connection.facebookSessionDetected &&
+      connection.facebookUserId &&
+      connection.detectedFacebookUserId &&
+      connection.facebookUserId === connection.detectedFacebookUserId,
+    );
+    return verified ? (connection as FacebookConnectionDocument) : null;
+  }
+
+  private async assertWorkerOwnsJob(
+    clerkUserId: string,
+    extensionInstanceId: string | undefined,
+    job: PublishingJobDocument,
+  ) {
+    const normalizedInstanceId = extensionInstanceId?.trim();
+    if (!normalizedInstanceId) return;
+    const connection = await this.getVerifiedWorkerConnection(
+      clerkUserId,
+      normalizedInstanceId,
+    );
+    if (
+      !connection ||
+      String(job.facebookConnectionId) !== String(connection._id)
+    ) {
+      throw new UnauthorizedException(
+        'Job is assigned to another Facebook connection',
+      );
+    }
+  }
 
   /** GET /api/jobs/next — fetch the next pending job for the extension */
   @Get('next')
-  async getNextJob(@Headers('x-clerk-user-id') clerkUserId: string) {
+  async getNextJob(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Headers('x-extension-instance-id') extensionInstanceId?: string,
+  ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
+
+    const normalizedInstanceId = extensionInstanceId?.trim();
+    const connection = await this.getVerifiedWorkerConnection(
+      clerkUserId,
+      normalizedInstanceId,
+    );
+    if (normalizedInstanceId && !connection) return null;
+    const connectionId = connection?._id;
 
     // First find all posts belonging to this user
     const posts = await this.postModel
@@ -133,27 +195,72 @@ export class JobsController {
       .exec();
     const postIds = posts.map((p) => p._id.toString());
 
-    // Find the oldest pending job for any of these posts
-    const job = await this.jobModel
-      .findOne({
-        status: 'PENDING',
-        $or: [
-          { scheduledFor: { $exists: false } },
-          { scheduledFor: null },
-          { scheduledFor: { $lte: new Date() } },
-        ],
-      })
-      .where('postId')
-      .in(postIds)
-      .sort({ scheduledFor: 1, flowOrder: 1, createdAt: 1 })
-      .populate('postId', 'content mediaUrls')
-      .populate('groupId', 'name url externalId')
-      .exec();
+    const now = new Date();
+    const ownershipFilter = connectionId
+      ? { facebookConnectionId: connectionId }
+      : {};
+
+    let job: PublishingJobDocument | null;
+    if (normalizedInstanceId && connectionId) {
+      const leaseExpiresAt = new Date(
+        now.getTime() + JobsController.JOB_CLAIM_LEASE_MS,
+      );
+      job = (await this.jobModel
+        .findOneAndUpdate(
+          {
+            ...ownershipFilter,
+            postId: { $in: postIds },
+            $and: [
+              {
+                $or: [
+                  { scheduledFor: { $exists: false } },
+                  { scheduledFor: null },
+                  { scheduledFor: { $lte: now } },
+                ],
+              },
+            ],
+            $or: [
+              { status: 'PENDING' },
+              { status: 'RUNNING', claimExpiresAt: { $lte: now } },
+              { status: 'RUNNING', claimExpiresAt: { $exists: false } },
+            ],
+          } as any,
+          {
+            $set: {
+              status: 'RUNNING',
+              claimedByExtensionInstanceId: normalizedInstanceId,
+              claimExpiresAt: leaseExpiresAt,
+              startedAt: now,
+            },
+          },
+          {
+            new: true,
+            sort: { scheduledFor: 1, flowOrder: 1, createdAt: 1 },
+          },
+        )
+        .populate('postId', 'content mediaUrls')
+        .populate('groupId', 'name url externalId')
+        .exec()) as PublishingJobDocument | null;
+    } else {
+      job = await this.jobModel
+        .findOne({
+          ...ownershipFilter,
+          status: 'PENDING',
+          $or: [
+            { scheduledFor: { $exists: false } },
+            { scheduledFor: null },
+            { scheduledFor: { $lte: now } },
+          ],
+        })
+        .where('postId')
+        .in(postIds)
+        .sort({ scheduledFor: 1, flowOrder: 1, createdAt: 1 })
+        .populate('postId', 'content mediaUrls')
+        .populate('groupId', 'name url externalId')
+        .exec();
+    }
 
     if (!job) return null;
-
-    // Optional: mark it as RUNNING right away or let the extension do it?
-    // Let's let the extension do it when it actually starts.
 
     return job;
   }
@@ -165,10 +272,16 @@ export class JobsController {
   @Get('pending')
   async getPendingPosts(
     @Headers('x-clerk-user-id') clerkUserId: string,
+    @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Query('limit') limit?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
+    const connection = await this.getVerifiedWorkerConnection(
+      clerkUserId,
+      extensionInstanceId,
+    );
+    if (extensionInstanceId?.trim() && !connection) return [];
 
     const parsedLimit = limit ? Number(limit) : 10;
     const batchLimit = Number.isFinite(parsedLimit)
@@ -188,6 +301,7 @@ export class JobsController {
     const pendingFilter = {
       status: 'SUCCESS',
       submissionStatus: FacebookSubmissionStatus.PENDING_APPROVAL,
+      ...(connection ? { facebookConnectionId: connection._id } : {}),
       $or: [
         { nextCheckAt: { $exists: false } },
         { nextCheckAt: null },
@@ -237,11 +351,17 @@ export class JobsController {
   @Get('engagement-pending')
   async getEngagementPendingPosts(
     @Headers('x-clerk-user-id') clerkUserId: string,
+    @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Query('limit') limit?: string,
     @Query('postId') postId?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
+    const connection = await this.getVerifiedWorkerConnection(
+      clerkUserId,
+      extensionInstanceId,
+    );
+    if (extensionInstanceId?.trim() && !connection) return [];
     const parsedLimit = limit ? Number(limit) : 10;
     const batchLimit = Number.isFinite(parsedLimit)
       ? Math.min(50, Math.max(1, Math.floor(parsedLimit)))
@@ -263,6 +383,7 @@ export class JobsController {
     const engagementQuery = this.jobModel.find({
       ...getEngagementQueueFilter(now),
       submissionStatus: FacebookSubmissionStatus.PUBLISHED,
+      ...(connection ? { facebookConnectionId: connection._id } : {}),
     });
     const jobsQuery = requestedPostId
       ? engagementQuery.where('postId').equals(requestedPostId)
@@ -297,6 +418,7 @@ export class JobsController {
   @HttpCode(HttpStatus.OK)
   async updateEngagement(
     @Headers('x-clerk-user-id') clerkUserId: string,
+    @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Param('id') id: string,
     @Body() body: PostEngagementSyncResult,
   ) {
@@ -311,6 +433,7 @@ export class JobsController {
     const post = job.postId as unknown as PostDocument;
     if (post.clerkUserId !== clerkUserId)
       throw new UnauthorizedException('Not your job');
+    await this.assertWorkerOwnsJob(clerkUserId, extensionInstanceId, job);
     if (
       job.submissionStatus !== FacebookSubmissionStatus.PUBLISHED ||
       !job.postUrl
@@ -368,6 +491,7 @@ export class JobsController {
   @HttpCode(HttpStatus.OK)
   async updatePendingSync(
     @Headers('x-clerk-user-id') clerkUserId: string,
+    @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Param('id') id: string,
     @Body()
     body: {
@@ -389,6 +513,7 @@ export class JobsController {
     if (post.clerkUserId !== clerkUserId) {
       throw new UnauthorizedException('Not your job');
     }
+    await this.assertWorkerOwnsJob(clerkUserId, extensionInstanceId, job);
     const normalizedBodyPostUrl = normalizeFacebookGroupPostUrl(body.postUrl);
     if (job.postUrl) {
       const normalizedExistingPostUrl = normalizeFacebookGroupPostUrl(
@@ -514,6 +639,7 @@ export class JobsController {
   @HttpCode(HttpStatus.OK)
   async updateJobStatus(
     @Headers('x-clerk-user-id') clerkUserId: string,
+    @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Param('id') id: string,
     @Body()
     body: {
@@ -555,6 +681,30 @@ export class JobsController {
       throw new UnauthorizedException('Not your job');
     }
 
+    const normalizedInstanceId = extensionInstanceId?.trim();
+    let workerConnectionId: unknown;
+    if (normalizedInstanceId) {
+      const connection = await this.connectionModel
+        .findOne({ clerkUserId, extensionInstanceId: normalizedInstanceId })
+        .lean()
+        .exec();
+      const verified = Boolean(
+        connection?.status === FacebookConnectionStatus.CONNECTED &&
+        connection.facebookSessionDetected &&
+        connection.facebookUserId &&
+        connection.detectedFacebookUserId &&
+        connection.facebookUserId === connection.detectedFacebookUserId,
+      );
+      if (
+        !connection ||
+        !verified ||
+        String(job.facebookConnectionId) !== String(connection._id)
+      ) {
+        throw new UnauthorizedException('Job is assigned to another Facebook connection');
+      }
+      workerConnectionId = connection._id;
+    }
+
     const previousStatus = job.status;
     if (
       body.submissionResult &&
@@ -567,14 +717,69 @@ export class JobsController {
     }
     job.status = body.status;
     job.error = body.status === 'FAILED' ? body.error : undefined;
+    if (normalizedInstanceId && body.status === 'RUNNING') {
+      job.claimedByExtensionInstanceId = normalizedInstanceId;
+      job.claimExpiresAt = new Date(Date.now() + JobsController.JOB_CLAIM_LEASE_MS);
+    } else if (
+      normalizedInstanceId &&
+      (body.status === 'SUCCESS' || body.status === 'FAILED')
+    ) {
+      job.claimedByExtensionInstanceId = undefined;
+      job.claimExpiresAt = undefined;
+    }
+    if (workerConnectionId && body.status === 'RUNNING') {
+      await this.connectionModel.updateOne(
+        { _id: workerConnectionId },
+        {
+          $set: {
+            workerStatus: FacebookConnectionWorkerStatus.PUBLISHING,
+            lastSeenAt: new Date(),
+          },
+        },
+      );
+    } else if (
+      workerConnectionId &&
+      (body.status === 'SUCCESS' || body.status === 'FAILED')
+    ) {
+      await this.connectionModel.updateOne(
+        { _id: workerConnectionId },
+        {
+          $set: {
+            workerStatus: FacebookConnectionWorkerStatus.IDLE,
+            lastSeenAt: new Date(),
+          },
+        },
+      );
+    }
     if (body.submissionResult) {
       const normalizedSubmissionPostUrl = normalizeFacebookGroupPostUrl(
         body.submissionResult.postUrl,
       );
-      job.submissionStatus = body.submissionResult.status;
+      let duplicatePermalink = false;
+      if (
+        normalizedSubmissionPostUrl &&
+        (body.submissionResult.status === FacebookSubmissionStatus.PUBLISHED ||
+          body.submissionResult.status === FacebookSubmissionStatus.PENDING_APPROVAL)
+      ) {
+        const existingJobWithPermalink = await this.jobModel
+          .findOne({
+            _id: { $ne: job._id },
+            groupId: job.groupId,
+            postUrl: normalizedSubmissionPostUrl,
+          })
+          .select('_id')
+          .lean()
+          .exec();
+        duplicatePermalink = Boolean(existingJobWithPermalink);
+      }
+
+      job.submissionStatus = duplicatePermalink
+        ? FacebookSubmissionStatus.UNKNOWN
+        : body.submissionResult.status;
       // A later retry may report the status without repeating the permalink.
       // Never erase a URL that was already captured successfully.
       if (
+        !duplicatePermalink &&
         (body.submissionResult.status === FacebookSubmissionStatus.PUBLISHED ||
           body.submissionResult.status ===
             FacebookSubmissionStatus.PENDING_APPROVAL) &&
@@ -586,11 +791,14 @@ export class JobsController {
         job.postUrl = undefined;
       }
       job.submissionReason =
-        body.submissionResult.status === FacebookSubmissionStatus.UNKNOWN
+        duplicatePermalink
+          ? 'Facebook returned a permalink already assigned to another job in this group'
+          : body.submissionResult.status === FacebookSubmissionStatus.UNKNOWN
           ? body.submissionResult.reason
           : undefined;
 
       if (
+        !duplicatePermalink &&
         body.submissionResult.status ===
           FacebookSubmissionStatus.PENDING_APPROVAL &&
         !job.submittedAt
@@ -602,7 +810,10 @@ export class JobsController {
         job.lastSyncError = undefined;
       }
 
-      if (body.submissionResult.status === FacebookSubmissionStatus.PUBLISHED) {
+      if (
+        !duplicatePermalink &&
+        body.submissionResult.status === FacebookSubmissionStatus.PUBLISHED
+      ) {
         job.publishedDetectedAt ??= new Date();
       }
     }

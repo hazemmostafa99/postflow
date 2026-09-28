@@ -1,6 +1,15 @@
 const groupsContainer = document.getElementById("groups")!;
 const statusElement = document.getElementById("status")!;
 const refreshButton = document.getElementById("refresh")!;
+const extensionNameInput = document.getElementById("extension-name") as HTMLInputElement;
+const profileNameElement = document.getElementById("profile-name")!;
+const editNameButton = document.getElementById("edit-name")!;
+const cancelNameButton = document.getElementById("cancel-name")!;
+const nameEditor = document.getElementById("name-editor")!;
+const saveNameButton = document.getElementById("save-name")!;
+const nameStatus = document.getElementById("name-status")!;
+
+let currentExtensionName = "";
 
 function setIndicator(dotId: string, textId: string, text: string, state: string) {
   const dot = document.getElementById(dotId);
@@ -26,6 +35,22 @@ async function loadConnectionStatus() {
     setIndicator("sync-dot", "sync-status", "Syncing...", "not-synced");
   } else {
     setIndicator("sync-dot", "sync-status", "Not synced", "not-synced");
+  }
+}
+
+async function loadExtensionName() {
+  const result = await chrome.storage.local.get("extensionName");
+  currentExtensionName = typeof result.extensionName === "string" ? result.extensionName.trim() : "";
+  extensionNameInput.value = currentExtensionName;
+  profileNameElement.textContent = currentExtensionName || "Unnamed profile";
+}
+
+function setNameEditorOpen(open: boolean) {
+  nameEditor.toggleAttribute("hidden", !open);
+  editNameButton.toggleAttribute("hidden", open);
+  if (open) {
+    extensionNameInput.focus();
+    extensionNameInput.select();
   }
 }
 
@@ -113,6 +138,39 @@ refreshButton.addEventListener("click", () => {
   }, 2000);
 });
 
+editNameButton.addEventListener("click", () => {
+  nameStatus.textContent = "";
+  setNameEditorOpen(true);
+});
+
+cancelNameButton.addEventListener("click", () => {
+  extensionNameInput.value = currentExtensionName;
+  nameStatus.textContent = "";
+  setNameEditorOpen(false);
+});
+
+saveNameButton.addEventListener("click", async () => {
+  const extensionName = extensionNameInput.value.trim();
+  saveNameButton.setAttribute("disabled", "true");
+  nameStatus.textContent = "Saving...";
+  try {
+    const result = await chrome.runtime.sendMessage({ type: "SAVE_EXTENSION_NAME", extensionName });
+    if (result?.ok) {
+      currentExtensionName = extensionName;
+      profileNameElement.textContent = extensionName || "Unnamed profile";
+      nameStatus.textContent = extensionName ? "Saved" : "Name cleared";
+      setNameEditorOpen(false);
+    } else {
+      nameStatus.textContent = result?.error ?? "Could not save";
+    }
+  } catch {
+    nameStatus.textContent = "Could not save";
+  } finally {
+    saveNameButton.removeAttribute("disabled");
+  }
+});
+
 checkFacebook();
 loadGroups();
 loadConnectionStatus();
+loadExtensionName();

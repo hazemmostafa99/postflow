@@ -16,6 +16,26 @@
       <span class="page-status" id="status">Checking...</span>
     </header>
 
+    <section class="identity-panel" aria-label="Extension profile name">
+      <div class="identity-summary">
+        <div class="identity-avatar" aria-hidden="true">PF</div>
+        <div class="identity-copy">
+          <p class="eyebrow">Worker profile</p>
+          <h2 id="profile-name">Unnamed profile</h2>
+        </div>
+        <button class="edit-name-button" id="edit-name" type="button">Rename</button>
+      </div>
+      <div class="name-editor" id="name-editor" hidden>
+        <label for="extension-name">Profile name</label>
+        <div class="name-row">
+          <input id="extension-name" maxlength="60" placeholder="e.g. Client A" />
+          <button class="save-name-button" id="save-name" type="button">Save</button>
+          <button class="cancel-name-button" id="cancel-name" type="button">Cancel</button>
+        </div>
+      </div>
+      <p class="name-status" id="name-status" aria-live="polite"></p>
+    </section>
+
     <section class="status-grid" aria-label="Sync status">
       <article class="status-card">
         <span class="status-dot" id="web-app-dot"></span>

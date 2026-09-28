@@ -93,6 +93,7 @@ interface PublishTrackingSession {
   jobId: string;
   groupId?: string;
   submittedAt: number;
+  acceptCandidatesAfter: number;
   hasVideo: boolean;
   existingPostUrls: ReadonlySet<string>;
   candidates: PublishTrackingCandidate[];
@@ -112,6 +113,7 @@ function createPublishTrackingSession(options: {
 }): PublishTrackingSession {
   const session: PublishTrackingSession = {
     ...options,
+    acceptCandidatesAfter: 0,
     candidates: [],
     candidateKeys: new Set(),
     mediaVideoIds: new Set(),
@@ -171,19 +173,27 @@ function trackFacebookResponseCandidates(detail: FacebookResponseCandidateDetail
   if (!session.hasVideo) {
     for (const postUrl of postUrls) addPublishCandidate(session, 'response-post-url', postUrl, detail.requestUrl);
   } else if (postUrls.length) {
-    const pendingPostUrls = postUrls.filter((postUrl) => {
+    const currentPageGroupId = extractFacebookGroupIdFromUrl(location.href)?.toLowerCase();
+    const sameGroupPostUrls = postUrls.filter((postUrl) => {
       try {
-        return /^\/groups\/[^/]+\/pending_posts\/[A-Za-z0-9_-]+/i.test(new URL(postUrl, window.location.origin).pathname);
+        const parsedUrl = new URL(postUrl, window.location.origin);
+        const path = parsedUrl.pathname;
+        if (!/^\/groups\/[^/]+\/(?:posts|permalink|pending_posts)\/[A-Za-z0-9_-]+/i.test(path)) return false;
+        const candidateGroupId = extractFacebookGroupIdFromUrl(postUrl)?.toLowerCase();
+        return Boolean(
+          candidateGroupId &&
+          (candidateGroupId === session.groupId?.toLowerCase() || candidateGroupId === currentPageGroupId),
+        );
       } catch {
         return false;
       }
     });
-    for (const postUrl of pendingPostUrls) addPublishCandidate(session, 'response-post-url', postUrl, detail.requestUrl);
+    for (const postUrl of sameGroupPostUrls) addPublishCandidate(session, 'response-post-url', postUrl, detail.requestUrl);
     console.log('[PostTracking] Ignoring direct network post URLs during video publish', {
       jobId: session.jobId,
-      postUrlCount: postUrls.length - pendingPostUrls.length,
-      pendingPostUrlCount: pendingPostUrls.length,
-      reason: 'video responses can include unrelated feed stories',
+      ignoredPostUrlCount: postUrls.length - sameGroupPostUrls.length,
+      acceptedSameGroupPostUrlCount: sameGroupPostUrls.length,
+      reason: 'video responses can include unrelated feed stories; same-group links are retained',
       requestUrl: detail.requestUrl,
     });
   }
@@ -206,6 +216,7 @@ function trackFacebookResponseCandidates(detail: FacebookResponseCandidateDetail
 function getBestNetworkPostUrl(session: PublishTrackingSession): string | null {
   for (let index = session.candidates.length - 1; index >= 0; index--) {
     const candidate = session.candidates[index];
+    if (candidate.observedAt < session.acceptCandidatesAfter) continue;
     const candidateUrl = candidate.source === 'response-story-fbid' && session.groupId
       ? 'https://www.facebook.com/groups/' + session.groupId + '/posts/' + candidate.value + '/'
       : candidate.value;
@@ -258,6 +269,7 @@ function getBestNetworkPostUrl(session: PublishTrackingSession): string | null {
 function getBestNetworkPendingPostUrl(session: PublishTrackingSession): string | null {
   for (let index = session.candidates.length - 1; index >= 0; index--) {
     const candidate = session.candidates[index];
+    if (candidate.observedAt < session.acceptCandidatesAfter) continue;
     if (candidate.source !== 'response-post-url') continue;
     const normalizedCandidate = normalizeTrackedPostUrl(candidate.value);
     if (!normalizedCandidate || !/\/pending_posts\//i.test(normalizedCandidate)) continue;
@@ -1283,6 +1295,7 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
       activePublishTrackingSession = trackingSession;
 
       (postButton as HTMLElement).click();
+      trackingSession.acceptCandidatesAfter = Date.now();
       console.log('[PostFlow] Post button clicked, waiting for publish confirmation...');
       recordPostingStep(jobId, 'post_button_clicked');
 

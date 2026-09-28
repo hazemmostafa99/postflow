@@ -25,6 +25,10 @@ import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
 import { TeamsModule } from './teams/teams.module';
 import { InvitationsModule } from './invitations/invitations.module';
+import {
+  FacebookConnection,
+  FacebookConnectionSchema,
+} from './schemas/facebook-connection.schema';
 
 const envFilePath = [
   resolve(process.cwd(), '.env'),
@@ -48,6 +52,7 @@ const envFilePath = [
     MongooseModule.forFeature([
       { name: User.name, schema: UserSchema },
       { name: ExtensionInstallation.name, schema: ExtensionInstallationSchema },
+      { name: FacebookConnection.name, schema: FacebookConnectionSchema },
       { name: Group.name, schema: GroupSchema },
       { name: Post.name, schema: PostSchema },
       { name: PublishingJob.name, schema: PublishingJobSchema },

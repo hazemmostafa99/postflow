@@ -2,13 +2,24 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { CheckSquare, ImagePlus, Loader2, Search, Send, Square, Trash2, X } from "lucide-react";
+import { CheckSquare, ChevronDown, ImagePlus, Loader2, Search, Send, Square, Trash2, UserRound, Users, X } from "lucide-react";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 interface Group {
   _id: string;
   name: string;
   externalId: string;
   status: string;
+  facebookConnectionId?: string;
+}
+
+interface FacebookConnection {
+  _id: string;
+  displayName?: string;
+  facebookUserId?: string;
+  status: string;
+  workerStatus: string;
 }
 
 interface CreatePostFormProps {
@@ -58,6 +69,9 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
   const [groupPage, setGroupPage] = useState(1);
   const [groupTotal, setGroupTotal] = useState(groups.length);
   const [groupTotalPages, setGroupTotalPages] = useState(Math.max(1, Math.ceil(groups.length / GROUPS_PER_PAGE)));
+  const [connections, setConnections] = useState<FacebookConnection[]>([]);
+  const [selectedConnectionId, setSelectedConnectionId] = useState("");
+  const [isGroupMenuOpen, setIsGroupMenuOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const selectedGroups = useMemo(
@@ -73,6 +87,7 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
         limit: String(GROUPS_PER_PAGE),
       });
       if (search.trim()) params.set("search", search.trim());
+      if (selectedConnectionId) params.set("connectionId", selectedConnectionId);
 
       const res = await fetch(`/api/groups?${params.toString()}`);
       if (!res.ok) throw new Error("Failed to load groups");
@@ -87,7 +102,29 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
     } finally {
       setIsLoadingGroups(false);
     }
-  }, []);
+  }, [selectedConnectionId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetch("/api/extensions/connections")
+      .then(async (res) => {
+        if (!res.ok) return [] as FacebookConnection[];
+        return (await res.json()) as FacebookConnection[];
+      })
+      .then((data) => {
+        if (cancelled) return;
+        setConnections(data);
+        const connected = data.filter((connection) => connection.status === "CONNECTED");
+        if (!selectedConnectionId && connected.length === 1) {
+          setSelectedConnectionId(connected[0]._id);
+        }
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedConnectionId]);
 
   useEffect(() => {
     const handle = window.setTimeout(() => {
@@ -96,6 +133,30 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
 
     return () => window.clearTimeout(handle);
   }, [fetchGroupsPage, groupPage, searchQuery]);
+
+  const connectionLabel = useCallback((connectionId?: string) => {
+    if (!connectionId) return "Unassigned group";
+    const connection = connections.find((item) => item._id === connectionId);
+    if (!connection) return "Facebook account";
+    if (connection.displayName) return connection.displayName;
+    return connection.facebookUserId
+      ? `Facebook ending ${connection.facebookUserId.slice(-4)}`
+      : "Unnamed profile";
+  }, [connections]);
+
+  const connectionName = useCallback((connection: FacebookConnection) => {
+    if (connection.displayName) return connection.displayName;
+    return connection.facebookUserId
+      ? `Facebook ending ${connection.facebookUserId.slice(-4)}`
+      : "Unnamed profile";
+  }, []);
+
+  const connectionStatus = useCallback((connection: FacebookConnection) => {
+    if (connection.status === "CONNECTED") {
+      return connection.workerStatus === "PUBLISHING" ? "Publishing" : "Ready";
+    }
+    return connection.status.replaceAll("_", " ").toLowerCase().replace(/\b\w/g, (letter) => letter.toUpperCase());
+  }, []);
 
   const toggleGroup = useCallback((group: Group) => {
     setSelectedGroupsById((prev) => {
@@ -237,6 +298,7 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
     !isOverLimit &&
     (content.trim().length > 0 || mediaUrls.length > 0) &&
     selectedGroupsById.size > 0;
+  const selectedConnection = connections.find((connection) => connection._id === selectedConnectionId);
 
   return (
     <form onSubmit={handleSubmit} className="space-y-5">
@@ -357,37 +419,196 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
         )}
       </div>
 
-      <div className="space-y-2">
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <label className="text-sm font-medium text-foreground">
-            Target Groups
-            <span className="ml-2 font-normal text-muted-foreground">
-              ({selectedGroupsById.size} selected)
-            </span>
-          </label>
-          <div className="flex items-center gap-2">
-            <button type="button" onClick={selectAll} className="text-xs font-medium text-primary hover:underline">
-              Select all
-            </button>
-            <span className="text-muted-foreground">/</span>
-            <button type="button" onClick={clearAll} className="text-xs font-medium text-muted-foreground hover:text-foreground hover:underline">
-              Clear
-            </button>
+      {connections.length > 0 && (
+        <div className="space-y-3 rounded-lg border border-border bg-muted/20 p-3">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="text-sm font-medium text-foreground">Publish from</p>
+              <p className="text-xs text-muted-foreground">Choose the profile that owns these groups.</p>
+            </div>
           </div>
-        </div>
-
-        <div className="relative">
-          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <input
-            type="text"
-            placeholder="Search groups..."
-            value={searchQuery}
-            onChange={(e) => {
-              setSearchQuery(e.target.value);
+          <Select
+            value={selectedConnectionId || "all"}
+            onValueChange={(value) => {
+              const connectionId = value === "all" ? "" : String(value ?? "");
+              setSelectedConnectionId(connectionId);
+              setSelectedGroupsById(new Map());
               setGroupPage(1);
             }}
-            className="w-full rounded-lg border border-border bg-background py-2 pl-9 pr-3 text-sm shadow-sm placeholder:text-muted-foreground focus:outline-none focus:ring-3 focus:ring-ring/20"
-          />
+          >
+            <SelectTrigger aria-label="Choose Facebook profile">
+              <SelectValue>
+                {() => (
+                  <span className="flex min-w-0 items-center gap-3 text-left">
+                    <span className={`grid h-8 w-8 shrink-0 place-items-center rounded-md ${selectedConnection ? "bg-emerald-50 text-emerald-700" : "bg-muted text-muted-foreground"}`}>
+                      {selectedConnection ? <UserRound className="h-4 w-4" /> : <Users className="h-4 w-4" />}
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block truncate text-sm font-medium text-foreground">
+                        {selectedConnection ? connectionName(selectedConnection) : "All profiles"}
+                      </span>
+                      <span className="block truncate text-xs text-muted-foreground">
+                        {selectedConnection ? connectionStatus(selectedConnection) : `Show groups from ${connections.length} profiles`}
+                      </span>
+                    </span>
+                  </span>
+                )}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent align="start" className="w-(--anchor-width)">
+              <SelectItem value="all">
+                <span className="block min-w-0">
+                  <span className="block truncate text-sm font-medium">All profiles</span>
+                  <span className="block truncate text-xs text-muted-foreground">Show groups from every account</span>
+                </span>
+              </SelectItem>
+              {connections.map((connection) => (
+                <SelectItem key={connection._id} value={connection._id}>
+                  <span className="block min-w-0">
+                    <span className="block truncate text-sm font-medium">{connectionName(connection)}</span>
+                    <span className="block truncate text-xs text-muted-foreground">{connectionStatus(connection)}</span>
+                  </span>
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+
+      <div className="space-y-3">
+        <div className="rounded-lg border border-border bg-muted/20 p-3">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-sm font-medium text-foreground">Target groups</p>
+              <p className="mt-0.5 text-xs text-muted-foreground">Choose where this post should be published.</p>
+            </div>
+            <span className="shrink-0 rounded-full border border-border bg-background px-2 py-1 text-xs font-medium text-muted-foreground">
+              {selectedGroupsById.size} selected
+            </span>
+          </div>
+          <Popover open={isGroupMenuOpen} onOpenChange={setIsGroupMenuOpen}>
+            <PopoverTrigger
+              type="button"
+              aria-label={selectedGroupsById.size > 0 ? `${selectedGroupsById.size} target groups selected` : "Choose target groups"}
+              className="flex w-full items-center gap-3 rounded-lg border border-border bg-background px-3 py-2.5 text-left shadow-sm transition-colors hover:border-primary/50 focus:outline-none focus:ring-3 focus:ring-ring/20"
+            >
+              <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-primary/10 text-primary">
+                <Users className="h-4 w-4" />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm font-medium text-foreground">
+                  {selectedGroupsById.size > 0 ? `${selectedGroupsById.size} groups selected` : "Choose target groups"}
+                </span>
+                <span className="block truncate text-xs text-muted-foreground">
+                  {isLoadingGroups ? "Loading groups..." : `${groupTotal.toLocaleString()} groups available`}
+                </span>
+              </span>
+              <ChevronDown className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${isGroupMenuOpen ? "rotate-180" : ""}`} />
+            </PopoverTrigger>
+
+            <PopoverContent align="start" className="w-(--anchor-width) p-0">
+                <div className="border-b border-border p-2">
+                  <div className="flex items-center justify-between gap-3 px-1 pb-2">
+                    <span className="text-xs font-medium text-muted-foreground">Select target groups</span>
+                    <div className="flex items-center gap-2">
+                      <button type="button" onClick={selectAll} className="text-xs font-medium text-primary hover:underline">
+                        Select visible
+                      </button>
+                      <button type="button" onClick={clearAll} className="text-xs font-medium text-muted-foreground hover:text-foreground hover:underline">
+                        Clear
+                      </button>
+                    </div>
+                  </div>
+                  <div className="relative">
+                    <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                    <input
+                      type="text"
+                      placeholder="Search groups..."
+                      value={searchQuery}
+                      onChange={(event) => {
+                        setSearchQuery(event.target.value);
+                        setGroupPage(1);
+                      }}
+                      aria-label="Search target groups"
+                      autoFocus
+                      className="w-full rounded-lg border border-border bg-background py-2 pl-9 pr-3 text-sm shadow-sm placeholder:text-muted-foreground focus:outline-none focus:ring-3 focus:ring-ring/20"
+                    />
+                  </div>
+                </div>
+
+                <div
+                  role="listbox"
+                  aria-label="Target groups"
+                  aria-multiselectable="true"
+                  className="max-h-64 space-y-1 overflow-y-auto p-2"
+                >
+                  {availableGroups.length === 0 ? (
+                    <div className="px-3 py-8 text-center">
+                      <p className="text-sm text-muted-foreground">
+                        {searchQuery ? "No groups match your search." : "No groups synced yet."}
+                      </p>
+                      <p className="mt-1 text-xs text-muted-foreground/70">
+                        {searchQuery ? "Try a different group name." : "Open the extension on Facebook to collect groups."}
+                      </p>
+                    </div>
+                  ) : (
+                    availableGroups.map((group) => {
+                      const isSelected = selectedGroupsById.has(group._id);
+                      return (
+                        <button
+                          key={group._id}
+                          type="button"
+                          role="option"
+                          aria-selected={isSelected}
+                          onClick={() => toggleGroup(group)}
+                          className={`flex w-full items-center gap-2 rounded-md border px-2.5 py-2 text-left transition-colors ${
+                            isSelected
+                              ? "border-primary/30 bg-primary/10 text-foreground"
+                              : "border-transparent text-muted-foreground hover:border-border hover:bg-accent hover:text-foreground"
+                          }`}
+                        >
+                          {isSelected ? (
+                            <CheckSquare className="h-3.5 w-3.5 shrink-0 text-primary" />
+                          ) : (
+                            <Square className="h-3.5 w-3.5 shrink-0" />
+                          )}
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate text-xs font-medium">{group.name}</span>
+                            <span className="block truncate text-[10px] text-muted-foreground">
+                              {connectionLabel(group.facebookConnectionId)}
+                            </span>
+                          </span>
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+
+                <div className="flex items-center justify-between gap-2 border-t border-border px-3 py-2 text-xs text-muted-foreground">
+                  <span>
+                    {isLoadingGroups ? "Loading..." : `${groupTotal.toLocaleString()} groups - page ${groupPage} of ${groupTotalPages}`}
+                  </span>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setGroupPage((page) => Math.max(1, page - 1))}
+                      disabled={groupPage <= 1 || isLoadingGroups}
+                      className="rounded-md border border-border bg-background px-2 py-1 hover:bg-accent disabled:opacity-40"
+                    >
+                      Prev
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setGroupPage((page) => Math.min(groupTotalPages, page + 1))}
+                      disabled={groupPage >= groupTotalPages || isLoadingGroups}
+                      className="rounded-md border border-border bg-background px-2 py-1 hover:bg-accent disabled:opacity-40"
+                    >
+                      Next
+                    </button>
+                  </div>
+                </div>
+            </PopoverContent>
+          </Popover>
         </div>
 
         {selectedGroups.length > 0 && (
@@ -419,68 +640,6 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
           </div>
         )}
 
-        {availableGroups.length === 0 ? (
-          <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-border bg-muted/20 py-8 text-center">
-            <p className="text-sm text-muted-foreground">
-              {searchQuery ? "No groups match your search." : "No groups synced yet."}
-            </p>
-            <p className="mt-1 text-xs text-muted-foreground/70">
-              {searchQuery ? "Try a different group name." : "Open the extension on Facebook to collect groups."}
-            </p>
-          </div>
-        ) : (
-          <div className="space-y-2">
-            <div className="grid max-h-52 grid-cols-1 gap-1.5 overflow-y-auto pr-1 sm:grid-cols-2">
-              {availableGroups.map((group) => {
-                const isSelected = selectedGroupsById.has(group._id);
-                return (
-                  <button
-                    key={group._id}
-                    type="button"
-                    onClick={() => toggleGroup(group)}
-                    className={`flex items-center gap-2 rounded-lg border px-2.5 py-2 text-left transition-all ${
-                      isSelected
-                        ? "border-primary bg-primary/10 text-foreground"
-                        : "border-border text-muted-foreground hover:border-muted-foreground/50 hover:bg-accent hover:text-foreground"
-                    }`}
-                  >
-                    {isSelected ? (
-                      <CheckSquare className="h-3.5 w-3.5 shrink-0 text-primary" />
-                    ) : (
-                      <Square className="h-3.5 w-3.5 shrink-0" />
-                    )}
-                    <span className="truncate text-xs font-medium">{group.name}</span>
-                  </button>
-                );
-              })}
-            </div>
-            <div className="flex flex-col gap-2 text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
-              <span>
-                {isLoadingGroups
-                  ? "Loading groups..."
-                  : `${groupTotal.toLocaleString()} groups - page ${groupPage} of ${groupTotalPages}`}
-              </span>
-              <div className="flex items-center gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => setGroupPage((page) => Math.max(1, page - 1))}
-                  disabled={groupPage <= 1 || isLoadingGroups}
-                  className="rounded-md border border-border bg-background px-2 py-1 hover:bg-accent disabled:opacity-40"
-                >
-                  Prev
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setGroupPage((page) => Math.min(groupTotalPages, page + 1))}
-                  disabled={groupPage >= groupTotalPages || isLoadingGroups}
-                  className="rounded-md border border-border bg-background px-2 py-1 hover:bg-accent disabled:opacity-40"
-                >
-                  Next
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
       </div>
 
       {error && (

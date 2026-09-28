@@ -28,11 +28,16 @@ export class GroupsController {
   @HttpCode(HttpStatus.OK)
   async sync(
     @Headers('x-clerk-user-id') clerkUserId: string,
+    @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Body() body: SyncGroupsDto,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
-    return this.groupsService.syncGroups(clerkUserId, body.groups ?? []);
+    return this.groupsService.syncGroups(
+      clerkUserId,
+      body.groups ?? [],
+      extensionInstanceId,
+    );
   }
 
   /**
@@ -45,6 +50,7 @@ export class GroupsController {
     @Query('search') search?: string,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
+    @Query('connectionId') connectionId?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
@@ -53,12 +59,17 @@ export class GroupsController {
         search,
         page: page ? Number(page) : undefined,
         limit: limit ? Number(limit) : undefined,
+        connectionId,
       });
     }
     if (search?.trim()) {
-      return this.groupsService.searchGroups(clerkUserId, search.trim());
+      return this.groupsService.searchGroups(
+        clerkUserId,
+        search.trim(),
+        connectionId,
+      );
     }
-    return this.groupsService.getGroups(clerkUserId);
+    return this.groupsService.getGroups(clerkUserId, connectionId);
   }
 
   /** DELETE /api/groups - delete all synced groups and their jobs */

@@ -1,5 +1,5 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-import { Document, Schema as MongooseSchema } from 'mongoose';
+import { Document, Schema as MongooseSchema, Types } from 'mongoose';
 import { Post } from './post.schema';
 import { Group } from './group.schema';
 
@@ -19,8 +19,23 @@ export class PublishingJob {
   @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'Group', required: true })
   groupId: Group;
 
+  /** Facebook connection responsible for executing this job. */
+  @Prop({
+    type: MongooseSchema.Types.ObjectId,
+    ref: 'FacebookConnection',
+    index: true,
+  })
+  facebookConnectionId?: Types.ObjectId;
+
   @Prop({ required: true, default: 'PENDING' })
   status: string;
+
+  /** Worker lease used to recover jobs after an extension restart. */
+  @Prop()
+  claimedByExtensionInstanceId?: string;
+
+  @Prop()
+  claimExpiresAt?: Date;
 
   @Prop({ required: true, default: 0 })
   attempts: number;

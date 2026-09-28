@@ -147,6 +147,9 @@ export class PostsService {
     const jobs = orderedGroups.map(({ group }, flowOrder) => ({
       postId: post._id,
       groupId: group._id,
+      ...(group.facebookConnectionId
+        ? { facebookConnectionId: group.facebookConnectionId }
+        : {}),
       status: 'PENDING',
       attempts: 0,
       flowOrder,

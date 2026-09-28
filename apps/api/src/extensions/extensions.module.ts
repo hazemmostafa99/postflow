@@ -7,12 +7,17 @@ import {
   ExtensionInstallationSchema,
 } from '../schemas/extension-installation.schema';
 import { User, UserSchema } from '../schemas/user.schema';
+import {
+  FacebookConnection,
+  FacebookConnectionSchema,
+} from '../schemas/facebook-connection.schema';
 
 @Module({
   imports: [
     MongooseModule.forFeature([
       { name: ExtensionInstallation.name, schema: ExtensionInstallationSchema },
       { name: User.name, schema: UserSchema },
+      { name: FacebookConnection.name, schema: FacebookConnectionSchema },
     ]),
   ],
   providers: [ExtensionsService],
