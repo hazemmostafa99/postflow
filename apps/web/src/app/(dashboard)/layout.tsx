@@ -11,8 +11,12 @@ export default async function DashboardLayout({
 }: {
   children: React.ReactNode;
 }) {
-  const { userId } = await auth();
-  if (!userId) redirect("/sign-in");
+  const { userId, redirectToSignIn } = await auth();
+  if (!userId) {
+    redirectToSignIn({ returnBackUrl: "/" });
+    throw new Error("Expected Clerk redirectToSignIn to interrupt rendering.");
+  }
+  const clerkUserId = userId;
   // The session ID is the source of truth for authentication. A temporary
   // failure while loading the profile must not destroy an otherwise valid session.
   const user = await currentUser().catch((error) => {
@@ -23,7 +27,7 @@ export default async function DashboardLayout({
 
   const accessResponse = await fetch(`${API_BASE}/api/auth/me`, {
     headers: {
-      "x-clerk-user-id": userId,
+      "x-clerk-user-id": clerkUserId,
       ...(email ? { "x-clerk-user-email": email } : {}),
     },
     cache: "no-store",
@@ -46,10 +50,10 @@ export default async function DashboardLayout({
         </main>
       </div>
       {/* Hidden meta element for the PostFlow extension to read the user ID */}
-      {userId && (
+      {clerkUserId && (
         <span
           id="postflow-user-meta"
-          data-postflow-user-id={userId}
+          data-postflow-user-id={clerkUserId}
           style={{ display: 'none' }}
           aria-hidden="true"
         />

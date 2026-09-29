@@ -25,6 +25,7 @@ import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
 import { TeamsModule } from './teams/teams.module';
 import { InvitationsModule } from './invitations/invitations.module';
+import { AnalyticsModule } from './analytics/analytics.module';
 import {
   FacebookConnection,
   FacebookConnectionSchema,
@@ -66,6 +67,7 @@ const envFilePath = [
     UsersModule,
     TeamsModule,
     InvitationsModule,
+    AnalyticsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
