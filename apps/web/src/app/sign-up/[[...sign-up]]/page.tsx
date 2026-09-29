@@ -1,8 +1,13 @@
 import Link from "next/link";
 import { SignUp } from "@clerk/nextjs";
+import { auth } from "@clerk/nextjs/server";
 import { ArrowLeft, CheckCircle2, Send } from "lucide-react";
+import { redirect } from "next/navigation";
 
-export default function SignUpPage() {
+export default async function SignUpPage() {
+  const { userId } = await auth();
+  if (userId) redirect("/");
+
   return (
     <main className="min-h-screen bg-background text-foreground">
       <div className="grid min-h-screen lg:grid-cols-[1.05fr_0.95fr]">
