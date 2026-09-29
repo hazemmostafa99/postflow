@@ -13,14 +13,20 @@ import {
   FacebookConnection,
   FacebookConnectionSchema,
 } from '../schemas/facebook-connection.schema';
+import { Team, TeamSchema } from '../schemas/team.schema';
+import { User, UserSchema } from '../schemas/user.schema';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
   imports: [
+    AuthModule,
     MongooseModule.forFeature([
       { name: Post.name, schema: PostSchema },
       { name: PublishingJob.name, schema: PublishingJobSchema },
       { name: Group.name, schema: GroupSchema },
       { name: FacebookConnection.name, schema: FacebookConnectionSchema },
+      { name: Team.name, schema: TeamSchema },
+      { name: User.name, schema: UserSchema },
     ]),
   ],
   providers: [PostsService],

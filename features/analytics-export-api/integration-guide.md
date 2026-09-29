@@ -30,6 +30,24 @@ Get one post:
 GET https://api.fitcure.online/api/analytics/posts/{postId}
 ```
 
+Summary:
+
+```http
+GET https://api.fitcure.online/api/analytics/summary
+```
+
+Reference users:
+
+```http
+GET https://api.fitcure.online/api/analytics/users
+```
+
+Reference teams:
+
+```http
+GET https://api.fitcure.online/api/analytics/teams
+```
+
 ## Query Params
 
 | Param | Description |
@@ -39,6 +57,9 @@ GET https://api.fitcure.online/api/analytics/posts/{postId}
 | `from` | Optional ISO date. Filters `createdAt >= from`. |
 | `to` | Optional ISO date. Filters `createdAt <= to`. |
 | `status` | Optional top-level post status. |
+| `userId` | Optional PostFlow analytics user id. |
+| `teamId` | Optional PostFlow team id. |
+| `role` | Optional creator role. |
 
 Valid top-level post statuses:
 
@@ -52,6 +73,8 @@ PARTIAL_FAILURE
 ```
 
 Note: `PUBLISHED` is a target `submissionStatus`, not a top-level post status.
+Date-only `to` filters include the whole UTC day. For example, `to=2026-09-29`
+means through `2026-09-29T23:59:59.999Z`.
 
 ## Response Summary
 
@@ -65,13 +88,19 @@ Note: `PUBLISHED` is a target `submissionStatus`, not a top-level post status.
     createdAt?: string;
     updatedAt?: string;
     createdBy: {
-      clerkUserId: string;
-      userId?: string;
+      id: string;
+      firstName?: string;
+      lastName?: string;
+      fullName?: string;
       email?: string;
       role?: string;
       status?: string;
       teamId?: string | null;
-    };
+      team?: {
+        id: string;
+        name: string;
+      };
+    } | null;
     totals: {
       targetCount: number;
       publishedCount: number;

@@ -23,6 +23,12 @@ export class User {
   @Prop({ unique: true, sparse: true, lowercase: true, trim: true })
   email?: string;
 
+  @Prop({ trim: true })
+  firstName?: string;
+
+  @Prop({ trim: true })
+  lastName?: string;
+
   @Prop({ required: true, enum: UserRole, default: UserRole.SALES })
   role: UserRole;
 

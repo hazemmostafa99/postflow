@@ -137,12 +137,13 @@ Known limitations:
 
 - [x] Collect post `clerkUserId` values.
 - [x] Query matching users by `User.clerkUserId`.
-- [x] Add `createdBy.clerkUserId` to every post.
-- [x] Add `createdBy.userId` when a user exists.
+- [x] Add `createdBy.id` when a user exists.
 - [x] Add `createdBy.email` when available.
+- [x] Add `createdBy.firstName`, `createdBy.lastName`, and `createdBy.fullName` when available.
 - [x] Add `createdBy.role`.
 - [x] Add `createdBy.status`.
 - [x] Add `createdBy.teamId`.
+- [x] Add readable `createdBy.team` data when the user's team exists.
 - [x] Keep posts exportable when a matching user is missing.
 
 ## Review Notes
@@ -152,16 +153,20 @@ Status: COMPLETE
 
 Files changed:
 - `apps/api/src/analytics/analytics.service.ts`
+- `apps/api/src/analytics/analytics.module.ts`
 
 Implementation:
 - Enriches creator data from `User.clerkUserId`.
-- Falls back to `createdBy.clerkUserId` if no user record exists.
+- Includes creator first name, last name, and full name.
+- Joins creator `teamId` to `Team` and returns `createdBy.team` with id, name,
+  and manager id when available.
+- Returns `createdBy: null` if no user record exists.
 
 Tests/checks:
 - `npm run build` in `apps/api` passes.
 
 Known limitations:
-- User display names are not available in the current schema.
+- Missing/deleted team records leave `teamId` present and omit `team`.
 ```
 
 ---
@@ -318,6 +323,9 @@ Known limitations:
 - [ ] Test pagination metadata.
 - [ ] Test filters.
 - [ ] Test single post export.
+- [ ] Test summary totals.
+- [ ] Test summary by creator.
+- [ ] Test summary by team.
 
 ## Review Notes
 
@@ -329,6 +337,158 @@ Files changed:
 Tests/checks:
 
 Known limitations:
+```
+
+---
+
+# Phase 10 - Filters and Summary
+
+## Checklist
+
+- [x] Add creator filters to `GET /api/analytics/posts`.
+- [x] Support `userId` filter.
+- [x] Support `teamId` filter.
+- [x] Support `role` filter.
+- [x] Add `GET /api/analytics/summary`.
+- [x] Reuse the same filter logic for posts and summary.
+- [x] Return totals across posts, targets, submissions, and engagement.
+- [x] Return `byStatus`.
+- [x] Return `byCreator`.
+- [x] Return `byTeam`.
+
+## Review Notes
+
+```text
+Status: COMPLETE
+
+Files changed:
+- `apps/api/src/analytics/analytics.controller.ts`
+- `apps/api/src/analytics/analytics.service.ts`
+- `features/analytics-export-api/feature.md`
+- `features/analytics-export-api/progress.md`
+
+Implementation:
+- Added `userId`, `teamId`, and `role` creator filters to the
+  posts export endpoint.
+- Added `GET /api/analytics/summary` with totals, by-status counts, creator
+  rollups, and team rollups.
+- Summary and posts export use the same filter builder.
+
+Tests/checks:
+- `npm run build` in `apps/api` passes.
+
+Known limitations:
+- Dedicated analytics tests remain pending.
+- Summary currently computes from matching posts and jobs in application code;
+  this is simple and consistent, but large datasets may eventually need MongoDB
+  aggregation pipelines.
+```
+
+---
+
+# Phase 11 - Public Analytics User Identity
+
+## Checklist
+
+- [x] Stop exposing `createdBy.clerkUserId`.
+- [x] Stop exposing both `createdBy.userId` and `createdBy.clerkUserId`.
+- [x] Use `createdBy.id` as the only public analytics user id.
+- [x] Remove `clerkUserId` from analytics query filters.
+- [x] Keep internal Clerk joins private to the API implementation.
+- [x] Return `createdBy: null` when a matching PostFlow user is missing.
+
+## Review Notes
+
+```text
+Status: COMPLETE
+
+Files changed:
+- `apps/api/src/analytics/analytics.controller.ts`
+- `apps/api/src/analytics/analytics.service.ts`
+- `features/analytics-export-api/feature.md`
+- `features/analytics-export-api/progress.md`
+- `features/analytics-export-api/integration-guide.md`
+
+Implementation:
+- Analytics responses now expose one user identifier: `id`.
+- Analytics filters now expose one user filter: `userId`.
+- Clerk ids remain internal for joining legacy post ownership data to users.
+
+Tests/checks:
+- `npm run build` in `apps/api` passes.
+
+Known limitations:
+- Existing posts still store `Post.clerkUserId`; the API hides that detail.
+```
+
+---
+
+# Phase 12 - Date Filter Inclusivity
+
+## Checklist
+
+- [x] Treat date-only `from` as the start of the UTC day.
+- [x] Treat date-only `to` as the end of the UTC day.
+- [x] Preserve exact timestamp filtering for full ISO datetime values.
+- [x] Document date-only filter behavior.
+
+## Review Notes
+
+```text
+Status: COMPLETE
+
+Files changed:
+- `apps/api/src/analytics/analytics.service.ts`
+- `features/analytics-export-api/feature.md`
+- `features/analytics-export-api/integration-guide.md`
+- `features/analytics-export-api/progress.md`
+
+Implementation:
+- `to=YYYY-MM-DD` now includes posts through `23:59:59.999Z` on that date.
+- `from=YYYY-MM-DD` remains the beginning of the date.
+
+Tests/checks:
+- `npm run build` in `apps/api` passes.
+
+Known limitations:
+- Date-only behavior is UTC-based.
+```
+
+---
+
+# Phase 13 - Reference Users and Teams
+
+## Checklist
+
+- [x] Add `GET /api/analytics/users`.
+- [x] Add `GET /api/analytics/teams`.
+- [x] Use only PostFlow public ids.
+- [x] Do not expose Clerk IDs.
+- [x] Return minimal user fields for filtering/display.
+- [x] Return minimal team fields plus useful counts.
+
+## Review Notes
+
+```text
+Status: COMPLETE
+
+Files changed:
+- `apps/api/src/analytics/analytics.controller.ts`
+- `apps/api/src/analytics/analytics.service.ts`
+- `features/analytics-export-api/feature.md`
+- `features/analytics-export-api/integration-guide.md`
+- `features/analytics-export-api/progress.md`
+
+Implementation:
+- Added analytics reference endpoints for users and teams.
+- Users include id, name, email, role, status, and team.
+- Teams include id, name, manager, team leader, member count, and sales count.
+
+Tests/checks:
+- `npm run build` in `apps/api` passes.
+
+Known limitations:
+- These endpoints are unpaginated reference lists.
 ```
 
 ---
@@ -346,6 +506,10 @@ Known limitations:
 | 7. Filters | Complete | No |
 | 8. Single post export | Complete | No |
 | 9. Tests | Not Started | No |
+| 10. Filters and Summary | Complete | No |
+| 11. Public analytics user identity | Complete | No |
+| 12. Date Filter Inclusivity | Complete | No |
+| 13. Reference Users and Teams | Complete | No |
 
 ---
 

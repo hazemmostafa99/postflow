@@ -12,6 +12,13 @@ import {
   PublishingJobStatus,
 } from '../schemas/publishing-job.schema';
 import { Group, GroupDocument } from '../schemas/group.schema';
+import { Team, TeamDocument } from '../schemas/team.schema';
+import {
+  User,
+  UserDocument,
+  UserRole,
+} from '../schemas/user.schema';
+import { AuthorizationService } from '../auth/authorization.service';
 import { calculatePostSchedule } from './post-flow-time-spacing';
 
 export class CreatePostDto {
@@ -55,11 +62,21 @@ type LeanJobSummary = {
 
 type AggregatedPost = {
   _id: Types.ObjectId;
+  clerkUserId: string;
   content: string;
   status: string;
   createdAt?: Date;
   updatedAt?: Date;
   mediaCount: number;
+};
+
+type LeanPostWithCreator = {
+  _id: Types.ObjectId;
+  clerkUserId: string;
+};
+
+type PostVisibilityFilter = {
+  clerkUserId?: string | { $in: string[] };
 };
 
 @Injectable()
@@ -71,6 +88,11 @@ export class PostsService {
     private readonly jobModel: Model<PublishingJobDocument>,
     @InjectModel(Group.name)
     private readonly groupModel: Model<GroupDocument>,
+    @InjectModel(User.name)
+    private readonly userModel: Model<UserDocument>,
+    @InjectModel(Team.name)
+    private readonly teamModel: Model<TeamDocument>,
+    private readonly authorization: AuthorizationService,
   ) {}
 
   /**
@@ -178,8 +200,10 @@ export class PostsService {
     postId: string,
     dto: UpdatePostScheduleDto,
   ) {
+    const postVisibilityFilter =
+      await this.getPostVisibilityFilter(clerkUserId);
     const post = await this.postModel
-      .findOne({ _id: postId, clerkUserId })
+      .findOne({ _id: postId, ...postVisibilityFilter })
       .exec();
     if (!post) throw new NotFoundException('Post not found');
 
@@ -281,8 +305,10 @@ export class PostsService {
    * List all posts for the user, newest first, with job counts.
    */
   async getPosts(clerkUserId: string) {
+    const postVisibilityFilter =
+      await this.getPostVisibilityFilter(clerkUserId);
     const posts = await this.postModel
-      .find({ clerkUserId })
+      .find(postVisibilityFilter)
       .select('-mediaUrls')
       .sort({ createdAt: -1 })
       .lean()
@@ -307,7 +333,9 @@ export class PostsService {
       {},
     );
 
-    return posts.map((post) => ({
+    const postsWithCreators = await this.attachCreators(posts);
+
+    return postsWithCreators.map((post) => ({
       ...post,
       _id: post._id.toString(),
       jobs: jobsByPost[post._id.toString()] ?? [],
@@ -318,17 +346,20 @@ export class PostsService {
     const page = Math.max(1, options.page ?? 1);
     const limit = Math.min(100, Math.max(1, options.limit ?? 10));
     const skip = (page - 1) * limit;
+    const postVisibilityFilter =
+      await this.getPostVisibilityFilter(clerkUserId);
 
     const [rawPosts, total] = await Promise.all([
       this.postModel
         .aggregate([
-          { $match: { clerkUserId } },
+          { $match: postVisibilityFilter },
           { $sort: { createdAt: -1, _id: -1 } },
           { $skip: skip },
           { $limit: limit },
           {
             $project: {
               content: 1,
+              clerkUserId: 1,
               status: 1,
               createdAt: 1,
               updatedAt: 1,
@@ -337,7 +368,7 @@ export class PostsService {
           },
         ])
         .exec(),
-      this.postModel.countDocuments({ clerkUserId }),
+      this.postModel.countDocuments(postVisibilityFilter),
     ]);
     const posts = rawPosts as unknown as AggregatedPost[];
 
@@ -359,8 +390,10 @@ export class PostsService {
       {},
     );
 
+    const postsWithCreators = await this.attachCreators(posts);
+
     return {
-      posts: posts.map((post) => ({
+      posts: postsWithCreators.map((post) => ({
         ...post,
         _id: post._id.toString(),
         jobs: jobsByPost[post._id.toString()] ?? [],
@@ -378,8 +411,10 @@ export class PostsService {
    * Get a single post with its jobs.
    */
   async getPost(clerkUserId: string, postId: string) {
+    const postVisibilityFilter =
+      await this.getPostVisibilityFilter(clerkUserId);
     const post = await this.postModel
-      .findOne({ _id: postId, clerkUserId })
+      .findOne({ _id: postId, ...postVisibilityFilter })
       .lean()
       .exec();
 
@@ -393,8 +428,10 @@ export class PostsService {
       .lean()
       .exec();
 
+    const [postWithCreator] = await this.attachCreators([post]);
+
     return {
-      ...post,
+      ...postWithCreator,
       _id: post._id.toString(),
       jobs,
     };
@@ -417,8 +454,10 @@ export class PostsService {
     postId: string,
     action: PostControlAction,
   ) {
+    const postVisibilityFilter =
+      await this.getPostVisibilityFilter(clerkUserId);
     const post = await this.postModel
-      .findOne({ _id: postId, clerkUserId })
+      .findOne({ _id: postId, ...postVisibilityFilter })
       .exec();
     if (!post) throw new NotFoundException('Post not found');
     const postRef = post._id as unknown as Post;
@@ -486,8 +525,10 @@ export class PostsService {
   }
 
   async deleteAllPosts(clerkUserId: string) {
+    const postVisibilityFilter =
+      await this.getPostVisibilityFilter(clerkUserId);
     const posts = await this.postModel
-      .find({ clerkUserId })
+      .find(postVisibilityFilter)
       .select('_id')
       .lean()
       .exec();
@@ -495,7 +536,96 @@ export class PostsService {
     if (postIds.length) {
       await this.jobModel.deleteMany().where('postId').in(postIds).exec();
     }
-    await this.postModel.deleteMany({ clerkUserId }).exec();
+    await this.postModel.deleteMany(postVisibilityFilter).exec();
+  }
+
+  private async getPostVisibilityFilter(
+    clerkUserId: string,
+  ): Promise<PostVisibilityFilter> {
+    const user = await this.authorization.requireActiveUser(clerkUserId);
+
+    if (user.role === UserRole.ADMIN) {
+      return {};
+    }
+
+    if (user.role === UserRole.MANAGER) {
+      const managedTeams = await this.teamModel
+        .find({ managerId: String(user._id) })
+        .select('_id')
+        .lean()
+        .exec();
+      const managedTeamIds = managedTeams.map((team) => team._id.toString());
+      if (managedTeamIds.length === 0) {
+        return { clerkUserId: { $in: [] } };
+      }
+
+      const teamMembers = await this.userModel
+        .find({ teamId: { $in: managedTeamIds } })
+        .select('clerkUserId')
+        .lean()
+        .exec();
+      return {
+        clerkUserId: {
+          $in: teamMembers.map((member) => member.clerkUserId),
+        },
+      };
+    }
+
+    if (user.role === UserRole.TEAM_LEADER) {
+      if (!user.teamId) return { clerkUserId: { $in: [] } };
+      const teamMembers = await this.userModel
+        .find({ teamId: user.teamId })
+        .select('clerkUserId')
+        .lean()
+        .exec();
+      return {
+        clerkUserId: {
+          $in: teamMembers.map((member) => member.clerkUserId),
+        },
+      };
+    }
+
+    return { clerkUserId };
+  }
+
+  private async attachCreators<TPost extends LeanPostWithCreator>(
+    posts: TPost[],
+  ) {
+    const creatorClerkIds = [
+      ...new Set(posts.map((post) => post.clerkUserId).filter(Boolean)),
+    ];
+    const creators = creatorClerkIds.length
+      ? await this.userModel
+          .find({ clerkUserId: { $in: creatorClerkIds } })
+          .select('clerkUserId email firstName lastName role status teamId')
+          .lean()
+          .exec()
+      : [];
+    const creatorsByClerkId = new Map(
+      creators.map((creator) => [creator.clerkUserId, creator]),
+    );
+
+    return posts.map((post) => {
+      const creator = creatorsByClerkId.get(post.clerkUserId);
+      return {
+        ...post,
+        createdBy: {
+          clerkUserId: post.clerkUserId,
+          ...(creator
+            ? {
+                userId: creator._id.toString(),
+                firstName: creator.firstName,
+                lastName: creator.lastName,
+                fullName: getFullName(creator.firstName, creator.lastName),
+                email: creator.email,
+                role: creator.role,
+                status: creator.status,
+                teamId: creator.teamId ?? null,
+              }
+            : {}),
+        },
+      };
+    });
   }
 
   private async updateParentPostStatus(post: PostDocument) {
@@ -551,4 +681,12 @@ export class PostsService {
 
     await post.save();
   }
+}
+
+function getFullName(firstName?: string, lastName?: string) {
+  const fullName = [firstName, lastName]
+    .map((part) => part?.trim())
+    .filter(Boolean)
+    .join(' ');
+  return fullName || undefined;
 }

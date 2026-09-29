@@ -1,7 +1,7 @@
 import { auth } from "@clerk/nextjs/server";
 import { redirect } from "next/navigation";
 import Link from "next/link";
-import { AlertCircle, ArrowLeft, Clock, ExternalLink, Users } from "lucide-react";
+import { AlertCircle, ArrowLeft, Clock, ExternalLink, UserRound, Users } from "lucide-react";
 import { RefreshGroupStatusButton, RefreshPostStatusControls } from "@/components/refresh-post-status-controls";
 import { RefreshPostEngagementButton, RefreshAllPostEngagementButton } from "@/components/refresh-post-engagement-button";
 import { ScheduledTime } from "@/components/scheduled-time";
@@ -44,6 +44,17 @@ interface Post {
   mediaUrls: string[];
   status: string;
   createdAt: string;
+  createdBy?: {
+    clerkUserId: string;
+    userId?: string;
+    firstName?: string;
+    lastName?: string;
+    fullName?: string;
+    email?: string;
+    role?: string;
+    status?: string;
+    teamId?: string | null;
+  };
   startTime?: string;
   spacePostsApart?: boolean;
   spacingMinutes?: number;
@@ -72,6 +83,10 @@ function timeAgo(dateStr: string): string {
   if (hours > 0) return `${hours}h ago`;
   if (minutes > 0) return `${minutes}m ago`;
   return "Just now";
+}
+
+function getCreatorLabel(createdBy?: Post["createdBy"]): string {
+  return createdBy?.fullName || createdBy?.email || createdBy?.clerkUserId || "Unknown";
 }
 
 function JobStatusBadge({ job }: { job: Job }) {
@@ -216,6 +231,13 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
               <div className="flex items-center gap-1.5">
                 <Clock className="h-4 w-4" />
                 Created {timeAgo(post.createdAt)}
+              </div>
+              <div className="flex min-w-0 items-center gap-1.5">
+                <UserRound className="h-4 w-4 shrink-0" />
+                <span className="truncate">By {getCreatorLabel(post.createdBy)}</span>
+                {post.createdBy?.role && (
+                  <span className="rounded-md bg-muted px-1.5 py-0.5 text-xs">{post.createdBy.role}</span>
+                )}
               </div>
               <div className="flex items-center gap-1.5">
                 <Users className="h-4 w-4" />

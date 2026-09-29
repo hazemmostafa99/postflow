@@ -8,6 +8,8 @@ for (let index = 2; index < process.argv.length; index += 1) {
 }
 
 const email = (args.get("email") || process.env.ADMIN_EMAIL || "").trim().replaceAll("\\@", "@").toLowerCase();
+const firstName = (args.get("first-name") || process.env.ADMIN_FIRST_NAME || "").trim();
+const lastName = (args.get("last-name") || process.env.ADMIN_LAST_NAME || "").trim();
 const password = args.get("password") || process.env.ADMIN_PASSWORD;
 const databaseUrl = process.env.DATABASE_URL;
 const clerkSecretKey = process.env.CLERK_SECRET_KEY;
@@ -29,7 +31,12 @@ try {
   const clerkResponse = await fetch("https://api.clerk.com/v1/users", {
     method: "POST",
     headers: { Authorization: `Bearer ${clerkSecretKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ email_address: [email], password }),
+    body: JSON.stringify({
+      email_address: [email],
+      password,
+      ...(firstName ? { first_name: firstName } : {}),
+      ...(lastName ? { last_name: lastName } : {}),
+    }),
   });
   const clerkBody = await clerkResponse.json();
   if (!clerkResponse.ok) throw new Error(`Clerk user creation failed (${clerkResponse.status}): ${clerkBody?.errors?.[0]?.message || "unknown error"}`);
@@ -38,6 +45,8 @@ try {
   await users.insertOne({
     clerkUserId,
     email,
+    ...(firstName ? { firstName } : {}),
+    ...(lastName ? { lastName } : {}),
     role: "ADMIN",
     status: "ACTIVE",
     teamId: null,

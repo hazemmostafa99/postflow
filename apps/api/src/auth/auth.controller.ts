@@ -14,17 +14,22 @@ export class AuthController {
   async me(
     @Headers('x-clerk-user-id') clerkUserId: string,
     @Headers('x-clerk-user-email') email?: string,
+    @Headers('x-clerk-user-first-name') firstName?: string,
+    @Headers('x-clerk-user-last-name') lastName?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
     const user = await this.authorization.requireOrProvisionActiveUser(
       clerkUserId,
       email,
+      { firstName, lastName },
     );
     return {
       id: user._id.toString(),
       clerkUserId: user.clerkUserId,
       email: user.email,
+      firstName: user.firstName,
+      lastName: user.lastName,
       role: user.role,
       status: user.status,
       teamId: user.teamId ?? null,
