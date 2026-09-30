@@ -13,8 +13,493 @@ const detectedCountElement = document.getElementById("detected-count")!;
 const syncedCountElement = document.getElementById("synced-count")!;
 const notSyncedCountElement = document.getElementById("not-synced-count")!;
 const groupsSummaryElement = document.getElementById("groups-summary")!;
+const dashboardTab = document.getElementById("dashboard-tab") as HTMLButtonElement;
+const phoneCollectorTab = document.getElementById("phone-collector-tab") as HTMLButtonElement;
+const dashboardView = document.getElementById("dashboard-view")!;
+const phoneCollectorView = document.getElementById("phone-collector-view")!;
+const collectorPageTitle = document.getElementById("collector-page-title")!;
+const collectorPageUrl = document.getElementById("collector-page-url")!;
+const collectNumbersButton = document.getElementById("collect-numbers") as HTMLButtonElement;
+const collectorStatus = document.getElementById("collector-status")!;
+const phoneFoundCount = document.getElementById("phone-found-count")!;
+const phoneValidCount = document.getElementById("phone-valid-count")!;
+const phoneDuplicateCount = document.getElementById("phone-duplicate-count")!;
+const phoneInvalidCount = document.getElementById("phone-invalid-count")!;
+const selectedPhoneCount = document.getElementById("selected-phone-count")!;
+const selectAllPhonesButton = document.getElementById("select-all-phones") as HTMLButtonElement;
+const clearPhoneSelectionButton = document.getElementById("clear-phone-selection") as HTMLButtonElement;
+const phoneReviewEmpty = document.getElementById("phone-review-empty")!;
+const phoneReviewList = document.getElementById("phone-review-list")!;
+const sendPhoneNumbersButton = document.getElementById("send-phone-numbers") as HTMLButtonElement;
+const phoneSyncResult = document.getElementById("phone-sync-result")!;
+const syncSubmittedCount = document.getElementById("sync-submitted-count")!;
+const syncAddedCount = document.getElementById("sync-added-count")!;
+const syncExistingCount = document.getElementById("sync-existing-count")!;
+const syncInvalidCount = document.getElementById("sync-invalid-count")!;
+const syncDuplicateCount = document.getElementById("sync-duplicate-count")!;
+const phoneSyncDialog = document.getElementById("phone-sync-confirmation") as HTMLDialogElement;
+const confirmSelectedCount = document.getElementById("confirm-selected-count")!;
+const confirmPhoneSyncButton = document.getElementById("confirm-phone-sync") as HTMLButtonElement;
+const cancelPhoneSyncButton = document.getElementById("cancel-phone-sync") as HTMLButtonElement;
 
 let currentExtensionName = "";
+let phoneCollectorState = createEmptyPhoneCollectorState();
+const phoneEditErrors = new Map<string, string>();
+
+// Writes phone collector diagnostics to the popup DevTools console without storing them.
+function logPhoneCollector(
+  level: "info" | "warn" | "error",
+  message: string,
+  details?: Record<string, string | number>,
+) {
+  const logger = level === "error" ? console.error : level === "warn" ? console.warn : console.info;
+  logger(`[PostFlow][Phone Collector] ${message}`, details ?? "");
+}
+
+// Creates the initial versioned state used before the first collection.
+function createEmptyPhoneCollectorState(): PhoneCollectorState {
+  return {
+    schemaVersion: 1,
+    collectionStatus: "idle",
+    source: null,
+    candidates: [],
+    numbers: [],
+    summary: { found: 0, valid: 0, duplicates: 0, invalid: 0 },
+    syncStatus: "idle",
+  };
+}
+
+// Switches the popup between its existing dashboard and the collector view.
+function setActivePopupView(view: "dashboard" | "phone-collector") {
+  const collectorActive = view === "phone-collector";
+  dashboardTab.setAttribute("aria-selected", String(!collectorActive));
+  dashboardTab.tabIndex = collectorActive ? -1 : 0;
+  dashboardTab.classList.toggle("active", !collectorActive);
+  phoneCollectorTab.setAttribute("aria-selected", String(collectorActive));
+  phoneCollectorTab.tabIndex = collectorActive ? 0 : -1;
+  phoneCollectorTab.classList.toggle("active", collectorActive);
+  dashboardView.toggleAttribute("hidden", collectorActive);
+  phoneCollectorView.toggleAttribute("hidden", !collectorActive);
+  if (collectorActive) void loadActivePageDetails();
+  void chrome.storage.local.set({ phoneCollectorActiveView: view });
+}
+
+// Supports standard left/right and Home/End keyboard navigation for the view tabs.
+function handlePopupTabKeydown(event: KeyboardEvent) {
+  const tabs = [dashboardTab, phoneCollectorTab];
+  const currentIndex = tabs.indexOf(document.activeElement as HTMLButtonElement);
+  if (currentIndex < 0) return;
+
+  let nextIndex: number | undefined;
+  if (event.key === "ArrowRight") nextIndex = (currentIndex + 1) % tabs.length;
+  if (event.key === "ArrowLeft") nextIndex = (currentIndex + tabs.length - 1) % tabs.length;
+  if (event.key === "Home") nextIndex = 0;
+  if (event.key === "End") nextIndex = tabs.length - 1;
+  if (nextIndex === undefined) return;
+
+  event.preventDefault();
+  tabs[nextIndex].focus();
+  setActivePopupView(nextIndex === 0 ? "dashboard" : "phone-collector");
+}
+
+// Loads the current tab's title and URL for the collector's source context.
+async function loadActivePageDetails() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    collectorPageTitle.textContent = tab?.title?.trim() || "Active page";
+    collectorPageUrl.textContent = tab?.url || "Page address unavailable";
+    collectorPageUrl.setAttribute("title", tab?.url || "Page address unavailable");
+  } catch {
+    collectorPageTitle.textContent = "Active page unavailable";
+    collectorPageUrl.textContent = "Could not read the active tab.";
+  }
+}
+
+// Restores the saved review list and selected tab when the popup is opened.
+async function loadPhoneCollectorState() {
+  const result = await chrome.storage.local.get(["phoneCollectorState", "phoneCollectorActiveView"]);
+  const savedState = result.phoneCollectorState as PhoneCollectorState | undefined;
+  if (savedState?.schemaVersion === 1 && Array.isArray(savedState.numbers)) {
+    phoneCollectorState = savedState;
+    if (phoneCollectorState.collectionStatus === "collecting") {
+      phoneCollectorState.collectionStatus = "error";
+      phoneCollectorState.collectionError = "The previous collection was interrupted. Try again.";
+      void persistPhoneCollectorState();
+    }
+    if (phoneCollectorState.syncStatus === "confirming") {
+      phoneCollectorState.syncStatus = "idle";
+      phoneCollectorState.syncError = undefined;
+      void persistPhoneCollectorState();
+    } else if (phoneCollectorState.syncStatus === "syncing") {
+      phoneCollectorState.syncStatus = "error";
+      phoneCollectorState.syncError = "The popup closed during sync. Retry to reconcile the saved numbers.";
+      void persistPhoneCollectorState();
+    }
+  }
+  renderPhoneCollector();
+
+  if (result.phoneCollectorActiveView === "phone-collector") {
+    setActivePopupView("phone-collector");
+  }
+}
+
+// Saves the current collection and review choices to extension-local storage.
+async function persistPhoneCollectorState() {
+  await chrome.storage.local.set({ phoneCollectorState });
+}
+
+// Updates the collector status, totals, empty state, and review rows from saved state.
+function renderPhoneCollector() {
+  const { summary, numbers, collectionStatus } = phoneCollectorState;
+  phoneFoundCount.textContent = String(summary.found);
+  phoneValidCount.textContent = String(summary.valid);
+  phoneDuplicateCount.textContent = String(summary.duplicates);
+  phoneInvalidCount.textContent = String(summary.invalid);
+  const selectedCount = getSelectedPhoneNumbers().length;
+  selectedPhoneCount.textContent = String(selectedCount);
+  const syncLocked = phoneCollectorState.syncStatus === "confirming" || phoneCollectorState.syncStatus === "syncing";
+  collectNumbersButton.disabled = collectionStatus === "collecting" || syncLocked;
+  collectNumbersButton.textContent = collectionStatus === "collecting" ? "Collecting..." : "Collect Numbers";
+  sendPhoneNumbersButton.disabled = selectedCount === 0 ||
+    !phoneCollectorState.source ||
+    collectionStatus === "collecting" ||
+    phoneCollectorState.syncStatus === "confirming" ||
+    phoneCollectorState.syncStatus === "syncing";
+  sendPhoneNumbersButton.textContent = phoneCollectorState.syncStatus === "syncing"
+    ? "Syncing..."
+    : `Send ${selectedCount} to PostFlow`;
+  confirmSelectedCount.textContent = String(selectedCount);
+  confirmPhoneSyncButton.disabled = phoneCollectorState.syncStatus === "syncing";
+
+  if (phoneCollectorState.syncStatus === "syncing") {
+    collectorStatus.textContent = "Syncing selected numbers with PostFlow...";
+  } else if (phoneCollectorState.syncStatus === "error") {
+    collectorStatus.textContent = phoneCollectorState.syncError || "Sync failed. Your selection is available to retry.";
+  } else if (phoneCollectorState.syncStatus === "success") {
+    collectorStatus.textContent = "Sync complete. See the result below.";
+  } else if (phoneCollectorState.syncStatus === "confirming") {
+    collectorStatus.textContent = "Confirm the selected numbers to continue.";
+  } else if (collectionStatus === "collecting") {
+    collectorStatus.textContent = "Collecting phone numbers from the loaded page...";
+  } else if (collectionStatus === "error") {
+    collectorStatus.textContent = phoneCollectorState.collectionError || "Could not collect numbers from this page.";
+  } else if (collectionStatus === "review" && summary.found === 0) {
+    collectorStatus.textContent = "No phone numbers were found on this page.";
+  } else if (collectionStatus === "review") {
+    collectorStatus.textContent = "Collection complete. Review the numbers below.";
+  } else {
+    collectorStatus.textContent = "Ready to collect numbers from the current page.";
+  }
+  collectorStatus.classList.toggle("error", phoneCollectorState.syncStatus === "error" || collectionStatus === "error");
+
+  phoneReviewEmpty.textContent = collectionStatus === "collecting"
+    ? "Scanning the loaded page..."
+    : collectionStatus === "review" && numbers.length === 0
+      ? "No reviewable phone numbers were found."
+      : "Numbers you collect will appear here.";
+  phoneReviewEmpty.toggleAttribute("hidden", numbers.length > 0);
+  phoneReviewList.replaceChildren(...numbers.map(renderPhoneReviewNumber));
+  const syncResult = phoneCollectorState.syncResult;
+  phoneSyncResult.toggleAttribute("hidden", !syncResult);
+  if (syncResult) {
+    syncSubmittedCount.textContent = String(syncResult.submitted);
+    syncAddedCount.textContent = String(syncResult.added);
+    syncExistingCount.textContent = String(syncResult.alreadyExisted);
+    syncInvalidCount.textContent = String(syncResult.invalid);
+    syncDuplicateCount.textContent = String(syncResult.duplicates);
+  }
+}
+
+// Returns the selected E.164 values from valid review rows.
+function getSelectedPhoneNumbers(): string[] {
+  return Array.from(new Set(phoneCollectorState.numbers
+    .filter((number) => number.status === "valid" && number.selected && Boolean(number.normalized))
+    .map((number) => number.normalized!)));
+}
+
+// Creates one editable review row and wires its selection, editing, and remove actions.
+function renderPhoneReviewNumber(number: PhoneReviewNumber): HTMLElement {
+  const row = document.createElement("article");
+  row.className = `phone-review-row ${number.status}`;
+  const syncLocked = phoneCollectorState.syncStatus === "confirming" || phoneCollectorState.syncStatus === "syncing";
+
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.checked = number.status === "valid" && number.selected;
+  checkbox.disabled = number.status !== "valid" || syncLocked;
+  checkbox.setAttribute("aria-label", `Select ${number.value}`);
+  checkbox.addEventListener("change", () => setPhoneNumberSelected(number.id, checkbox.checked));
+
+  const details = document.createElement("div");
+  details.className = "phone-review-details";
+  const input = document.createElement("input");
+  input.className = "phone-review-input";
+  input.type = "tel";
+  input.value = number.value;
+  input.maxLength = 40;
+  input.disabled = syncLocked;
+  input.setAttribute("aria-label", `Edit phone number ${number.value}`);
+  input.addEventListener("change", () => updatePhoneReviewNumber(number.id, input.value));
+  details.append(input);
+
+  const reason = document.createElement("p");
+  reason.className = `phone-review-reason ${number.status}`;
+  reason.textContent = phoneEditErrors.get(number.id) || (number.status === "valid" ? "Valid" : number.reason || "Invalid number");
+  details.append(reason);
+
+  const removeButton = document.createElement("button");
+  removeButton.className = "icon-button remove-phone-button";
+  removeButton.type = "button";
+  removeButton.textContent = "x";
+  removeButton.disabled = syncLocked;
+  removeButton.setAttribute("aria-label", `Remove ${number.value}`);
+  removeButton.title = "Remove number";
+  removeButton.addEventListener("click", () => removePhoneReviewNumber(number.id));
+
+  row.append(checkbox, details, removeButton);
+  return row;
+}
+
+// Changes selection only for rows that have passed client-side validation.
+function setPhoneNumberSelected(id: string, selected: boolean) {
+  phoneCollectorState.numbers = phoneCollectorState.numbers.map((number) =>
+    number.id === id && number.status === "valid" ? { ...number, selected } : number,
+  );
+  renderPhoneCollector();
+  void persistPhoneCollectorState();
+}
+
+// Selects every valid review row while leaving invalid values unselected.
+function selectAllValidPhoneNumbers() {
+  phoneCollectorState.numbers = phoneCollectorState.numbers.map((number) =>
+    number.status === "valid" ? { ...number, selected: true } : number,
+  );
+  renderPhoneCollector();
+  void persistPhoneCollectorState();
+}
+
+// Clears selection from all review rows without removing collected values.
+function clearPhoneNumberSelection() {
+  phoneCollectorState.numbers = phoneCollectorState.numbers.map((number) => ({ ...number, selected: false }));
+  renderPhoneCollector();
+  void persistPhoneCollectorState();
+}
+
+// Removes a review row and clears any temporary edit warning associated with it.
+function removePhoneReviewNumber(id: string) {
+  phoneCollectorState.numbers = phoneCollectorState.numbers.filter((number) => number.id !== id);
+  phoneEditErrors.delete(id);
+  renderPhoneCollector();
+  void persistPhoneCollectorState();
+}
+
+// Revalidates an edited value and prevents two rows from sharing one normalized number.
+function updatePhoneReviewNumber(id: string, value: string) {
+  const result = normalizePhoneNumber(value);
+  const existing = phoneCollectorState.numbers.find((number) => number.id === id);
+  if (!existing) return;
+
+  if (result.valid && phoneCollectorState.numbers.some((number) => number.id !== id && number.status === "valid" && number.normalized === result.normalized)) {
+    phoneEditErrors.set(id, "This number is already in the review list.");
+    renderPhoneCollector();
+    return;
+  }
+
+  phoneEditErrors.delete(id);
+  phoneCollectorState.numbers = phoneCollectorState.numbers.map((number) => {
+    if (number.id !== id) return number;
+    if (!result.valid) {
+      return { ...number, value, normalized: undefined, status: "invalid", selected: false, reason: result.reason };
+    }
+    return {
+      ...number,
+      value: result.normalized,
+      normalized: result.normalized,
+      status: "valid",
+      selected: number.status === "valid" ? number.selected : true,
+      reason: undefined,
+    };
+  });
+  renderPhoneCollector();
+  void persistPhoneCollectorState();
+}
+
+// Collects the active page, then stores its candidates, validated rows, and summary.
+async function collectPhoneNumbers() {
+  logPhoneCollector("info", "Collection started for the active page.");
+  phoneCollectorState.collectionStatus = "collecting";
+  phoneCollectorState.collectionError = undefined;
+  renderPhoneCollector();
+  await persistPhoneCollectorState();
+
+  const response = await requestPhoneCollection();
+  if (!response.ok || !response.source || !response.candidates || !response.numbers || !response.summary) {
+    phoneCollectorState.collectionStatus = "error";
+    phoneCollectorState.collectionError = response.error || "Could not collect numbers from this page.";
+    logPhoneCollector("error", "Collection failed.", response.code ? { code: response.code } : undefined);
+    renderPhoneCollector();
+    await persistPhoneCollectorState();
+    return;
+  }
+
+  phoneCollectorState = {
+    schemaVersion: 1,
+    collectionStatus: "review",
+    source: response.source,
+    candidates: response.candidates,
+    numbers: response.numbers,
+    summary: response.summary,
+    syncStatus: "idle",
+  };
+  phoneEditErrors.clear();
+  logPhoneCollector("info", "Collection completed.", {
+    valid: response.summary.valid,
+    duplicates: response.summary.duplicates,
+    invalid: response.summary.invalid,
+  });
+  collectorPageTitle.textContent = response.source.title || "Active page";
+  collectorPageUrl.textContent = response.source.url;
+  collectorPageUrl.setAttribute("title", response.source.url);
+  renderPhoneCollector();
+  await persistPhoneCollectorState();
+}
+
+// Opens an explicit confirmation dialog for the currently selected valid numbers.
+async function openPhoneSyncConfirmation() {
+  const selectedNumbers = getSelectedPhoneNumbers();
+  if (!selectedNumbers.length || phoneCollectorState.syncStatus === "syncing") return;
+
+  logPhoneCollector("info", "Sync confirmation opened.", { selected: selectedNumbers.length });
+  phoneCollectorState.syncStatus = "confirming";
+  phoneCollectorState.syncError = undefined;
+  confirmSelectedCount.textContent = String(selectedNumbers.length);
+  renderPhoneCollector();
+  await persistPhoneCollectorState();
+  if (!phoneSyncDialog.open) phoneSyncDialog.showModal();
+}
+
+// Closes confirmation without sending and restores the review controls.
+function closePhoneSyncConfirmation() {
+  if (phoneSyncDialog.open) phoneSyncDialog.close();
+  if (phoneCollectorState.syncStatus !== "confirming") return;
+  logPhoneCollector("info", "Sync canceled by the user.");
+  phoneCollectorState.syncStatus = "idle";
+  phoneCollectorState.syncError = undefined;
+  renderPhoneCollector();
+  void persistPhoneCollectorState();
+}
+
+// Resets a confirmation canceled with Escape, while leaving active syncs untouched.
+function handlePhoneSyncDialogClose() {
+  if (phoneCollectorState.syncStatus !== "confirming") return;
+  logPhoneCollector("info", "Sync confirmation dismissed.");
+  phoneCollectorState.syncStatus = "idle";
+  phoneCollectorState.syncError = undefined;
+  renderPhoneCollector();
+  void persistPhoneCollectorState();
+}
+
+// Sends a sync command to the worker and converts messaging failures to retryable UI errors.
+async function requestPhoneSync(): Promise<PhoneSyncResponse> {
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "SYNC_PHONE_NUMBERS" }) as
+      PhoneSyncResponse | undefined;
+    return response ?? {
+      ok: false,
+      code: "WORKER_NO_RESPONSE",
+      error: "The extension worker did not respond. Reload PostFlow at chrome://extensions, then retry. Your selection is saved.",
+    };
+  } catch {
+    return {
+      ok: false,
+      code: "NETWORK_ERROR",
+      error: "Could not contact the extension worker. Reload PostFlow at chrome://extensions, then retry. Your selection is saved.",
+    };
+  }
+}
+
+// Confirms and sends the saved selection, retaining all review rows if the request fails.
+async function confirmAndSyncPhoneNumbers() {
+  if (phoneCollectorState.syncStatus !== "confirming") return;
+  const selectedNumbers = getSelectedPhoneNumbers();
+  if (!selectedNumbers.length || !phoneCollectorState.source) {
+    closePhoneSyncConfirmation();
+    return;
+  }
+
+  logPhoneCollector("info", "Sync confirmed.", { selected: selectedNumbers.length });
+  if (phoneSyncDialog.open) phoneSyncDialog.close();
+  phoneCollectorState.syncStatus = "syncing";
+  phoneCollectorState.syncError = undefined;
+  phoneCollectorState.syncResult = undefined;
+  renderPhoneCollector();
+
+  try {
+    await persistPhoneCollectorState();
+    const response = await requestPhoneSync();
+    if (response.ok && response.result) {
+      phoneCollectorState.syncStatus = "success";
+      phoneCollectorState.syncResult = response.result;
+      phoneCollectorState.syncError = undefined;
+      phoneCollectorState.collectionStatus = "idle";
+      phoneCollectorState.source = null;
+      phoneCollectorState.candidates = [];
+      phoneCollectorState.numbers = [];
+      phoneCollectorState.summary = { found: 0, valid: 0, duplicates: 0, invalid: 0 };
+      phoneEditErrors.clear();
+      logPhoneCollector("info", "Sync completed.", {
+        added: response.result.added,
+        alreadyExisted: response.result.alreadyExisted,
+        invalid: response.result.invalid,
+      });
+    } else {
+      phoneCollectorState.syncStatus = "error";
+      phoneCollectorState.syncError = response.error || "Sync failed. Your selection is saved for retry.";
+      logPhoneCollector("error", "Sync failed.", {
+        ...(response.code ? { code: response.code } : {}),
+        ...(typeof response.httpStatus === "number" ? { httpStatus: response.httpStatus } : {}),
+      });
+    }
+  } catch {
+    phoneCollectorState.syncStatus = "error";
+    phoneCollectorState.syncError = "Could not sync with PostFlow. Your selection is saved for retry.";
+    logPhoneCollector("error", "Popup could not complete the sync request.", { code: "NETWORK_ERROR" });
+  }
+
+  renderPhoneCollector();
+  await persistPhoneCollectorState();
+}
+
+dashboardTab.addEventListener("click", () => setActivePopupView("dashboard"));
+phoneCollectorTab.addEventListener("click", () => setActivePopupView("phone-collector"));
+dashboardTab.addEventListener("keydown", handlePopupTabKeydown);
+phoneCollectorTab.addEventListener("keydown", handlePopupTabKeydown);
+collectNumbersButton.addEventListener("click", () => void collectPhoneNumbers());
+selectAllPhonesButton.addEventListener("click", selectAllValidPhoneNumbers);
+clearPhoneSelectionButton.addEventListener("click", clearPhoneNumberSelection);
+sendPhoneNumbersButton.addEventListener("click", () => void openPhoneSyncConfirmation());
+cancelPhoneSyncButton.addEventListener("click", closePhoneSyncConfirmation);
+confirmPhoneSyncButton.addEventListener("click", () => void confirmAndSyncPhoneNumbers());
+phoneSyncDialog.addEventListener("close", handlePhoneSyncDialogClose);
+
+// Requests a page scan through the service worker and converts transport failures to UI state.
+async function requestPhoneCollection(): Promise<PhoneCollectionResponse> {
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "COLLECT_PHONE_NUMBERS" }) as
+      PhoneCollectionResponse | undefined;
+    return response ?? {
+      ok: false,
+      code: "COLLECTION_FAILED",
+      error: "The extension did not return a collection result.",
+    };
+  } catch {
+    return {
+      ok: false,
+      code: "COLLECTION_FAILED",
+      error: "Could not contact the extension service worker.",
+    };
+  }
+}
 
 function setIndicator(dotId: string, textId: string, text: string, state: string) {
   const dot = document.getElementById(dotId);
@@ -250,3 +735,4 @@ saveNameButton.addEventListener("click", async () => {
 loadGroups();
 loadConnectionStatus();
 loadExtensionName();
+loadPhoneCollectorState();

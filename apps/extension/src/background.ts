@@ -24,6 +24,55 @@ const POSTING_TIMING = (globalThis as { PostFlowPostingTiming?: PostFlowPostingT
 
 let extensionInstanceIdPromise: Promise<string> | null = null;
 
+// Writes sanitized phone-sync diagnostics to the service worker DevTools console.
+function logPhoneSync(
+  level: 'info' | 'warn' | 'error',
+  message: string,
+  details?: Record<string, string | number>,
+) {
+  const prefix = `[PostFlow][Phone Collector] ${message}`;
+  if (level === 'error') console.error(prefix, details ?? '');
+  else if (level === 'warn') console.warn(prefix, details ?? '');
+  else console.info(prefix, details ?? '');
+}
+
+interface ApiFetchFailure {
+  apiFetchError: true;
+  status: number;
+}
+
+// Identifies structured API failures returned only to callers that request details.
+function isApiFetchFailure(value: unknown): value is ApiFetchFailure {
+  return typeof value === 'object' && value !== null &&
+    'apiFetchError' in value && value.apiFetchError === true &&
+    'status' in value && typeof value.status === 'number';
+}
+
+// Checks that the backend returned every non-negative count needed by the popup.
+function isPhoneSyncResult(value: unknown): value is PhoneSyncResult {
+  if (typeof value !== 'object' || value === null) return false;
+  const result = value as Record<string, unknown>;
+  return ['submitted', 'valid', 'duplicates', 'invalid', 'added', 'alreadyExisted']
+    .every((key) => Number.isInteger(result[key]) && Number(result[key]) >= 0);
+}
+
+// Converts HTTP/network status codes into safe, actionable sync errors for the popup.
+function phoneSyncErrorForStatus(status: number): PhoneSyncResponse {
+  if (status === 401) {
+    return { ok: false, code: 'AUTH_REQUIRED', httpStatus: status, error: 'Your PostFlow session has expired. Sign in and try again.' };
+  }
+  if (status === 403) {
+    return { ok: false, code: 'FORBIDDEN', httpStatus: status, error: 'Your account is not allowed to sync phone numbers.' };
+  }
+  if (status === 0) {
+    return { ok: false, code: 'NETWORK_ERROR', httpStatus: status, error: 'Could not reach PostFlow. Check your connection and try again.' };
+  }
+  if (status >= 500) {
+    return { ok: false, code: 'SERVER_ERROR', httpStatus: status, error: 'PostFlow is temporarily unavailable. Your selection is saved for retry.' };
+  }
+  return { ok: false, code: 'API_REJECTED', httpStatus: status, error: 'PostFlow rejected the sync request. Your selection is saved for retry.' };
+}
+
 function createExtensionInstanceId(): string {
   const randomId = globalThis.crypto?.randomUUID?.()
     ?? `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
@@ -59,10 +108,16 @@ async function getExtensionName(): Promise<string> {
     : '';
 }
 
-async function apiFetch(path: string, body?: Record<string, unknown>, method?: string) {
+// Uses shared authentication and URL fallback; detailed failures are opt-in for UI workflows.
+async function apiFetch(
+  path: string,
+  body?: Record<string, unknown>,
+  method?: string,
+  includeFailureDetails = false,
+) {
   if (!path || !path.startsWith('/')) {
     console.warn('[PostFlow] Refusing API call with invalid path:', path);
-    return null;
+    return includeFailureDetails ? { apiFetchError: true, status: 400 } : null;
   }
 
   const [clerkUserId, extensionInstanceId] = await Promise.all([
@@ -71,7 +126,7 @@ async function apiFetch(path: string, body?: Record<string, unknown>, method?: s
   ]);
   if (!clerkUserId) {
     console.warn('[PostFlow] No user ID found — skipping API call:', path);
-    return null;
+    return includeFailureDetails ? { apiFetchError: true, status: 401 } : null;
   }
 
   const httpMethod = method || (body ? 'POST' : 'GET');
@@ -110,7 +165,9 @@ async function apiFetch(path: string, body?: Record<string, unknown>, method?: s
           url,
           response: text.slice(0, 300),
         });
-        return null;
+        return includeFailureDetails
+          ? { apiFetchError: true, status: response.status }
+          : null;
       }
 
       return text ? JSON.parse(text) : null;
@@ -124,7 +181,157 @@ async function apiFetch(path: string, body?: Record<string, unknown>, method?: s
     `[PostFlow] Network error: ${httpMethod} ${urls[0]} (${path}) - ${errorMessage}`,
     lastError,
   );
-  return null;
+  return includeFailureDetails ? { apiFetchError: true, status: 0 } : null;
+}
+
+// Reads persisted review state and submits only selected, valid normalized numbers.
+async function syncPhoneNumbersToBackend(): Promise<PhoneSyncResponse> {
+  const stored = await chrome.storage.local.get('phoneCollectorState');
+  const state = stored.phoneCollectorState as PhoneCollectorState | undefined;
+  const selectedNumbers = Array.from(new Set(
+    (state?.numbers ?? [])
+      .filter((number) =>
+        number.status === 'valid' && number.selected &&
+        typeof number.normalized === 'string' && /^\+[1-9]\d{1,14}$/.test(number.normalized),
+      )
+      .map((number) => number.normalized!),
+  ));
+
+  if (!selectedNumbers.length) {
+    logPhoneSync('warn', 'Sync stopped: no valid numbers are selected.', { code: 'NO_NUMBERS_SELECTED' });
+    return {
+      ok: false,
+      code: 'NO_NUMBERS_SELECTED',
+      error: 'Select at least one valid number before syncing.',
+    };
+  }
+  if (!state?.source || !['facebook', 'generic'].includes(state.source.type) || !state.source.url) {
+    logPhoneSync('error', 'Sync stopped: collection source is missing.', { code: 'INVALID_RESPONSE' });
+    return {
+      ok: false,
+      code: 'INVALID_RESPONSE',
+      error: 'The collection source is missing. Collect the numbers again before syncing.',
+    };
+  }
+
+  logPhoneSync('info', 'Sending selected numbers to PostFlow.', { selected: selectedNumbers.length });
+  const response = await apiFetch(
+    '/api/phone-contacts/sync',
+    { numbers: selectedNumbers, source: state.source },
+    'POST',
+    true,
+  );
+  if (isApiFetchFailure(response)) {
+    const error = phoneSyncErrorForStatus(response.status);
+    logPhoneSync('error', 'PostFlow sync request failed.', {
+      ...(error.code ? { code: error.code } : {}),
+      ...(typeof error.httpStatus === 'number' ? { httpStatus: error.httpStatus } : {}),
+    });
+    return error;
+  }
+  if (!isPhoneSyncResult(response)) {
+    logPhoneSync('error', 'PostFlow returned an unexpected sync result.', { code: 'INVALID_RESPONSE' });
+    return {
+      ok: false,
+      code: 'INVALID_RESPONSE',
+      error: 'PostFlow returned an unexpected sync result. Your selection is saved for retry.',
+    };
+  }
+  logPhoneSync('info', 'Sync response received.', {
+    added: response.added,
+    alreadyExisted: response.alreadyExisted,
+    invalid: response.invalid,
+  });
+  return { ok: true, result: response };
+}
+
+// Locates collector scripts next to the service worker in either extension layout.
+function getPhoneCollectorScriptFiles(): string[] {
+  const background = chrome.runtime.getManifest().background;
+  const serviceWorkerPath = background && "service_worker" in background
+    ? background.service_worker
+    : "";
+  const scriptDirectory = serviceWorkerPath.includes("/")
+    ? serviceWorkerPath.slice(0, serviceWorkerPath.lastIndexOf("/") + 1)
+    : "";
+  return [
+    "libphonenumber-max.js",
+    "phone-collector/phone-extractor.js",
+    "phone-collector/phone-normalizer.js",
+    "phone-collector/content.js",
+  ].map((path) => `${scriptDirectory}${path}`);
+}
+
+// Scans the current HTTP(S) tab by installing the collector into its isolated content context.
+async function collectPhoneNumbersFromActiveTab(): Promise<PhoneCollectionResponse> {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (tab?.id === undefined || !tab.url) {
+      return { ok: false, code: "NO_ACTIVE_TAB", error: "No active page is available." };
+    }
+
+    let pageUrl: URL;
+    try {
+      pageUrl = new URL(tab.url);
+    } catch {
+      return { ok: false, code: "UNSUPPORTED_PAGE", error: "This page cannot be scanned." };
+    }
+    if (pageUrl.protocol !== "http:" && pageUrl.protocol !== "https:") {
+      return {
+        ok: false,
+        code: "UNSUPPORTED_PAGE",
+        error: "Browser pages and local files cannot be scanned.",
+      };
+    }
+
+    let collectorReady = false;
+    try {
+      const ping = await chrome.tabs.sendMessage(tab.id, { type: "PHONE_COLLECTOR_PING" });
+      collectorReady = ping?.collectorReady === true;
+    } catch {
+      // A missing content script is expected on pages where the collector has not run yet.
+    }
+
+    if (!collectorReady) {
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: getPhoneCollectorScriptFiles(),
+        });
+      } catch {
+        return {
+          ok: false,
+          code: "CONTENT_SCRIPT_UNAVAILABLE",
+          error: "Unable to scan this page. Reload it and try again.",
+        };
+      }
+    }
+
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, {
+        type: "PHONE_COLLECTOR_COLLECT",
+      }) as PhoneCollectionResponse | undefined;
+      return response?.ok
+        ? response
+        : {
+            ok: false,
+            code: "COLLECTION_FAILED",
+            error: response?.error ?? "Could not collect numbers from this page.",
+          };
+    } catch {
+      return {
+        ok: false,
+        code: "CONTENT_SCRIPT_UNAVAILABLE",
+        error: "The page collector did not respond. Reload the page and try again.",
+      };
+    }
+  } catch {
+    return {
+      ok: false,
+      code: "COLLECTION_FAILED",
+      error: "Could not access the active page.",
+    };
+  }
 }
 
 async function updateJobStatus(
@@ -440,6 +647,43 @@ chrome.runtime.onConnect.addListener((port) => {
 // ── Session + sync messages ──
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'SYNC_PHONE_NUMBERS') {
+    if (sender.tab) {
+      sendResponse({
+        ok: false,
+        code: 'FORBIDDEN',
+        error: 'Phone sync can only be started from the extension popup.',
+      } satisfies PhoneSyncResponse);
+      return;
+    }
+    void (async () => {
+      try {
+        logPhoneSync('info', 'Sync request received by the extension worker.');
+        const response = await syncPhoneNumbersToBackend();
+        sendResponse(response);
+      } catch {
+        logPhoneSync('error', 'Extension worker could not complete the sync.', { code: 'NETWORK_ERROR' });
+        sendResponse({
+          ok: false,
+          code: 'NETWORK_ERROR',
+          error: 'Could not sync with PostFlow. Your selection is saved for retry.',
+        } satisfies PhoneSyncResponse);
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === 'COLLECT_PHONE_NUMBERS') {
+    void collectPhoneNumbersFromActiveTab()
+      .then(sendResponse)
+      .catch(() => sendResponse({
+        ok: false,
+        code: 'COLLECTION_FAILED',
+        error: 'Could not collect numbers from the active page.',
+      }));
+    return true;
+  }
+
   if (message.type === 'POSTING_LOG' && message.entry) {
     console.log('[PostFlow][posting-log]', message.entry);
     void (async () => {

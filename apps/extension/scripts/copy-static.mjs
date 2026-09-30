@@ -31,6 +31,11 @@ for (const file of files) {
   copyFileSync(source, target);
 }
 
+copyFileSync(
+  resolve("node_modules/libphonenumber-js/bundle/libphonenumber-max.js"),
+  resolve("dist/libphonenumber-max.js"),
+);
+
 writeFileSync(resolve("dist/env.js"),
   `// Generated from ${envFile}; public extension configuration.\nexport const BUILD_ENV = ${JSON.stringify(mode)};\nexport const API_BASE_URL = ${JSON.stringify(API_BASE_URL.replace(/\/+$/, ""))};\n`);
 
