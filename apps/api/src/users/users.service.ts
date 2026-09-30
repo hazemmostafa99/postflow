@@ -129,6 +129,8 @@ export class UsersService {
   async createFromInvitation(data: {
     clerkUserId: string;
     email: string;
+    firstName?: string;
+    lastName?: string;
     role: UserRole;
     teamId?: string | null;
   }) {
@@ -141,9 +143,22 @@ export class UsersService {
     const existing = await this.userModel
       .findOne({ clerkUserId: data.clerkUserId })
       .exec();
-    if (existing) return existing;
+    if (existing) {
+      let changed = false;
+      if (data.firstName?.trim() && existing.firstName !== data.firstName.trim()) {
+        existing.firstName = data.firstName.trim();
+        changed = true;
+      }
+      if (data.lastName?.trim() && existing.lastName !== data.lastName.trim()) {
+        existing.lastName = data.lastName.trim();
+        changed = true;
+      }
+      return changed ? existing.save() : existing;
+    }
     return new this.userModel({
       ...data,
+      firstName: data.firstName?.trim() || undefined,
+      lastName: data.lastName?.trim() || undefined,
       status: UserStatus.ACTIVE,
       teamId:
         data.role === UserRole.ADMIN || data.role === UserRole.MANAGER

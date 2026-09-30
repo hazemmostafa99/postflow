@@ -24,6 +24,9 @@ export class AnalyticsController {
     @Query('from') from?: string,
     @Query('to') to?: string,
     @Query('status') status?: string,
+    @Query('userId') userId?: string,
+    @Query('teamId') teamId?: string,
+    @Query('role') role?: string,
   ) {
     this.requireAnalyticsApiKey(authorization);
     return this.analyticsService.listPosts({
@@ -32,7 +35,43 @@ export class AnalyticsController {
       from,
       to,
       status,
+      userId,
+      teamId,
+      role,
     });
+  }
+
+  @Get('summary')
+  summary(
+    @Headers('authorization') authorization: string | undefined,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('status') status?: string,
+    @Query('userId') userId?: string,
+    @Query('teamId') teamId?: string,
+    @Query('role') role?: string,
+  ) {
+    this.requireAnalyticsApiKey(authorization);
+    return this.analyticsService.summary({
+      from,
+      to,
+      status,
+      userId,
+      teamId,
+      role,
+    });
+  }
+
+  @Get('users')
+  users(@Headers('authorization') authorization: string | undefined) {
+    this.requireAnalyticsApiKey(authorization);
+    return this.analyticsService.listUsers();
+  }
+
+  @Get('teams')
+  teams(@Headers('authorization') authorization: string | undefined) {
+    this.requireAnalyticsApiKey(authorization);
+    return this.analyticsService.listTeams();
   }
 
   @Get('posts/:id')

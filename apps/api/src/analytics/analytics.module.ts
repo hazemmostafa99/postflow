@@ -9,6 +9,7 @@ import {
   PublishingJobSchema,
 } from '../schemas/publishing-job.schema';
 import { User, UserSchema } from '../schemas/user.schema';
+import { Team, TeamSchema } from '../schemas/team.schema';
 
 @Module({
   imports: [
@@ -17,6 +18,7 @@ import { User, UserSchema } from '../schemas/user.schema';
       { name: PublishingJob.name, schema: PublishingJobSchema },
       { name: Group.name, schema: GroupSchema },
       { name: User.name, schema: UserSchema },
+      { name: Team.name, schema: TeamSchema },
     ]),
   ],
   controllers: [AnalyticsController],

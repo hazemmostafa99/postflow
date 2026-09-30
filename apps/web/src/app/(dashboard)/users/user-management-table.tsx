@@ -4,7 +4,15 @@ import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 
 type Team = { _id: string; name: string };
-type User = { _id: string; email?: string; role: string; status: string; teamId?: string | null };
+type User = {
+  _id: string;
+  email?: string;
+  firstName?: string;
+  lastName?: string;
+  role: string;
+  status: string;
+  teamId?: string | null;
+};
 
 const ROLES = ["ADMIN", "MANAGER", "TEAM_LEADER", "SALES"];
 const STATUSES = ["ACTIVE", "DISABLED"];
@@ -31,7 +39,8 @@ export function UserManagementTable({ users, teams }: { users: User[]; teams: Te
   const filteredUsers = useMemo(() => {
     const query = search.trim().toLowerCase();
     return users.filter((user) => {
-      const matchesSearch = !query || (user.email ?? "").toLowerCase().includes(query) || teamName(user.teamId, teams).toLowerCase().includes(query);
+      const name = userFullName(user).toLowerCase();
+      const matchesSearch = !query || name.includes(query) || (user.email ?? "").toLowerCase().includes(query) || teamName(user.teamId, teams).toLowerCase().includes(query);
       const matchesRole = roleFilter === "ALL" || user.role === roleFilter;
       return matchesSearch && matchesRole;
     });
@@ -94,6 +103,7 @@ function UserRow({ user, teams }: { user: User; teams: Team[] }) {
   const [isSaving, setIsSaving] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const requiresTeam = TEAM_ROLES.has(role);
+  const displayName = userFullName(user);
 
   async function save() {
     setIsSaving(true);
@@ -113,7 +123,7 @@ function UserRow({ user, teams }: { user: User; teams: Team[] }) {
   }
 
   async function deleteUser() {
-    if (!confirm(`Delete ${user.email ?? "this user"} from PostFlow?`)) return;
+    if (!confirm(`Delete ${displayName || user.email || "this user"} from PostFlow?`)) return;
     setIsDeleting(true);
     setMessage("");
     try {
@@ -129,7 +139,10 @@ function UserRow({ user, teams }: { user: User; teams: Team[] }) {
   return (
     <tr className="align-top">
       <td className="px-4 py-3">
-        <p className="font-medium">{user.email ?? "Unknown email"}</p>
+        <p className="font-medium">{displayName || user.email || "Unknown user"}</p>
+        {displayName && user.email && (
+          <p className="mt-0.5 text-xs text-muted-foreground">{user.email}</p>
+        )}
         {message && <p className="mt-1 text-xs text-muted-foreground">{message}</p>}
       </td>
       <td className="px-4 py-3">
@@ -181,4 +194,11 @@ function statusLabel(status: string) {
 function teamName(teamId: string | null | undefined, teams: Team[]) {
   if (!teamId) return "";
   return teams.find((team) => team._id === teamId)?.name ?? "";
+}
+
+function userFullName(user: Pick<User, "firstName" | "lastName">) {
+  return [user.firstName, user.lastName]
+    .map((part) => part?.trim())
+    .filter(Boolean)
+    .join(" ");
 }

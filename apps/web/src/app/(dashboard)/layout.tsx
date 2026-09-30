@@ -24,11 +24,15 @@ export default async function DashboardLayout({
     return null;
   });
   const email = user?.primaryEmailAddress?.emailAddress ?? user?.emailAddresses[0]?.emailAddress;
+  const firstName = user?.firstName ?? undefined;
+  const lastName = user?.lastName ?? undefined;
 
   const accessResponse = await fetch(`${API_BASE}/api/auth/me`, {
     headers: {
       "x-clerk-user-id": clerkUserId,
       ...(email ? { "x-clerk-user-email": email } : {}),
+      ...(firstName ? { "x-clerk-user-first-name": firstName } : {}),
+      ...(lastName ? { "x-clerk-user-last-name": lastName } : {}),
     },
     cache: "no-store",
   });

@@ -126,6 +126,8 @@ export class InvitationsService {
     invitationId: string;
     clerkUserId: string;
     email: string;
+    firstName?: string;
+    lastName?: string;
   }) {
     const invitation = await this.invitationModel
       .findById(data.invitationId)
@@ -142,6 +144,8 @@ export class InvitationsService {
     const user = await this.users.createFromInvitation({
       clerkUserId: data.clerkUserId,
       email: invitation.email,
+      firstName: data.firstName,
+      lastName: data.lastName,
       role: invitation.role,
       teamId: invitation.teamId,
     });

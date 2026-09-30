@@ -46,7 +46,14 @@ export class InvitationsController {
   @Post('accept')
   accept(
     @Headers('x-postflow-internal-secret') secret: string,
-    @Body() body: { invitationId: string; clerkUserId: string; email: string },
+    @Body()
+    body: {
+      invitationId: string;
+      clerkUserId: string;
+      email: string;
+      firstName?: string;
+      lastName?: string;
+    },
   ) {
     if (
       !process.env.INVITATION_ACCEPT_SECRET ||

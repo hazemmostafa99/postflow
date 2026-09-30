@@ -1,7 +1,7 @@
 import { auth } from "@clerk/nextjs/server";
 import { redirect } from "next/navigation";
 import Link from "next/link";
-import { AlertCircle, ArrowRight, Clock, FileText, Image as ImageIcon, Users } from "lucide-react";
+import { AlertCircle, ArrowRight, Clock, FileText, Image as ImageIcon, UserRound, Users } from "lucide-react";
 import { NewPostDialog } from "@/components/new-post-dialog";
 import { ScheduledTime } from "@/components/scheduled-time";
 import { PostControlButtons } from "@/components/post-control-buttons";
@@ -25,6 +25,17 @@ interface Post {
   mediaCount: number;
   status: string;
   createdAt: string;
+  createdBy?: {
+    clerkUserId: string;
+    userId?: string;
+    firstName?: string;
+    lastName?: string;
+    fullName?: string;
+    email?: string;
+    role?: string;
+    status?: string;
+    teamId?: string | null;
+  };
   jobs: Job[];
 }
 
@@ -178,6 +189,10 @@ function getScheduledTime(jobs: Job[]): string | undefined {
     .sort((left, right) => new Date(left).getTime() - new Date(right).getTime())[0];
 }
 
+function getCreatorLabel(createdBy?: Post["createdBy"]): string {
+  return createdBy?.fullName || createdBy?.email || createdBy?.clerkUserId || "Unknown";
+}
+
 export const metadata = {
   title: "Posts - PostFlow",
   description: "Manage and track your published Facebook Group posts.",
@@ -233,6 +248,7 @@ export default async function PostsPage({
               <thead>
                 <tr className="border-b border-border bg-muted/60">
                   <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-normal text-muted-foreground">Content</th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-normal text-muted-foreground">Created by</th>
                   <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-normal text-muted-foreground">Groups</th>
                   <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-normal text-muted-foreground">Status</th>
                   <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-normal text-muted-foreground">Created</th>
@@ -259,6 +275,15 @@ export default async function PostsPage({
                             <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                             <span className="line-clamp-2">{failureReason}</span>
                           </div>
+                        )}
+                      </td>
+                      <td className="max-w-[180px] px-4 py-4">
+                        <div className="flex min-w-0 items-center gap-1.5 text-muted-foreground">
+                          <UserRound className="h-3.5 w-3.5 shrink-0" />
+                          <span className="truncate">{getCreatorLabel(post.createdBy)}</span>
+                        </div>
+                        {post.createdBy?.role && (
+                          <span className="mt-1 block text-xs text-muted-foreground/75">{post.createdBy.role}</span>
                         )}
                       </td>
                       <td className="px-4 py-4">

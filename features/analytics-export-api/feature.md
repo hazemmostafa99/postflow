@@ -42,9 +42,160 @@ limit      optional, default 100, max 500
 from       optional ISO date, filters post createdAt >= from
 to         optional ISO date, filters post createdAt <= to
 status     optional Post.status
+userId     optional PostFlow user id
+teamId     optional PostFlow team id
+role       optional creator role
 ```
 
 The endpoint returns all posts across all users, newest first.
+Creator filters are resolved through `User` records and then applied to
+`Post.clerkUserId`. If a creator filter matches no users, the response is an
+empty result set.
+
+Date-only filters are interpreted as full UTC days:
+
+```text
+from=2026-09-29 -> 2026-09-29T00:00:00.000Z
+to=2026-09-29   -> 2026-09-29T23:59:59.999Z
+```
+
+## Summary Endpoint
+
+```http
+GET /api/analytics/summary
+```
+
+Supported query parameters:
+
+```text
+from
+to
+status
+userId
+teamId
+role
+```
+
+The summary endpoint uses the same filter semantics as
+`GET /api/analytics/posts`.
+
+```ts
+type AnalyticsMetricBucket = {
+  posts: number;
+  targets: number;
+  pending: number;
+  running: number;
+  success: number;
+  failed: number;
+  canceled: number;
+  published: number;
+  pendingApproval: number;
+  unknownSubmission: number;
+  reactions: number;
+  comments: number;
+};
+
+type AnalyticsSummaryResponse = {
+  filters: {
+    from?: string;
+    to?: string;
+    status?: string;
+    userId?: string;
+    teamId?: string;
+    role?: string;
+  };
+  totals: AnalyticsMetricBucket;
+  byStatus: Record<string, number>;
+  byCreator: Array<{
+    id: string | null;
+    firstName?: string;
+    lastName?: string;
+    fullName?: string;
+    name?: string;
+    creatorMissing?: boolean;
+    email?: string;
+    role?: string;
+    status?: string;
+    teamId?: string | null;
+    team?: {
+      id: string;
+      name: string;
+      managerId?: string;
+    };
+  } & AnalyticsMetricBucket>;
+  byTeam: Array<{
+    teamId: string | null;
+    teamName?: string;
+    team?: {
+      id: string;
+      name: string;
+      managerId?: string;
+    };
+  } & AnalyticsMetricBucket>;
+};
+```
+
+## Reference Data Endpoints
+
+These endpoints let an external analytics backend build filter controls without
+calling admin APIs.
+
+```http
+GET /api/analytics/users
+GET /api/analytics/teams
+```
+
+Both use the same analytics API key authentication.
+
+Users response:
+
+```ts
+type AnalyticsUsersResponse = {
+  users: Array<{
+    id: string;
+    firstName?: string;
+    lastName?: string;
+    fullName?: string;
+    email?: string;
+    role?: string;
+    status?: string;
+    teamId?: string | null;
+    team?: {
+      id: string;
+      name: string;
+      managerId?: string;
+    };
+  }>;
+};
+```
+
+Teams response:
+
+```ts
+type AnalyticsTeamsResponse = {
+  teams: Array<{
+    id: string;
+    name: string;
+    managerId?: string;
+    manager?: {
+      id: string;
+      firstName?: string;
+      lastName?: string;
+      fullName?: string;
+      email?: string;
+    };
+    memberCount: number;
+    salesCount: number;
+    teamLeader?: {
+      id: string;
+      firstName?: string;
+      lastName?: string;
+      fullName?: string;
+      email?: string;
+    };
+  }>;
+};
+```
 
 ## Response Shape
 
@@ -72,13 +223,20 @@ type AnalyticsPost = {
   updatedAt?: string;
 
   createdBy: {
-    clerkUserId: string;
-    userId?: string;
+    id: string;
+    firstName?: string;
+    lastName?: string;
+    fullName?: string;
     email?: string;
     role?: string;
     status?: string;
     teamId?: string | null;
-  };
+    team?: {
+      id: string;
+      name: string;
+      managerId?: string;
+    };
+  } | null;
 
   totals: {
     targetCount: number;
@@ -160,14 +318,29 @@ The analytics API should join that value to:
 User.clerkUserId
 ```
 
-If a matching user exists, include email, role, status, and team id.
-
-If no matching user exists, still return the post with:
+If a matching user exists, include name, email, role, status, and team id.
+Use the PostFlow user id as the only public analytics user identifier:
 
 ```ts
-createdBy: {
-  clerkUserId: post.clerkUserId
+createdBy.id = User._id
+```
+
+Do not expose Clerk user ids in analytics responses or analytics filters.
+
+If the matching user belongs to a team, include readable team data:
+
+```ts
+createdBy.team = {
+  id: User.teamId,
+  name: Team.name,
+  managerId?: Team.managerId
 }
+```
+
+If no matching user exists, still return the post with a null creator:
+
+```ts
+createdBy: null
 ```
 
 ## Optional Endpoint
@@ -237,6 +410,7 @@ The module should inject:
 ### Phase 3 - Filtering
 
 - Add `from`, `to`, and `status`.
+- Add creator filters: `userId`, `teamId`, and `role`.
 - Validate dates.
 - Keep pagination stable with `{ createdAt: -1, _id: -1 }`.
 
@@ -254,6 +428,22 @@ The module should inject:
 - Test missing creator fallback.
 - Test aggregate engagement totals.
 - Test pagination metadata.
+
+### Phase 6 - Summary
+
+- Add `GET /api/analytics/summary`.
+- Reuse the same filter semantics as the posts export.
+- Return global totals.
+- Return counts by post status.
+- Return rollups by creator.
+- Return rollups by team.
+
+### Phase 7 - Reference Data
+
+- Add `GET /api/analytics/users`.
+- Add `GET /api/analytics/teams`.
+- Return minimal filter/display data only.
+- Do not expose Clerk IDs.
 
 ## Example Request
 
@@ -274,12 +464,19 @@ Authorization: Bearer pf_live_...
       "status": "COMPLETED",
       "createdAt": "2026-09-29T00:00:00.000Z",
       "createdBy": {
-        "clerkUserId": "user_123",
-        "userId": "mongo_user_id",
+        "id": "mongo_user_id",
+        "firstName": "Sara",
+        "lastName": "Ahmed",
+        "fullName": "Sara Ahmed",
         "email": "person@company.com",
         "role": "SALES",
         "status": "ACTIVE",
-        "teamId": "team_id"
+        "teamId": "team_id",
+        "team": {
+          "id": "team_id",
+          "name": "Cairo Sales",
+          "managerId": "manager_user_id"
+        }
       },
       "totals": {
         "targetCount": 2,

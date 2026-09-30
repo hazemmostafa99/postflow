@@ -16,6 +16,12 @@
       <span class="page-status" id="status">Checking...</span>
     </header>
 
+    <div class="view-tabs" role="tablist" aria-label="PostFlow views">
+      <button class="view-tab active" id="dashboard-tab" type="button" role="tab" aria-selected="true" aria-controls="dashboard-view" tabindex="0">Groups</button>
+      <button class="view-tab" id="phone-collector-tab" type="button" role="tab" aria-selected="false" aria-controls="phone-collector-view" tabindex="-1">Phone Collector</button>
+    </div>
+
+    <section id="dashboard-view" role="tabpanel" aria-labelledby="dashboard-tab">
     <section class="identity-panel" aria-label="Extension profile name">
       <div class="identity-summary">
         <div class="identity-avatar" aria-hidden="true">PF</div>
@@ -98,7 +104,66 @@
         <span>Not synced <strong id="not-synced-count">0</strong></span>
       </div>
     </section>
+    </section>
+
+    <section id="phone-collector-view" class="phone-collector-view" role="tabpanel" aria-labelledby="phone-collector-tab" hidden>
+      <section class="collector-page" aria-label="Current page">
+        <div class="section-heading">
+          <div class="page-copy">
+            <p class="eyebrow">Current page</p>
+            <h2 id="collector-page-title">Checking active tab...</h2>
+            <p class="collector-page-url" id="collector-page-url"></p>
+          </div>
+        </div>
+        <button class="primary-button collect-button" id="collect-numbers" type="button">Collect Numbers</button>
+      </section>
+
+      <p class="collector-status" id="collector-status" aria-live="polite">Ready to collect.</p>
+
+      <p class="eyebrow collector-summary-label">Collection totals</p>
+      <section class="collector-summary" aria-label="Collection summary">
+        <div><strong id="phone-found-count">0</strong><span>Found</span></div>
+        <div><strong id="phone-valid-count">0</strong><span>Valid</span></div>
+        <div><strong id="phone-duplicate-count">0</strong><span>Duplicates</span></div>
+        <div><strong id="phone-invalid-count">0</strong><span>Invalid</span></div>
+      </section>
+
+      <section class="review-section" aria-label="Phone number review">
+        <div class="review-toolbar">
+          <span><strong id="selected-phone-count">0</strong> selected</span>
+          <div>
+            <button class="text-button" id="select-all-phones" type="button">Select all</button>
+            <button class="text-button" id="clear-phone-selection" type="button">Clear</button>
+          </div>
+        </div>
+        <p class="review-empty" id="phone-review-empty">Numbers you collect will appear here.</p>
+        <div class="phone-review-list" id="phone-review-list" aria-live="polite"></div>
+        <button class="primary-button sync-phone-button" id="send-phone-numbers" type="button" disabled>Send 0 to PostFlow</button>
+        <section class="sync-result" id="phone-sync-result" aria-live="polite" hidden>
+          <h2 id="phone-sync-result-title">Sync complete</h2>
+          <div class="sync-result-grid">
+            <div><strong id="sync-submitted-count">0</strong><span>Submitted</span></div>
+            <div><strong id="sync-added-count">0</strong><span>Added</span></div>
+            <div><strong id="sync-existing-count">0</strong><span>Already existed</span></div>
+            <div><strong id="sync-invalid-count">0</strong><span>Invalid</span></div>
+            <div><strong id="sync-duplicate-count">0</strong><span>Duplicates</span></div>
+          </div>
+        </section>
+      </section>
+    </section>
+
+    <dialog class="sync-confirmation" id="phone-sync-confirmation" aria-labelledby="phone-sync-confirmation-title">
+      <p class="eyebrow">Confirm sync</p>
+      <h2 id="phone-sync-confirmation-title">Send numbers to PostFlow?</h2>
+      <p class="sync-confirmation-copy">You are about to send <strong id="confirm-selected-count">0</strong> selected phone numbers.</p>
+      <div class="sync-dialog-actions">
+        <button class="secondary-button" id="cancel-phone-sync" type="button">Cancel</button>
+        <button class="primary-button" id="confirm-phone-sync" type="button">Confirm &amp; Sync</button>
+      </div>
+    </dialog>
   </main>
+  <script src="../libphonenumber-max.js"></script>
+  <script src="../phone-collector/phone-normalizer.js"></script>
   <script src="./popup.js"></script>
 </body>
 </html>
