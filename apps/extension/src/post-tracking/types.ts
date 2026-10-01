@@ -87,6 +87,7 @@ type PendingPostSyncResult =
 interface PublishedFacebookPost {
   id: string;
   status: "PUBLISHED";
+  targetType?: "GROUP" | "PROFILE_FEED";
   postUrl: string;
   lastEngagementSyncAt?: string;
 }
@@ -100,4 +101,4 @@ interface FacebookPostEngagement {
 type PostEngagementSyncResult =
   | { status: "SUCCESS"; reactionCount: number; commentCount: number }
   | { status: "PARTIAL"; reactionCount?: number; commentCount?: number; reason?: string }
-  | { status: "CHECK_FAILED"; reason?: string };
+  | { status: "CHECK_FAILED"; reason?: string; emptySurface?: boolean };

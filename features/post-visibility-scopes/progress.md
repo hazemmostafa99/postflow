@@ -6,7 +6,7 @@ Apply role-based post visibility:
 
 ```text
 ADMIN       -> ALL
-MANAGER     -> MANAGED_TEAMS
+MANAGER     -> ALL
 TEAM_LEADER -> DIRECT_TEAM
 SALES       -> OWN
 ```
@@ -22,7 +22,7 @@ SALES       -> OWN
 ## Checklist
 
 - [x] Define role-to-scope mapping.
-- [x] Define manager team ownership rule.
+- [x] Define manager all-post visibility rule.
 - [x] Define team leader direct-team rule.
 - [x] Define sales own-post rule.
 - [x] Confirm no schema change is required.
@@ -68,8 +68,7 @@ Implementation:
 - PostsService now resolves the active PostFlow user before post reads and
   post-level mutations.
 - ADMIN receives an unscoped post filter.
-- MANAGER receives posts from members of teams where `Team.managerId` matches
-  the manager user's database id.
+- MANAGER receives all posts in the company, like ADMIN.
 - TEAM_LEADER receives posts from members with the same `teamId`.
 - SALES receives only posts where `Post.clerkUserId` matches the authenticated
   Clerk user.
@@ -81,6 +80,7 @@ Tests/checks:
 
 Known limitations:
 - Focused automated scope tests are not added yet.
+- The manager scope update to `ALL` has not been covered by an automated test.
 ```
 
 ---
@@ -92,7 +92,7 @@ Known limitations:
 - [x] Run API build.
 - [ ] Add or update focused tests if practical.
 - [ ] Verify admin filter is unscoped.
-- [ ] Verify manager filter uses managed team members.
+- [ ] Verify manager filter is unscoped.
 - [ ] Verify team leader filter uses direct team members.
 - [ ] Verify sales filter uses own posts only.
 

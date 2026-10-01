@@ -108,11 +108,17 @@
   }
 
   function extractNetworkMetadata(text: string): { videoIds: string[]; uploadSessionIds: string[] } {
+    let normalized = text.replace(/\\"/g, '"');
+    try {
+      normalized = decodeURIComponent(normalized.replace(/\+/g, ' '));
+    } catch {
+      // Responses are not URL encoded; use the original normalized text.
+    }
     const videoIds = Array.from(new Set(
-      Array.from(text.matchAll(/"video_id"\s*:\s*"(\d+)"/g), (match) => match[1]),
+      Array.from(normalized.matchAll(/"video_id"\s*:\s*"(\d+)"/g), (match) => match[1]),
     ));
     const uploadSessionIds = Array.from(new Set(
-      Array.from(text.matchAll(/"upload_session_id"\s*:\s*"(\d+)"/g), (match) => match[1]),
+      Array.from(normalized.matchAll(/"upload_session_id"\s*:\s*"(\d+)"/g), (match) => match[1]),
     ));
     return { videoIds, uploadSessionIds };
   }
@@ -130,8 +136,21 @@
     return "";
   }
 
+  function isStoryCreateRequest(requestText: string): boolean {
+    if (!requestText) return false;
+    let decoded = requestText.replace(/\+/g, ' ');
+    try {
+      decoded = decodeURIComponent(decoded);
+    } catch {
+      // The body may be only partially URL encoded; inspect it as-is.
+    }
+    return /(?:Comet)?ComposerStoryCreateMutation|story_create/i.test(decoded);
+  }
+
   function publishCandidates(detail: {
     requestUrl?: string;
+    requestStartedAt?: number;
+    isStoryCreateResponse?: boolean;
     postUrls?: string[];
     storyFbids?: string[];
     videoIds?: string[];
@@ -152,15 +171,46 @@
     }, "*");
   }
 
-  function processText(text: string, requestUrl = ''): void {
-    const postUrls = extractPostUrls(text);
-    const storyFbids = text.includes('"story_create"')
+  function processText(
+    text: string,
+    requestUrl = '',
+    requestStartedAt = Date.now(),
+    requestWasStoryCreate = false,
+    requestMetadata: { videoIds: string[]; uploadSessionIds: string[] } = {
+      videoIds: [],
+      uploadSessionIds: [],
+    },
+  ): void {
+    const hasStoryCreatePayload = text.includes('"story_create"');
+    const requestCompletedWithoutGraphQLErrors = requestWasStoryCreate &&
+      !/"errors"\s*:/.test(text);
+    const isStoryCreateResponse = hasStoryCreatePayload || requestCompletedWithoutGraphQLErrors;
+    // General feed responses contain many historical permalinks. They are not
+    // publication evidence, even when one happens to belong to the target.
+    const postUrls = isStoryCreateResponse ? extractPostUrls(text) : [];
+    const storyFbids = isStoryCreateResponse
       ? Array.from(new Set(
         Array.from(text.matchAll(/"feed_fbids"\s*:\s*\[\s*"(\d+)"/g), (match) => match[1]),
       ))
       : [];
-    const metadata = extractNetworkMetadata(text);
-    publishCandidates({ requestUrl, postUrls, storyFbids, ...metadata });
+    const responseMetadata = extractNetworkMetadata(text);
+    const metadata = isStoryCreateResponse
+      ? {
+          videoIds: Array.from(new Set([...requestMetadata.videoIds, ...responseMetadata.videoIds])),
+          uploadSessionIds: Array.from(new Set([
+            ...requestMetadata.uploadSessionIds,
+            ...responseMetadata.uploadSessionIds,
+          ])),
+        }
+      : responseMetadata;
+    publishCandidates({
+      requestUrl,
+      requestStartedAt,
+      isStoryCreateResponse,
+      postUrls,
+      storyFbids,
+      ...metadata,
+    });
     if (requestUrl && !requestUrl.includes("/api/graphql")) return;
 
     // Facebook may return multiple JSON objects in a single response body
@@ -187,13 +237,17 @@
 
   window.addEventListener('postflow:graphql-text', ((e: CustomEvent<string>) => {
     if (typeof e.detail === 'string') {
-      processText(e.detail);
+      // This legacy bridge does not carry the originating request time. Keep
+      // it available for group discovery, but make it ineligible as publish
+      // evidence for any active submission.
+      processText(e.detail, '', 0);
     }
   }) as EventListener);
 
   const originalFetch = window.fetch.bind(window);
 
   window.fetch = async function (...args: Parameters<typeof fetch>) {
+    const requestStartedAt = Date.now();
     const response = await originalFetch(...args);
 
     try {
@@ -205,13 +259,22 @@
           : "";
       const requestBody = args[1]?.body ?? (args[0] instanceof Request ? getBodyText(args[0].body) : "");
       const requestText = getBodyText(requestBody);
+      const requestWasStoryCreate = isStoryCreateRequest(requestText);
+      const requestMetadata = extractNetworkMetadata(requestText);
       if (requestText) {
-        const metadata = extractNetworkMetadata(requestText);
-        publishCandidates({ requestUrl: url, ...metadata });
+        publishCandidates({ requestUrl: url, ...requestMetadata });
       }
 
       if (url.includes("facebook.com") || url.startsWith("/")) {
-        response.clone().text().then((text) => processText(text, url)).catch(() => {});
+        response.clone().text()
+          .then((text) => processText(
+            text,
+            url,
+            requestStartedAt,
+            requestWasStoryCreate,
+            requestMetadata,
+          ))
+          .catch(() => {});
       }
     } catch {
       // never break the original response
@@ -234,15 +297,23 @@
   };
 
   proto.send = function (body?: unknown) {
+    const requestStartedAt = Date.now();
     const requestText = getBodyText(body);
+    const requestWasStoryCreate = isStoryCreateRequest(requestText);
+    const requestMetadata = extractNetworkMetadata(requestText);
     if (requestText) {
-      const metadata = extractNetworkMetadata(requestText);
-      publishCandidates({ requestUrl: this._postflow_url ?? '', ...metadata });
+      publishCandidates({ requestUrl: this._postflow_url ?? '', ...requestMetadata });
     }
     if (this._postflow_url?.includes("facebook.com") || this._postflow_url?.startsWith("/")) {
       this.addEventListener("load", () => {
         try {
-          processText(this.responseText, this._postflow_url ?? '');
+          processText(
+            this.responseText,
+            this._postflow_url ?? '',
+            requestStartedAt,
+            requestWasStoryCreate,
+            requestMetadata,
+          );
         } catch {
           // ignore
         }

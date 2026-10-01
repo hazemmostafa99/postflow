@@ -11,6 +11,7 @@ import {
   PublishingJob,
   PublishingJobDocument,
   PublishingJobStatus,
+  PublishingTargetType,
 } from '../schemas/publishing-job.schema';
 import { User, UserDocument } from '../schemas/user.schema';
 import { Team, TeamDocument } from '../schemas/team.schema';
@@ -54,6 +55,12 @@ type LeanGroup = {
   externalId?: string;
 };
 
+type LeanConnection = {
+  _id: Types.ObjectId;
+  displayName?: string;
+  facebookUserId?: string;
+};
+
 type LeanTeam = {
   _id: Types.ObjectId;
   name: string;
@@ -63,7 +70,9 @@ type LeanTeam = {
 type LeanJob = {
   _id: Types.ObjectId;
   postId: Types.ObjectId | { _id: Types.ObjectId };
+  targetType?: PublishingTargetType;
   groupId?: Types.ObjectId | LeanGroup;
+  facebookConnectionId?: Types.ObjectId | LeanConnection;
   status: string;
   error?: string;
   submissionStatus?: FacebookSubmissionStatus;
@@ -400,6 +409,10 @@ export class AnalyticsService {
         .where('postId')
         .in(postIds)
         .populate<{ groupId?: LeanGroup }>('groupId', 'name url externalId')
+        .populate<{ facebookConnectionId?: LeanConnection }>(
+          'facebookConnectionId',
+          'displayName facebookUserId',
+        )
         .lean<LeanJob[]>()
         .exec(),
     ]);
@@ -550,8 +563,21 @@ function isPopulatedGroup(value: unknown): value is LeanGroup {
   );
 }
 
+function isPopulatedConnection(value: unknown): value is LeanConnection {
+  return Boolean(
+    value &&
+    typeof value === 'object' &&
+    '_id' in value &&
+    !(value instanceof Types.ObjectId),
+  );
+}
+
 function serializeTarget(job: LeanJob) {
   const group = isPopulatedGroup(job.groupId) ? job.groupId : undefined;
+  const connection = isPopulatedConnection(job.facebookConnectionId)
+    ? job.facebookConnectionId
+    : undefined;
+  const targetType = job.targetType ?? PublishingTargetType.GROUP;
   const engagement =
     job.engagement &&
     (job.engagement.reactionCount !== undefined ||
@@ -572,12 +598,27 @@ function serializeTarget(job: LeanJob) {
 
   return {
     jobId: job._id.toString(),
+    targetType,
     ...(group
       ? {
           groupId: group._id.toString(),
           ...(group.name ? { groupName: group.name } : {}),
           ...(group.url ? { groupUrl: group.url } : {}),
           ...(group.externalId ? { groupExternalId: group.externalId } : {}),
+        }
+      : {}),
+    ...(targetType === PublishingTargetType.PROFILE_FEED
+      ? {
+          ...(connection
+            ? {
+                facebookConnectionId: connection._id.toString(),
+                connectionName:
+                  connection.displayName ??
+                  (connection.facebookUserId
+                    ? `Facebook ending ${connection.facebookUserId.slice(-4)}`
+                    : 'Facebook profile'),
+              }
+            : { connectionName: 'Facebook profile' }),
         }
       : {}),
     status: job.status,

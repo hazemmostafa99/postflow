@@ -80,6 +80,8 @@ let activeJobId: string | null = null;
 
 interface FacebookResponseCandidateDetail {
   requestUrl?: string;
+  requestStartedAt?: unknown;
+  isStoryCreateResponse?: unknown;
   postUrls?: unknown[];
   storyFbids?: unknown[];
   videoIds?: unknown[];
@@ -92,6 +94,7 @@ interface PublishTrackingCandidate {
   source: PublishCandidateSource;
   value: string;
   requestUrl?: string;
+  requestStartedAt?: number;
   observedAt: number;
 }
 
@@ -152,21 +155,31 @@ function addPublishCandidate(
   source: PublishCandidateSource,
   value: string,
   requestUrl?: string,
+  requestStartedAt?: number,
 ): void {
   const key = `${source}:${value}`;
   if (session.candidateKeys.has(key)) return;
   session.candidateKeys.add(key);
-  session.candidates.push({ source, value, requestUrl, observedAt: Date.now() });
+  session.candidates.push({ source, value, requestUrl, requestStartedAt, observedAt: Date.now() });
 }
 
 function trackFacebookResponseCandidates(detail: FacebookResponseCandidateDetail): void {
+  if (activeProfileTrackingSession) {
+    trackProfileResponseCandidates(detail);
+    return;
+  }
   const session = activePublishTrackingSession;
   if (!session) return;
 
-  const postUrls = Array.isArray(detail.postUrls)
+  const isActivePublishResponse = isResponseForActivePublish(
+    detail,
+    session.acceptCandidatesAfter,
+  );
+
+  const postUrls = isActivePublishResponse && Array.isArray(detail.postUrls)
     ? detail.postUrls.filter((url): url is string => typeof url === 'string')
     : [];
-  const storyFbids = Array.isArray(detail.storyFbids)
+  const storyFbids = isActivePublishResponse && Array.isArray(detail.storyFbids)
     ? detail.storyFbids.filter((value): value is string => typeof value === 'string' && /^\d+$/.test(value))
     : [];
   const videoIds = Array.isArray(detail.videoIds)
@@ -177,7 +190,9 @@ function trackFacebookResponseCandidates(detail: FacebookResponseCandidateDetail
     : [];
 
   if (!session.hasVideo) {
-    for (const postUrl of postUrls) addPublishCandidate(session, 'response-post-url', postUrl, detail.requestUrl);
+    for (const postUrl of postUrls) {
+      addPublishCandidate(session, 'response-post-url', postUrl, detail.requestUrl, detail.requestStartedAt as number);
+    }
   } else if (postUrls.length) {
     const currentPageGroupId = extractFacebookGroupIdFromUrl(location.href)?.toLowerCase();
     const sameGroupPostUrls = postUrls.filter((postUrl) => {
@@ -194,7 +209,9 @@ function trackFacebookResponseCandidates(detail: FacebookResponseCandidateDetail
         return false;
       }
     });
-    for (const postUrl of sameGroupPostUrls) addPublishCandidate(session, 'response-post-url', postUrl, detail.requestUrl);
+    for (const postUrl of sameGroupPostUrls) {
+      addPublishCandidate(session, 'response-post-url', postUrl, detail.requestUrl, detail.requestStartedAt as number);
+    }
     console.log('[PostTracking] Ignoring direct network post URLs during video publish', {
       jobId: session.jobId,
       ignoredPostUrlCount: postUrls.length - sameGroupPostUrls.length,
@@ -203,7 +220,9 @@ function trackFacebookResponseCandidates(detail: FacebookResponseCandidateDetail
       requestUrl: detail.requestUrl,
     });
   }
-  for (const storyFbid of storyFbids) addPublishCandidate(session, 'response-story-fbid', storyFbid, detail.requestUrl);
+  for (const storyFbid of storyFbids) {
+    addPublishCandidate(session, 'response-story-fbid', storyFbid, detail.requestUrl, detail.requestStartedAt as number);
+  }
   for (const videoId of videoIds) session.mediaVideoIds.add(videoId);
   for (const uploadSessionId of uploadSessionIds) session.uploadSessionIds.add(uploadSessionId);
 
@@ -223,6 +242,7 @@ function getBestNetworkPostUrl(session: PublishTrackingSession): string | null {
   for (let index = session.candidates.length - 1; index >= 0; index--) {
     const candidate = session.candidates[index];
     if (candidate.observedAt < session.acceptCandidatesAfter) continue;
+    if (candidate.requestStartedAt === undefined || candidate.requestStartedAt < session.acceptCandidatesAfter) continue;
     const candidateUrl = candidate.source === 'response-story-fbid' && session.groupId
       ? 'https://www.facebook.com/groups/' + session.groupId + '/posts/' + candidate.value + '/'
       : candidate.value;
@@ -276,6 +296,7 @@ function getBestNetworkPendingPostUrl(session: PublishTrackingSession): string |
   for (let index = session.candidates.length - 1; index >= 0; index--) {
     const candidate = session.candidates[index];
     if (candidate.observedAt < session.acceptCandidatesAfter) continue;
+    if (candidate.requestStartedAt === undefined || candidate.requestStartedAt < session.acceptCandidatesAfter) continue;
     if (candidate.source !== 'response-post-url') continue;
     const normalizedCandidate = normalizeTrackedPostUrl(candidate.value);
     if (!normalizedCandidate || !/\/pending_posts\//i.test(normalizedCandidate)) continue;
@@ -754,6 +775,23 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'GET_PROFILE_VIDEO_NOTIFICATIONS') {
+    const notifications = getProcessedProfileVideoNotifications();
+    const surfaceReady = location.pathname.startsWith('/notifications') && Boolean(
+      document.querySelector(
+        '[role="main"], [role="complementary"], [role="list"], ' +
+        'a[href*="notif_t=fb_shorts_video_processed"]',
+      ),
+    );
+    console.log('[PostFlow] Processed profile-video notifications scanned', {
+      jobId: message.jobId,
+      count: notifications.length,
+      surfaceReady,
+    });
+    sendResponse({ ok: true, surfaceReady, notifications });
+    return;
+  }
+
   if (message.type === 'CHECK_PENDING_POST') {
     void (async () => {
       try {
@@ -817,6 +855,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse({
           ok: true,
           result,
+          emptySurface: result.status === 'CHECK_FAILED' && result.emptySurface === true,
         });
       } catch (err: any) {
         console.error('[PostAnalytics] Engagement extraction error', err);
@@ -830,21 +869,43 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (isExecutingJob && activeJobId === message.jobId) {
       console.warn('[PostFlow] Ignoring duplicate EXECUTE_JOB for active job:', message.jobId);
       recordPostingStep(message.jobId, 'duplicate_job_ignored');
+      sendResponse({ ok: true, accepted: true, duplicate: true });
       return;
     }
     if (isExecutingJob) {
       console.warn('[PostFlow] Ignoring EXECUTE_JOB while another job is active:', activeJobId);
+      sendResponse({ ok: false, accepted: false, error: 'Another job is already active' });
       return;
     }
-    console.log('[PostFlow] Received job to execute:', message);
+    const target = message.target;
+    if (!target || (target.type !== 'GROUP' && target.type !== 'PROFILE_FEED')) {
+      console.warn('[PostFlow] Refusing job with an unsupported publishing target', { jobId: message.jobId });
+      chrome.runtime.sendMessage({
+        type: 'JOB_FAILED',
+        jobId: message.jobId,
+        postId: message.post?._id,
+        error: 'Unsupported publishing target',
+      });
+      sendResponse({ ok: false, accepted: false, error: 'Unsupported publishing target' });
+      return;
+    }
+    console.log('[PostFlow] Received job to execute', { jobId: message.jobId, targetType: target.type });
     recordPostingStep(message.jobId, 'job_received', {
       hasContent: Boolean(message.post?.content),
       mediaCount: Array.isArray(message.post?.mediaUrls) ? message.post.mediaUrls.length : 0,
-      groupExternalId: message.group?.externalId,
-      groupUrl: message.group?.url,
+      targetType: target.type,
     });
     activeJobId = message.jobId;
-    executeFacebookPost(message.jobId, message.post, message.group)
+    sendResponse({ ok: true, accepted: true });
+    const profileVideoNotificationBaselineKeys = Array.isArray(message.profileVideoNotificationBaselineKeys)
+      ? message.profileVideoNotificationBaselineKeys.filter((value: unknown): value is string => typeof value === 'string')
+      : null;
+    executeFacebookPost(
+      message.jobId,
+      message.post,
+      target,
+      profileVideoNotificationBaselineKeys,
+    )
       .then((submissionResult) => {
         if (isFacebookPublishFailureResult(submissionResult)) {
           chrome.runtime.sendMessage({
@@ -869,11 +930,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         });
       })
       .catch((err) => {
+        const isAccountMismatch = err?.name === 'PostFlowAccountMismatch';
         chrome.runtime.sendMessage({
           type: err?.name === 'PostFlowJobCanceled' ? 'JOB_CANCELED' : 'JOB_FAILED',
           jobId: message.jobId,
           postId: message.post?._id,
           error: err.message,
+          ...(isAccountMismatch ? { publishStatus: 'ACCOUNT_MISMATCH', shouldPauseQueue: true } : {}),
         });
       });
   }
@@ -912,18 +975,27 @@ function extractFacebookGroupIdFromUrl(value?: string): string | undefined {
   }
 }
 
-async function executeFacebookPost(jobId: string, post: any, group?: any): Promise<FacebookPostSubmissionResult> {
+async function executeFacebookPost(
+  jobId: string,
+  post: any,
+  target: any,
+  profileVideoNotificationBaselineKeys: readonly string[] | null = null,
+): Promise<FacebookPostSubmissionResult> {
   return new Promise<FacebookPostSubmissionResult>(async (resolve, reject) => {
     isExecutingJob = true;
     try {
       console.log(`[PostFlow] Starting job ${jobId}`);
       const mediaUrls = Array.isArray(post.mediaUrls) ? post.mediaUrls.filter((url: unknown) => typeof url === 'string') : [];
       const hasMedia = mediaUrls.length > 0;
-      const currentGroupId =
-        group?.externalId ??
-        extractFacebookGroupIdFromUrl(group?.url) ??
-        extractFacebookGroupIdFromUrl(window.location.href);
-      const isTargetGroupRoot = () => {
+      const hasVideo = mediaUrls.some((url: string) => url.startsWith('data:video/'));
+      const isProfileTarget = target?.type === 'PROFILE_FEED';
+      const currentGroupId = isProfileTarget
+        ? undefined
+        : target?.externalId ??
+          extractFacebookGroupIdFromUrl(target?.url) ??
+          extractFacebookGroupIdFromUrl(window.location.href);
+      const isTargetDestinationRoot = () => {
+        if (isProfileTarget) return isExpectedProfileFeed(target as ProfileFeedTarget);
         try {
           const url = new URL(window.location.href);
           const path = url.pathname.replace(/\/+$/, '');
@@ -939,31 +1011,33 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
         }
       };
       recordPostingStep(jobId, 'job_started', {
+        targetType: target?.type,
         hasContent: Boolean(post.content),
         mediaCount: mediaUrls.length,
-        currentGroupId,
+        ...(currentGroupId ? { currentGroupId } : {}),
       });
 
       // 1. Find the "Write something…" composer trigger on the group page.
 
-      await waitForCondition(
-        () => {
-          const main = document.querySelector('[role="main"]');
-          const inline = document.querySelector('[data-pagelet="GroupInlineComposer"]');
-          if (!main && !inline) return false;
-          return !!document.querySelector(
+      const pageReady = await waitForCondition(
+        () => isProfileTarget
+          ? isExpectedProfileFeed(target as ProfileFeedTarget) && Boolean(document.querySelector('[role="main"]'))
+          : Boolean(document.querySelector('[role="main"], [data-pagelet="GroupInlineComposer"]')) && Boolean(document.querySelector(
             '[data-pagelet="GroupInlineComposer"] [role="button"], ' +
             '[data-pagelet="GroupInlineComposer"] button, ' +
             '[aria-label*="Create a post" i], ' +
             '[aria-label*="Write something" i], ' +
-            '[aria-placeholder*="Write something" i]'
-          );
-        },
-        POSTING_TIMING.groupPageReadyTimeoutMs,
+            '[aria-placeholder*="Write something" i]',
+          )),
+        isProfileTarget ? POSTING_TIMING.facebookTabReadyTimeoutMs : POSTING_TIMING.groupPageReadyTimeoutMs,
       );
-      recordPostingStep(jobId, 'group_composer_surface_ready', {
+      if (!pageReady) {
+        throw new Error(isProfileTarget
+          ? 'The expected Facebook profile feed was not ready'
+          : 'The Facebook group composer was not ready');
+      }
+      recordPostingStep(jobId, isProfileTarget ? 'profile_composer_surface_ready' : 'group_composer_surface_ready', {
         hasMain: Boolean(document.querySelector('[role="main"]')),
-        hasInlineComposer: Boolean(document.querySelector('[data-pagelet="GroupInlineComposer"]')),
       });
 
       // Facebook places the composer in `data-pagelet="GroupInlineComposer"`
@@ -975,8 +1049,11 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
 
       console.log('[PostFlow] Search root found:', searchRoot.tagName, searchRoot.getAttribute('role'));
 
-      let composerTrigger: HTMLElement | null = null;
+      let composerTrigger: HTMLElement | null = isProfileTarget
+        ? await waitForValue(() => findProfileComposerTrigger(), POSTING_TIMING.facebookTabReadyTimeoutMs)
+        : null;
 
+      if (!isProfileTarget) {
       // Method 0: The most direct and reliable Facebook selector (GroupInlineComposer)
       const inlineComposer = document.querySelector('[data-pagelet="GroupInlineComposer"]');
       if (inlineComposer) {
@@ -1063,11 +1140,13 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
           }
         }
       }
+      }
 
       if (!composerTrigger) {
         throw new Error(
-          'Could not find the post composer on this group page. ' +
-          'Make sure you are on a Facebook group page and the page has loaded.'
+          isProfileTarget
+            ? 'Could not find the post composer on the expected Facebook profile feed.'
+            : 'Could not find the post composer on this group page. Make sure the page has loaded.',
         );
       }
 
@@ -1081,8 +1160,8 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
       console.log('[PostFlow] Clicking composer trigger:', composerTrigger.getAttribute('aria-label') ?? composerTrigger.textContent?.substring(0, 40));
       clickLikeUser(composerTrigger);
       await sleep(POSTING_TIMING.composerOpenDelayMs);
-      if (!isTargetGroupRoot()) {
-        throw new Error(`Facebook navigated away from the target group before opening the composer: ${location.href}`);
+      if (!isTargetDestinationRoot()) {
+        throw new Error(`Facebook navigated away from the target destination before opening the composer: ${location.href}`);
       }
       recordPostingStep(jobId, 'composer_trigger_clicked', {
         dialogs: document.querySelectorAll('div[role="dialog"], [aria-modal="true"]').length,
@@ -1114,8 +1193,8 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
           console.log('[PostFlow] Clicking Post/Text option in intermediate modal:', textOption.textContent?.trim().substring(0, 30));
           textOption.click();
           await sleep(POSTING_TIMING.intermediateComposerOptionDelayMs);
-          if (!isTargetGroupRoot()) {
-            throw new Error(`Facebook intermediate Post option navigated to a different surface: ${location.href}`);
+          if (!isTargetDestinationRoot()) {
+            throw new Error(`Facebook intermediate Post option navigated to a different destination: ${location.href}`);
           }
           recordPostingStep(jobId, 'intermediate_post_option_clicked', {
             text: textOption.textContent?.trim().slice(0, 80),
@@ -1130,13 +1209,13 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
       // an inline composer for this flow. Do not require role="dialog": the
       // GroupInlineComposer markup in some locales stays on the group page.
       console.log('[PostFlow] Waiting for create-post editor...');
-      let dialog = await waitForCreatePostDialog(POSTING_TIMING.createPostDialogTimeoutMs);
+      let dialog = await waitForCreatePostDialog(POSTING_TIMING.createPostDialogTimeoutMs, isProfileTarget);
       if (!dialog) {
         console.warn('[PostFlow] Create-post editor not found after first click; retrying composer trigger once');
         recordPostingStep(jobId, 'editor_surface_retrying_click');
         clickLikeUser(composerTrigger);
         await sleep(POSTING_TIMING.composerOpenDelayMs);
-        dialog = await waitForCreatePostDialog(Math.floor(POSTING_TIMING.createPostDialogTimeoutMs / 2));
+        dialog = await waitForCreatePostDialog(Math.floor(POSTING_TIMING.createPostDialogTimeoutMs / 2), isProfileTarget);
       }
 
       if (!dialog) {
@@ -1302,6 +1381,96 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
         ariaLabel: postButton.getAttribute('aria-label'),
       });
 
+      if (isProfileTarget) {
+        const profileTarget = target as ProfileFeedTarget;
+        const existingProfilePostElements = new Set<Element>([
+          ...document.querySelectorAll('[role="article"], [data-pagelet*="FeedUnit"]'),
+        ]);
+        const existingProfilePostUrls = new Set(
+          Array.from(existingProfilePostElements)
+            .map((element) => getProfilePostPermalink(element, profileTarget.facebookUserId, true))
+            .filter((url): url is string => Boolean(url))
+            .map((url) => url.replace(/\/$/, '').toLowerCase()),
+        );
+        const existingProfileConfirmationSurfaceText = new Map(
+          Array.from(document.querySelectorAll<HTMLElement>('[role="alert"], [role="status"], [aria-live]'))
+            .map((element) => [element, `${element.innerText ?? element.textContent ?? ''} ${element.getAttribute('aria-label') ?? ''}`]),
+        );
+        const profileTrackingSession = createProfilePublishTrackingSession({
+          jobId,
+          facebookUserId: profileTarget.facebookUserId,
+          submittedAt: Date.now(),
+          existingPostUrls: existingProfilePostUrls,
+        });
+        activeProfileTrackingSession = profileTrackingSession;
+
+        const latestJob = await chrome.runtime.sendMessage({
+          type: 'GET_JOB_STATUS',
+          jobId,
+        }).catch(() => null);
+        if (latestJob?.job?.status === 'CANCEL_REQUESTED') {
+          recordPostingStep(jobId, 'job_canceled_before_final_submit');
+          const cancelError = new Error('Canceled before clicking Facebook Post');
+          cancelError.name = 'PostFlowJobCanceled';
+          throw cancelError;
+        }
+
+        const identity = await chrome.runtime.sendMessage({
+          type: 'VERIFY_EXECUTION_IDENTITY',
+          jobId,
+        }).catch(() => null);
+        if (!identity?.verified || !isExpectedProfileFeed(target as ProfileFeedTarget)) {
+          const mismatchError = new Error('Facebook account or profile feed no longer matches the publishing target');
+          mismatchError.name = 'PostFlowAccountMismatch';
+          throw mismatchError;
+        }
+
+        profileTrackingSession.acceptCandidatesAfter = Date.now();
+        (postButton as HTMLElement).click();
+        console.log('[PostFlow] Profile Post button clicked; waiting for explicit confirmation...');
+        recordPostingStep(jobId, 'post_button_clicked', { targetType: target.type });
+        const submissionResult = await waitForProfileSubmissionResult({
+          jobId,
+          root: document,
+          dialog,
+          hasVideo,
+          expectedFacebookUserId: profileTarget.facebookUserId,
+          submittedText: typeof post.content === 'string' ? post.content : '',
+          submittedAt: profileTrackingSession.submittedAt,
+          existingPostElements: existingProfilePostElements,
+          existingPostUrls: existingProfilePostUrls,
+          submittedMediaCount: mediaUrls.length,
+          trackingSession: profileTrackingSession,
+          existingConfirmationSurfaceText: existingProfileConfirmationSurfaceText,
+          notificationBaselineIdentities: profileVideoNotificationBaselineKeys
+            ? new Set(profileVideoNotificationBaselineKeys)
+            : null,
+          timeout: hasVideo
+            ? POSTING_TIMING.profileVideoPermalinkTimeoutMs
+            : POSTING_TIMING.publishConfirmationTimeoutMs,
+          interval: POSTING_TIMING.publishPollIntervalMs,
+        });
+        if (!('postUrl' in submissionResult) || !submissionResult.postUrl) {
+          const diagnostics = getProfilePostUrlDiagnostics(document);
+          recordPostingStep(jobId, 'profile_post_url_not_found', {
+            articleCount: diagnostics.articleCount,
+            anchorCount: diagnostics.anchorCount,
+            candidatePathSamples: diagnostics.candidatePathSamples,
+            existingPostUrlCount: existingProfilePostUrls.size,
+            networkCandidates: profileTrackingSession.candidates.length,
+          });
+        }
+        recordPostingStep(jobId, 'submission_result_detected', {
+          targetType: target.type,
+          status: submissionResult.status,
+          postUrl: 'postUrl' in submissionResult ? submissionResult.postUrl : undefined,
+          reason: 'reason' in submissionResult ? submissionResult.reason : undefined,
+          networkCandidates: profileTrackingSession.candidates.length,
+        });
+        resolve(submissionResult);
+        return;
+      }
+
       const existingPostElements = new Set<Element>([
         ...document.querySelectorAll('[role="article"], [data-pagelet*="FeedUnit"]'),
       ]);
@@ -1313,7 +1482,6 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
       );
       const submittedAt = Date.now();
       const initialPageUrl = location.href;
-      const hasVideo = mediaUrls.some((url: string) => url.startsWith('data:video/'));
       const trackingSession = createPublishTrackingSession({
         jobId,
         groupId: currentGroupId,
@@ -1334,8 +1502,8 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
         throw cancelError;
       }
 
-      (postButton as HTMLElement).click();
       trackingSession.acceptCandidatesAfter = Date.now();
+      (postButton as HTMLElement).click();
       console.log('[PostFlow] Post button clicked, waiting for publish confirmation...');
       recordPostingStep(jobId, 'post_button_clicked');
 
@@ -1516,11 +1684,168 @@ async function executeFacebookPost(jobId: string, post: any, group?: any): Promi
       recordPostingStep(jobId, 'job_failed_in_content_script', { error: err?.message ?? String(err) });
       reject(err);
     } finally {
-      if (activeJobId === jobId) activePublishTrackingSession = null;
+      if (activeJobId === jobId) {
+        activePublishTrackingSession = null;
+        activeProfileTrackingSession = null;
+      }
       isExecutingJob = false;
       activeJobId = null;
     }
   });
+}
+
+// Prefer a verified profile permalink. Video publishes may finish without one,
+// so a closed composer is retained as acceptance evidence while the full video
+// confirmation window continues looking for stronger proof.
+async function waitForProfileSubmissionResult(options: {
+  jobId: string;
+  root: ParentNode;
+  dialog: Element;
+  hasVideo: boolean;
+  expectedFacebookUserId: string;
+  submittedText: string;
+  submittedAt: number;
+  existingPostElements: ReadonlySet<Element>;
+  existingPostUrls: ReadonlySet<string>;
+  submittedMediaCount: number;
+  trackingSession: ProfilePublishTrackingSession;
+  existingConfirmationSurfaceText: ReadonlyMap<Element, string>;
+  notificationBaselineIdentities: ReadonlySet<string> | null;
+  timeout: number;
+  interval: number;
+}): Promise<FacebookPostSubmissionResult> {
+  const startedAt = Date.now();
+  let acceptedVideoEvidence: string | null = null;
+  let acceptedVideoPersisted = false;
+  let lastTrackingHeartbeatAt = 0;
+  const successCues = [
+    'your post is now published',
+    'your post has been published',
+    'post published',
+    '\u062a\u0645 \u0646\u0634\u0631',
+    'ØªÙ… Ù†Ø´Ø±',
+  ];
+  const failureCues = [
+    'something went wrong',
+    "couldn't post",
+    'could not post',
+    'unable to post',
+    'failed to publish',
+    'Ø­Ø¯Ø« Ø®Ø·Ø£',
+    'ØªØ¹Ø°Ø± Ø§Ù„Ù†Ø´Ø±',
+  ];
+
+  while (Date.now() - startedAt < options.timeout) {
+    if (Date.now() - lastTrackingHeartbeatAt >= 10000) {
+      lastTrackingHeartbeatAt = Date.now();
+      await chrome.runtime.sendMessage({
+        type: 'PROFILE_VIDEO_TRACKING_HEARTBEAT',
+        jobId: options.jobId,
+      }).catch(() => null);
+    }
+
+    const interruption = detectFacebookPublishingInterruption({
+      root: options.root,
+      hasVideo: options.hasVideo,
+      activeComposer: document.body.contains(options.dialog) ? options.dialog : null,
+    });
+    if (interruption) {
+      return {
+        status: interruption.status,
+        reason: interruption.reason,
+        source: interruption.source,
+        detector: interruption.detector,
+        shouldPauseQueue: interruption.shouldPauseQueue,
+      };
+    }
+
+    if (options.hasVideo && options.notificationBaselineIdentities) {
+      const processedNotification = findNewProcessedProfileVideoNotification(
+        options.root,
+        options.notificationBaselineIdentities,
+      );
+      if (processedNotification) {
+        recordPostingStep(options.jobId, 'profile_video_notification_detected_on_page', {
+          postUrl: processedNotification.postUrl,
+          notificationId: processedNotification.notificationId ?? null,
+        });
+        return { status: 'PUBLISHED', postUrl: processedNotification.postUrl };
+      }
+    }
+
+    acceptedVideoEvidence = acceptedVideoEvidence ??
+      getAcceptedProfileVideoEvidence(options.dialog, options.hasVideo);
+    if (acceptedVideoEvidence && !acceptedVideoPersisted) {
+      const acceptance = await chrome.runtime.sendMessage({
+        type: 'PROFILE_VIDEO_PUBLISH_ACCEPTED',
+        jobId: options.jobId,
+      }).catch(() => null);
+      acceptedVideoPersisted = acceptance?.ok === true;
+      if (acceptedVideoPersisted) {
+        recordPostingStep(options.jobId, 'profile_video_publish_accepted_persisted');
+      }
+    }
+
+    const publishedProfilePost = findPublishedProfilePost({
+      root: options.root,
+      expectedFacebookUserId: options.expectedFacebookUserId,
+      submittedText: options.submittedText,
+      submittedAt: options.submittedAt,
+      existingPostElements: options.existingPostElements,
+      existingPostUrls: options.existingPostUrls,
+      submittedMediaCount: options.submittedMediaCount,
+      allowUndatedMedia: Boolean(acceptedVideoEvidence),
+    });
+    if (publishedProfilePost) {
+      return { status: 'PUBLISHED', postUrl: publishedProfilePost.postUrl };
+    }
+
+    const networkPostUrl = getBestProfileNetworkPostUrl(options.trackingSession);
+    if (networkPostUrl) return { status: 'PUBLISHED', postUrl: networkPostUrl };
+
+    const currentPagePostUrl = normalizeFacebookProfilePostUrl(
+      window.location.href,
+      options.expectedFacebookUserId,
+    );
+    if (currentPagePostUrl) return { status: 'PUBLISHED', postUrl: currentPagePostUrl };
+
+    const visibleSurfaces = Array.from(document.querySelectorAll<HTMLElement>(
+      '[role="alert"], [role="status"], [aria-live]',
+    )).filter((element) => {
+      const style = window.getComputedStyle(element);
+      return !element.hidden && element.getAttribute('aria-hidden') !== 'true' &&
+        style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+    });
+    const visibleText = visibleSurfaces
+      .filter((element) => {
+        const currentText = `${element.innerText ?? element.textContent ?? ''} ${element.getAttribute('aria-label') ?? ''}`;
+        return options.existingConfirmationSurfaceText.get(element) !== currentText;
+      })
+      .map((element) => `${element.innerText ?? element.textContent ?? ''} ${element.getAttribute('aria-label') ?? ''}`)
+      .join(' ')
+      .toLowerCase();
+    if (successCues.some((cue) => visibleText.includes(cue.toLowerCase()))) {
+      return { status: 'PUBLISHED' };
+    }
+    if (failureCues.some((cue) => visibleText.includes(cue.toLowerCase()))) {
+      return {
+        status: 'UNKNOWN',
+        reason: 'Facebook rejected the profile post after clicking Post',
+      };
+    }
+    await sleep(options.interval);
+  }
+
+  if (acceptedVideoEvidence) {
+    return {
+      status: 'PUBLISHED',
+    };
+  }
+
+  return {
+    status: 'UNKNOWN',
+    reason: 'Facebook accepted the profile composer without reliable publication evidence',
+  };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -1661,7 +1986,7 @@ async function waitForValue<T>(check: () => T | null, timeoutMs: number, interva
   return check();
 }
 
-function waitForCreatePostDialog(timeoutMs: number): Promise<Element | null> {
+function waitForCreatePostDialog(timeoutMs: number, isProfileTarget = false): Promise<Element | null> {
   return new Promise((resolve) => {
     const editorSelector = [
       'div[data-lexical-editor="true"]',
@@ -1727,11 +2052,13 @@ function waitForCreatePostDialog(timeoutMs: number): Promise<Element | null> {
       const dialog = dialogs.find(d => Array.from(d.querySelectorAll(editorSelector)).some(isLikelyComposerEditor));
       if (dialog) return dialog;
 
-      // Fallback for the newer inline group composer. Return its nearest useful
-      // container so the existing editor/media/button lookup remains scoped.
-      const inline = document.querySelector<HTMLElement>('[data-pagelet="GroupInlineComposer"]');
-      const inlineEditor = inline && Array.from(inline.querySelectorAll(editorSelector)).find(isLikelyComposerEditor);
-      if (inlineEditor) return inline;
+      if (!isProfileTarget) {
+        // Fallback for the newer inline group composer. Return its nearest useful
+        // container so the existing editor/media/button lookup remains scoped.
+        const inline = document.querySelector<HTMLElement>('[data-pagelet="GroupInlineComposer"]');
+        const inlineEditor = inline && Array.from(inline.querySelectorAll(editorSelector)).find(isLikelyComposerEditor);
+        if (inlineEditor) return inline;
+      }
 
       // Facebook sometimes mounts the opened composer in a sibling pagelet
       // instead of a dialog or GroupInlineComposer, especially after several

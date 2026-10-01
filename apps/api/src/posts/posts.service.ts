@@ -10,9 +10,13 @@ import {
   PublishingJob,
   PublishingJobDocument,
   PublishingJobStatus,
+  PublishingTargetType,
 } from '../schemas/publishing-job.schema';
 import { Group, GroupDocument } from '../schemas/group.schema';
-import { Team, TeamDocument } from '../schemas/team.schema';
+import {
+  FacebookConnection,
+  FacebookConnectionDocument,
+} from '../schemas/facebook-connection.schema';
 import {
   User,
   UserDocument,
@@ -20,11 +24,17 @@ import {
 } from '../schemas/user.schema';
 import { AuthorizationService } from '../auth/authorization.service';
 import { calculatePostSchedule } from './post-flow-time-spacing';
+import {
+  CreatePostTarget,
+  isVerifiedProfileConnection,
+  normalizeCreatePostTargets,
+} from './create-post-targets';
 
 export class CreatePostDto {
   content!: string;
   mediaUrls?: string[];
-  targetGroupIds!: string[]; // MongoDB _id strings of the groups to target
+  targets?: CreatePostTarget[];
+  targetGroupIds?: string[];
   startTime?: string;
   spacePostsApart?: boolean;
   spacingMinutes?: number | null;
@@ -46,7 +56,8 @@ type PostControlAction = 'pause' | 'resume' | 'cancel';
 type LeanJobSummary = {
   _id: Types.ObjectId;
   postId: Types.ObjectId;
-  groupId: Types.ObjectId;
+  targetType?: PublishingTargetType;
+  groupId?: Types.ObjectId;
   status: string;
   submissionStatus?: string;
   postUrl?: string;
@@ -79,6 +90,18 @@ type PostVisibilityFilter = {
   clerkUserId?: string | { $in: string[] };
 };
 
+type ResolvedCreatePostTarget =
+  | {
+      type: PublishingTargetType.GROUP;
+      group: GroupDocument;
+      order: number;
+    }
+  | {
+      type: PublishingTargetType.PROFILE_FEED;
+      connection: FacebookConnectionDocument;
+      order: number;
+    };
+
 @Injectable()
 export class PostsService {
   constructor(
@@ -88,15 +111,15 @@ export class PostsService {
     private readonly jobModel: Model<PublishingJobDocument>,
     @InjectModel(Group.name)
     private readonly groupModel: Model<GroupDocument>,
+    @InjectModel(FacebookConnection.name)
+    private readonly connectionModel: Model<FacebookConnectionDocument>,
     @InjectModel(User.name)
     private readonly userModel: Model<UserDocument>,
-    @InjectModel(Team.name)
-    private readonly teamModel: Model<TeamDocument>,
     private readonly authorization: AuthorizationService,
   ) {}
 
   /**
-   * Create a post and immediately spawn one PublishingJob per selected group.
+   * Create a post and immediately spawn one PublishingJob per destination.
    */
   async createPost(clerkUserId: string, dto: CreatePostDto) {
     const content = dto.content?.trim() ?? '';
@@ -105,9 +128,13 @@ export class PostsService {
     if (!content && mediaUrls.length === 0) {
       throw new BadRequestException('Post content or media is required');
     }
-    if (!dto.targetGroupIds?.length) {
+
+    let targets: CreatePostTarget[];
+    try {
+      targets = normalizeCreatePostTargets(dto.targets, dto.targetGroupIds);
+    } catch (error) {
       throw new BadRequestException(
-        'At least one target group must be selected',
+        error instanceof Error ? error.message : 'Invalid publishing targets',
       );
     }
 
@@ -122,17 +149,75 @@ export class PostsService {
       );
     }
 
-    // Validate all group IDs belong to the user
-    const groups = await this.groupModel
-      .find({
-        _id: { $in: dto.targetGroupIds.map((id) => new Types.ObjectId(id)) },
-        clerkUserId,
-      })
-      .exec();
+    const groupIds = targets.flatMap((target) =>
+      target.type === PublishingTargetType.GROUP ? [target.groupId] : [],
+    );
+    const connectionIds = targets.flatMap((target) =>
+      target.type === PublishingTargetType.PROFILE_FEED
+        ? [target.facebookConnectionId]
+        : [],
+    );
+    const [groups, connections] = await Promise.all([
+      groupIds.length
+        ? this.groupModel
+            .find({
+              _id: { $in: groupIds.map((id) => new Types.ObjectId(id)) },
+              clerkUserId,
+            })
+            .exec()
+        : [],
+      connectionIds.length
+        ? this.connectionModel
+            .find({
+              _id: {
+                $in: connectionIds.map((id) => new Types.ObjectId(id)),
+              },
+              clerkUserId,
+            })
+            .exec()
+        : [],
+    ]);
 
-    if (groups.length === 0) {
-      throw new BadRequestException('No valid groups found for this user');
+    if (groups.length !== groupIds.length) {
+      throw new BadRequestException(
+        'One or more selected groups are invalid for this user',
+      );
     }
+    if (connections.length !== connectionIds.length) {
+      throw new BadRequestException(
+        'One or more selected Facebook connections are invalid for this user',
+      );
+    }
+
+    const groupsById = new Map(
+      groups.map((group) => [group._id.toString(), group]),
+    );
+    const connectionsById = new Map(
+      connections.map((connection) => [connection._id.toString(), connection]),
+    );
+    const orderedTargets: ResolvedCreatePostTarget[] = targets.map(
+      (target, order) => {
+        if (target.type === PublishingTargetType.GROUP) {
+          return {
+            type: PublishingTargetType.GROUP,
+            group: groupsById.get(target.groupId)!,
+            order,
+          };
+        }
+
+        const connection = connectionsById.get(target.facebookConnectionId)!;
+        if (!isVerifiedProfileConnection(connection)) {
+          throw new BadRequestException(
+            'Profile feed publishing requires a verified Facebook connection',
+          );
+        }
+        return {
+          type: PublishingTargetType.PROFILE_FEED,
+          connection,
+          order,
+        };
+      },
+    );
 
     // Create the post
     const post = await this.postModel.create({
@@ -147,51 +232,65 @@ export class PostsService {
         : {}),
     });
 
-    const groupsById = new Map(
-      groups.map((group) => [group._id.toString(), group]),
-    );
-    const orderedGroups = dto.targetGroupIds.flatMap((groupId, order) => {
-      const group = groupsById.get(groupId);
-      return group ? [{ group, order }] : [];
-    });
     const schedule = startTime
       ? calculatePostSchedule({
           startTime,
-          posts: orderedGroups.map(({ group, order }) => ({
-            post: group,
-            order,
+          posts: orderedTargets.map((target) => ({
+            post: target,
+            order: target.order,
           })),
           spacePostsApart,
           spacingMinutes: spacePostsApart ? (dto.spacingMinutes ?? null) : null,
         })
       : [];
 
-    const scheduledByGroupId = new Map(
-      schedule.map((item) => [item.post._id.toString(), item.scheduledAt]),
+    const scheduledByOrder = new Map(
+      schedule.map((item) => [item.order, item.scheduledAt]),
     );
-    const jobs = orderedGroups.map(({ group }, flowOrder) => ({
-      postId: post._id,
-      groupId: group._id,
-      ...(group.facebookConnectionId
-        ? { facebookConnectionId: group.facebookConnectionId }
-        : {}),
-      status: PublishingJobStatus.PENDING,
-      attempts: 0,
-      flowOrder,
-      ...(scheduledByGroupId.has(group._id.toString())
-        ? { scheduledFor: scheduledByGroupId.get(group._id.toString()) }
-        : {}),
-    }));
+    const jobs = orderedTargets.map((target, flowOrder) => {
+      const destination =
+        target.type === PublishingTargetType.GROUP
+          ? {
+              groupId: target.group._id,
+              ...(target.group.facebookConnectionId
+                ? { facebookConnectionId: target.group.facebookConnectionId }
+                : {}),
+            }
+          : { facebookConnectionId: target.connection._id };
+      return {
+        postId: post._id,
+        targetType: target.type,
+        ...destination,
+        status: PublishingJobStatus.PENDING,
+        attempts: 0,
+        flowOrder,
+        ...(scheduledByOrder.has(target.order)
+          ? { scheduledFor: scheduledByOrder.get(target.order) }
+          : {}),
+      };
+    });
 
     await this.jobModel.insertMany(jobs);
 
     return {
       post: { ...post.toObject(), _id: post._id.toString() },
       jobsCreated: jobs.length,
-      schedule: jobs.map((job) => ({
-        groupId: job.groupId.toString(),
-        ...(job.scheduledFor ? { scheduledFor: job.scheduledFor } : {}),
-      })),
+      schedule: orderedTargets.map((target, index) => {
+        const targetId =
+          target.type === PublishingTargetType.GROUP
+            ? target.group._id.toString()
+            : target.connection._id.toString();
+        return {
+          targetType: target.type,
+          targetId,
+          ...(target.type === PublishingTargetType.GROUP
+            ? { groupId: targetId }
+            : {}),
+          ...(jobs[index].scheduledFor
+            ? { scheduledFor: jobs[index].scheduledFor }
+            : {}),
+        };
+      }),
     };
   }
 
@@ -425,6 +524,10 @@ export class PostsService {
       .where('postId')
       .equals(post._id)
       .populate('groupId', 'name url externalId')
+      .populate(
+        'facebookConnectionId',
+        'displayName facebookUserId detectedFacebookUserId',
+      )
       .lean()
       .exec();
 
@@ -544,31 +647,8 @@ export class PostsService {
   ): Promise<PostVisibilityFilter> {
     const user = await this.authorization.requireActiveUser(clerkUserId);
 
-    if (user.role === UserRole.ADMIN) {
+    if (user.role === UserRole.ADMIN || user.role === UserRole.MANAGER) {
       return {};
-    }
-
-    if (user.role === UserRole.MANAGER) {
-      const managedTeams = await this.teamModel
-        .find({ managerId: String(user._id) })
-        .select('_id')
-        .lean()
-        .exec();
-      const managedTeamIds = managedTeams.map((team) => team._id.toString());
-      if (managedTeamIds.length === 0) {
-        return { clerkUserId: { $in: [] } };
-      }
-
-      const teamMembers = await this.userModel
-        .find({ teamId: { $in: managedTeamIds } })
-        .select('clerkUserId')
-        .lean()
-        .exec();
-      return {
-        clerkUserId: {
-          $in: teamMembers.map((member) => member.clerkUserId),
-        },
-      };
     }
 
     if (user.role === UserRole.TEAM_LEADER) {

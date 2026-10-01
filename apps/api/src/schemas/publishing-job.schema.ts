@@ -2,6 +2,16 @@ import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { Document, Schema as MongooseSchema, Types } from 'mongoose';
 import { Post } from './post.schema';
 import { Group } from './group.schema';
+import {
+  PublishingTargetType,
+  validatePublishingTarget,
+} from './publishing-target';
+
+export {
+  PublishingTargetType,
+  resolvePublishingTargetType,
+  validatePublishingTarget,
+} from './publishing-target';
 
 export type PublishingJobDocument = PublishingJob & Document;
 
@@ -26,8 +36,16 @@ export class PublishingJob {
   @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'Post', required: true })
   postId: Post;
 
-  @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'Group', required: true })
-  groupId: Group;
+  @Prop({
+    required: true,
+    enum: PublishingTargetType,
+    default: PublishingTargetType.GROUP,
+    index: true,
+  })
+  targetType: PublishingTargetType;
+
+  @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'Group' })
+  groupId?: Group;
 
   /** Facebook connection responsible for executing this job. */
   @Prop({
@@ -119,3 +137,23 @@ export class PublishingJob {
 }
 
 export const PublishingJobSchema = SchemaFactory.createForClass(PublishingJob);
+
+PublishingJobSchema.pre('validate', function () {
+  const validationError = validatePublishingTarget({
+    targetType: this.targetType,
+    groupId: this.groupId,
+    facebookConnectionId: this.facebookConnectionId,
+  });
+  if (validationError) {
+    this.invalidate(validationError.path, validationError.message);
+  }
+});
+
+PublishingJobSchema.index({
+  facebookConnectionId: 1,
+  targetType: 1,
+  status: 1,
+  scheduledFor: 1,
+  flowOrder: 1,
+  createdAt: 1,
+});

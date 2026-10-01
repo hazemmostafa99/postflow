@@ -19,6 +19,7 @@ import {
   PublishingJob,
   PublishingJobDocument,
   PublishingJobStatus,
+  PublishingTargetType,
 } from '../schemas/publishing-job.schema';
 import { Post as PostSchema, PostDocument } from '../schemas/post.schema';
 import { getNextPendingPostCheckAt } from './pending-sync-schedule';
@@ -30,6 +31,7 @@ import {
   FacebookConnectionStatus,
   FacebookConnectionWorkerStatus,
 } from '../schemas/facebook-connection.schema';
+import { toPublishJobPayload } from './publish-job-payload';
 
 type PostEngagementSyncResult = {
   status: 'SUCCESS' | 'PARTIAL' | 'CHECK_FAILED';
@@ -52,7 +54,7 @@ type PendingJobLean = {
     content?: string;
     mediaUrls?: string[];
   };
-  groupId: {
+  groupId?: {
     _id: {
       toString(): string;
     };
@@ -66,6 +68,23 @@ type PendingJobLean = {
   syncAttempts?: number;
   lastSyncError?: string;
   createdAt?: Date;
+};
+
+const groupOrLegacyTargetFilter = {
+  $or: [
+    { targetType: PublishingTargetType.GROUP },
+    { targetType: { $exists: false } },
+    { targetType: null },
+  ],
+};
+
+const publishableTargetFilter = {
+  $or: [
+    { targetType: PublishingTargetType.GROUP },
+    { targetType: PublishingTargetType.PROFILE_FEED },
+    { targetType: { $exists: false } },
+    { targetType: null },
+  ],
 };
 
 type TimestampedDocument = {
@@ -200,6 +219,7 @@ export class JobsController {
     const ownershipFilter = connectionId
       ? { facebookConnectionId: connectionId }
       : {};
+    const supportedTargetFilter = publishableTargetFilter;
 
     let job: PublishingJobDocument | null;
     if (normalizedInstanceId && connectionId) {
@@ -212,6 +232,7 @@ export class JobsController {
             ...ownershipFilter,
             postId: { $in: postIds },
             $and: [
+              supportedTargetFilter,
               {
                 $or: [
                   { scheduledFor: { $exists: false } },
@@ -247,16 +268,25 @@ export class JobsController {
         )
         .populate('postId', 'content mediaUrls')
         .populate('groupId', 'name url externalId')
+        .populate(
+          'facebookConnectionId',
+          'displayName facebookUserId detectedFacebookUserId',
+        )
         .exec()) as PublishingJobDocument | null;
     } else {
       job = await this.jobModel
         .findOne({
           ...ownershipFilter,
           status: PublishingJobStatus.PENDING,
-          $or: [
-            { scheduledFor: { $exists: false } },
-            { scheduledFor: null },
-            { scheduledFor: { $lte: now } },
+          $and: [
+            supportedTargetFilter,
+            {
+              $or: [
+                { scheduledFor: { $exists: false } },
+                { scheduledFor: null },
+                { scheduledFor: { $lte: now } },
+              ],
+            },
           ],
         })
         .where('postId')
@@ -264,12 +294,16 @@ export class JobsController {
         .sort({ scheduledFor: 1, flowOrder: 1, createdAt: 1 })
         .populate('postId', 'content mediaUrls')
         .populate('groupId', 'name url externalId')
+        .populate(
+          'facebookConnectionId',
+          'displayName facebookUserId detectedFacebookUserId',
+        )
         .exec();
     }
 
     if (!job) return null;
 
-    return job;
+    return toPublishJobPayload(job);
   }
 
   /**
@@ -309,10 +343,15 @@ export class JobsController {
       status: 'SUCCESS',
       submissionStatus: FacebookSubmissionStatus.PENDING_APPROVAL,
       ...(connection ? { facebookConnectionId: connection._id } : {}),
-      $or: [
-        { nextCheckAt: { $exists: false } },
-        { nextCheckAt: null },
-        { nextCheckAt: { $lte: now } },
+      $and: [
+        groupOrLegacyTargetFilter,
+        {
+          $or: [
+            { nextCheckAt: { $exists: false } },
+            { nextCheckAt: null },
+            { nextCheckAt: { $lte: now } },
+          ],
+        },
       ],
     };
 
@@ -327,30 +366,33 @@ export class JobsController {
       .lean<PendingJobLean[]>()
       .exec();
 
-    return jobs.map((job) => {
+    return jobs.flatMap((job) => {
       const post = job.postId;
       const group = job.groupId;
+      if (!group) return [];
       const submittedAt = job.submittedAt ?? job.createdAt;
 
-      return {
-        id: job._id.toString(),
-        groupId: group._id.toString(),
-        groupExternalId: group.externalId,
-        groupUrl: group.url ?? '',
-        status: FacebookSubmissionStatus.PENDING_APPROVAL,
-        ...(job.postUrl ? { postUrl: job.postUrl } : {}),
-        content: post.content,
-        submittedAt: submittedAt?.toISOString() ?? new Date().toISOString(),
-        mediaCount: Array.isArray(post.mediaUrls) ? post.mediaUrls.length : 0,
-        ...(job.lastCheckedAt
-          ? { lastCheckedAt: job.lastCheckedAt.toISOString() }
-          : {}),
-        ...(job.nextCheckAt
-          ? { nextCheckAt: job.nextCheckAt.toISOString() }
-          : {}),
-        syncAttempts: job.syncAttempts ?? 0,
-        ...(job.lastSyncError ? { lastSyncError: job.lastSyncError } : {}),
-      };
+      return [
+        {
+          id: job._id.toString(),
+          groupId: group._id.toString(),
+          groupExternalId: group.externalId,
+          groupUrl: group.url ?? '',
+          status: FacebookSubmissionStatus.PENDING_APPROVAL,
+          ...(job.postUrl ? { postUrl: job.postUrl } : {}),
+          content: post.content,
+          submittedAt: submittedAt?.toISOString() ?? new Date().toISOString(),
+          mediaCount: Array.isArray(post.mediaUrls) ? post.mediaUrls.length : 0,
+          ...(job.lastCheckedAt
+            ? { lastCheckedAt: job.lastCheckedAt.toISOString() }
+            : {}),
+          ...(job.nextCheckAt
+            ? { nextCheckAt: job.nextCheckAt.toISOString() }
+            : {}),
+          syncAttempts: job.syncAttempts ?? 0,
+          ...(job.lastSyncError ? { lastSyncError: job.lastSyncError } : {}),
+        },
+      ];
     });
   }
 
@@ -391,6 +433,7 @@ export class JobsController {
       ...getEngagementQueueFilter(now),
       submissionStatus: FacebookSubmissionStatus.PUBLISHED,
       ...(connection ? { facebookConnectionId: connection._id } : {}),
+      $and: [publishableTargetFilter],
     });
     const jobsQuery = requestedPostId
       ? engagementQuery.where('postId').equals(requestedPostId)
@@ -410,6 +453,7 @@ export class JobsController {
     return jobs.map((job) => ({
       id: job._id.toString(),
       status: FacebookSubmissionStatus.PUBLISHED,
+      targetType: job.targetType ?? PublishingTargetType.GROUP,
       postUrl: job.postUrl!,
       ...(job.lastEngagementSyncAt
         ? { lastEngagementSyncAt: job.lastEngagementSyncAt.toISOString() }
@@ -540,6 +584,11 @@ export class JobsController {
     const post = job.postId as unknown as PostDocument;
     if (post.clerkUserId !== clerkUserId) {
       throw new UnauthorizedException('Not your job');
+    }
+    if (job.targetType === PublishingTargetType.PROFILE_FEED) {
+      throw new BadRequestException(
+        'Pending-approval sync is only supported for Group jobs',
+      );
     }
     await this.assertWorkerOwnsJob(clerkUserId, extensionInstanceId, job);
     const normalizedBodyPostUrl = normalizeFacebookGroupPostUrl(body.postUrl);
@@ -729,7 +778,9 @@ export class JobsController {
         !verified ||
         String(job.facebookConnectionId) !== String(connection._id)
       ) {
-        throw new UnauthorizedException('Job is assigned to another Facebook connection');
+        throw new UnauthorizedException(
+          'Job is assigned to another Facebook connection',
+        );
       }
       workerConnectionId = connection._id;
     }
@@ -739,7 +790,9 @@ export class JobsController {
       body.status === PublishingJobStatus.CANCELED &&
       previousStatus !== PublishingJobStatus.CANCEL_REQUESTED
     ) {
-      throw new BadRequestException('Only cancel-requested jobs can be canceled');
+      throw new BadRequestException(
+        'Only cancel-requested jobs can be canceled',
+      );
     }
     if (
       previousStatus === PublishingJobStatus.CANCEL_REQUESTED &&
@@ -763,7 +816,9 @@ export class JobsController {
       body.status === PublishingJobStatus.FAILED ? body.error : undefined;
     if (normalizedInstanceId && body.status === PublishingJobStatus.RUNNING) {
       job.claimedByExtensionInstanceId = normalizedInstanceId;
-      job.claimExpiresAt = new Date(Date.now() + JobsController.JOB_CLAIM_LEASE_MS);
+      job.claimExpiresAt = new Date(
+        Date.now() + JobsController.JOB_CLAIM_LEASE_MS,
+      );
     } else if (
       normalizedInstanceId &&
       (body.status === PublishingJobStatus.SUCCESS ||
@@ -807,12 +862,23 @@ export class JobsController {
       if (
         normalizedSubmissionPostUrl &&
         (body.submissionResult.status === FacebookSubmissionStatus.PUBLISHED ||
-          body.submissionResult.status === FacebookSubmissionStatus.PENDING_APPROVAL)
+          body.submissionResult.status ===
+            FacebookSubmissionStatus.PENDING_APPROVAL)
       ) {
+        const duplicateTargetFilter =
+          job.targetType === PublishingTargetType.PROFILE_FEED
+            ? {
+                targetType: PublishingTargetType.PROFILE_FEED,
+                facebookConnectionId: job.facebookConnectionId,
+              }
+            : {
+                ...groupOrLegacyTargetFilter,
+                groupId: job.groupId,
+              };
         const existingJobWithPermalink = await this.jobModel
           .findOne({
             _id: { $ne: job._id },
-            groupId: job.groupId,
+            ...duplicateTargetFilter,
             postUrl: normalizedSubmissionPostUrl,
           })
           .select('_id')
@@ -838,10 +904,13 @@ export class JobsController {
       if (body.submissionResult.status === FacebookSubmissionStatus.UNKNOWN) {
         job.postUrl = undefined;
       }
-      job.submissionReason =
-        duplicatePermalink
-          ? 'Facebook returned a permalink already assigned to another job in this group'
-          : body.submissionResult.status === FacebookSubmissionStatus.UNKNOWN
+      job.submissionReason = duplicatePermalink
+        ? `Facebook returned a permalink already assigned to another job in this ${
+            job.targetType === PublishingTargetType.PROFILE_FEED
+              ? 'profile feed'
+              : 'group'
+          }`
+        : body.submissionResult.status === FacebookSubmissionStatus.UNKNOWN
           ? body.submissionResult.reason
           : undefined;
 

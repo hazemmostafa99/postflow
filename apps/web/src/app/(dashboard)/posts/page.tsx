@@ -11,6 +11,7 @@ const POSTS_PER_PAGE = 10;
 
 interface Job {
   _id: string;
+  targetType?: "GROUP" | "PROFILE_FEED";
   status: string;
   submissionStatus?: "PUBLISHED" | "PENDING_APPROVAL" | "UNKNOWN";
   postUrl?: string;
@@ -193,9 +194,17 @@ function getCreatorLabel(createdBy?: Post["createdBy"]): string {
   return createdBy?.fullName || createdBy?.email || createdBy?.clerkUserId || "Unknown";
 }
 
+function getTargetSummary(jobs: Job[]): string {
+  const profileCount = jobs.filter((job) => job.targetType === "PROFILE_FEED").length;
+  const groupCount = jobs.length - profileCount;
+  if (profileCount && groupCount) return `${groupCount} groups · ${profileCount} profile feeds`;
+  if (profileCount) return `${profileCount} profile feed${profileCount === 1 ? "" : "s"}`;
+  return `${groupCount} group${groupCount === 1 ? "" : "s"}`;
+}
+
 export const metadata = {
   title: "Posts - PostFlow",
-  description: "Manage and track your published Facebook Group posts.",
+  description: "Manage and track your published Facebook posts.",
 };
 
 export default async function PostsPage({
@@ -237,7 +246,7 @@ export default async function PostsPage({
           </div>
           <p className="text-base font-semibold text-foreground">No posts yet</p>
           <p className="mt-1 mb-6 max-w-sm text-sm text-muted-foreground">
-            Create your first post and publish it to your synced groups.
+             Create your first post and publish it to your selected destinations.
           </p>
           <NewPostDialog label="Create Post" />
         </div>
@@ -249,7 +258,7 @@ export default async function PostsPage({
                 <tr className="border-b border-border bg-muted/60">
                   <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-normal text-muted-foreground">Content</th>
                   <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-normal text-muted-foreground">Created by</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-normal text-muted-foreground">Groups</th>
+                   <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-normal text-muted-foreground">Targets</th>
                   <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-normal text-muted-foreground">Status</th>
                   <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-normal text-muted-foreground">Created</th>
                   <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-normal text-muted-foreground">Scheduled</th>
@@ -288,8 +297,8 @@ export default async function PostsPage({
                       </td>
                       <td className="px-4 py-4">
                         <div className="flex items-center gap-1.5 text-muted-foreground">
-                          <Users className="h-3.5 w-3.5" />
-                          <span>{post.jobs.length} {post.jobs.length === 1 ? "group" : "groups"}</span>
+                           <Users className="h-3.5 w-3.5" />
+                           <span>{getTargetSummary(post.jobs)}</span>
                         </div>
                       </td>
                       <td className="px-4 py-4">

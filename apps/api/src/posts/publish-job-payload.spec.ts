@@ -1,0 +1,117 @@
+import { PublishingTargetType } from '../schemas/publishing-target';
+import {
+  getFacebookProfileUrl,
+  toPublishJobPayload,
+} from './publish-job-payload';
+
+describe('toPublishJobPayload', () => {
+  const id = (value: string) => ({ toString: () => value });
+
+  it('maps group jobs to normalized and legacy-compatible payload fields', () => {
+    const groupId = id('group-1');
+    const payload = toPublishJobPayload({
+      _id: id('job-1'),
+      targetType: PublishingTargetType.GROUP,
+      postId: {
+        content: 'Hello group',
+        mediaUrls: ['https://cdn.example/post.png'],
+      },
+      groupId: {
+        _id: groupId,
+        name: 'Launch group',
+        externalId: 'launch-group',
+        url: 'https://www.facebook.com/groups/launch-group/',
+      },
+    });
+
+    expect(payload?.groupId?._id.toString()).toBe('group-1');
+    expect(payload).toEqual({
+      id: 'job-1',
+      _id: 'job-1',
+      targetType: PublishingTargetType.GROUP,
+      post: {
+        content: 'Hello group',
+        mediaUrls: ['https://cdn.example/post.png'],
+      },
+      postId: {
+        content: 'Hello group',
+        mediaUrls: ['https://cdn.example/post.png'],
+      },
+      groupId: {
+        _id: groupId,
+        name: 'Launch group',
+        externalId: 'launch-group',
+        url: 'https://www.facebook.com/groups/launch-group/',
+      },
+      target: {
+        type: PublishingTargetType.GROUP,
+        groupId: 'group-1',
+        name: 'Launch group',
+        externalId: 'launch-group',
+        url: 'https://www.facebook.com/groups/launch-group/',
+      },
+    });
+  });
+
+  it('maps profile feed jobs from the populated Facebook connection', () => {
+    const payload = toPublishJobPayload({
+      _id: id('job-2'),
+      targetType: PublishingTargetType.PROFILE_FEED,
+      postId: { content: 'Hello profile' },
+      facebookConnectionId: {
+        _id: id('connection-1'),
+        displayName: 'Chrome Work',
+        facebookUserId: '12345',
+        detectedFacebookUserId: '12345',
+      },
+    });
+
+    expect(payload).toEqual({
+      id: 'job-2',
+      _id: 'job-2',
+      targetType: PublishingTargetType.PROFILE_FEED,
+      post: {
+        content: 'Hello profile',
+        mediaUrls: [],
+      },
+      postId: {
+        content: 'Hello profile',
+        mediaUrls: [],
+      },
+      target: {
+        type: PublishingTargetType.PROFILE_FEED,
+        facebookConnectionId: 'connection-1',
+        facebookUserId: '12345',
+        name: 'Chrome Work',
+        url: 'https://www.facebook.com/profile.php?id=12345',
+      },
+    });
+  });
+
+  it('returns null for malformed target payloads', () => {
+    expect(
+      toPublishJobPayload({
+        _id: id('job-3'),
+        targetType: PublishingTargetType.GROUP,
+        postId: { content: 'No group' },
+      }),
+    ).toBeNull();
+
+    expect(
+      toPublishJobPayload({
+        _id: id('job-4'),
+        targetType: PublishingTargetType.PROFILE_FEED,
+        postId: { content: 'No identity' },
+        facebookConnectionId: { _id: id('connection-1') },
+      }),
+    ).toBeNull();
+  });
+});
+
+describe('getFacebookProfileUrl', () => {
+  it('encodes the persisted Facebook user id', () => {
+    expect(getFacebookProfileUrl('abc 123')).toBe(
+      'https://www.facebook.com/profile.php?id=abc%20123',
+    );
+  });
+});

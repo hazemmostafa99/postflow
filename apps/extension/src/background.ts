@@ -3,6 +3,12 @@
 import './posting-config.js';
 
 import { API_BASE_URL, BUILD_ENV } from './env.js';
+import {
+  getSafeFacebookProfileUrl,
+  normalizePublishJob,
+  type ProfileFeedPublishTarget,
+  type PublishJob,
+} from './publishing-target.js';
 
 console.info(`[PostFlow] ${BUILD_ENV === 'production' ? 'PROD' : 'DEV'} environment | API: ${API_BASE_URL}`);
 
@@ -18,6 +24,7 @@ const EXTENSION_INSTANCE_ID_KEY = 'extensionInstanceId';
 const EXTENSION_NAME_KEY = 'extensionName';
 const TAB_ACTION_RETRY_COUNT = 6;
 const TAB_ACTION_RETRY_DELAY_MS = 500;
+const FACEBOOK_NOTIFICATIONS_URL = 'https://www.facebook.com/notifications/';
 const POSTING_TIMING = (globalThis as { PostFlowPostingTiming?: PostFlowPostingTimingConfig }).PostFlowPostingTiming!;
 
 // ── Helpers ──
@@ -511,6 +518,8 @@ function workerStatusForPublishFailure(status: unknown): ExtensionWorkerStatus {
       return 'CHECKPOINT_OR_VERIFICATION';
     case 'LOGIN_REQUIRED':
       return 'LOGIN_REQUIRED';
+    case 'ACCOUNT_MISMATCH':
+      return 'ACCOUNT_MISMATCH';
     default:
       return 'MANUAL_INTERVENTION_REQUIRED';
   }
@@ -696,6 +705,54 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 
+  if (message.type === 'VERIFY_EXECUTION_IDENTITY' && typeof message.jobId === 'string') {
+    void (async () => {
+      if (!isCurrentExecutionResult(message, sender)) {
+        sendResponse({ verified: false });
+        return;
+      }
+      const target = activeExecution?.target;
+      const verified = target?.type === 'PROFILE_FEED'
+        ? await verifyProfileTargetIdentity(target)
+        : await refreshFacebookSession();
+      console.log('[PostFlow] Final submission identity check', {
+        jobId: message.jobId,
+        targetType: target?.type,
+        verified,
+      });
+      sendResponse({ verified });
+    })().catch(() => sendResponse({ verified: false }));
+    return true;
+  }
+
+  if (message.type === 'PROFILE_VIDEO_PUBLISH_ACCEPTED' && typeof message.jobId === 'string') {
+    void (async () => {
+      if (
+        !isCurrentExecutionResult(message, sender) ||
+        activeExecution?.target.type !== 'PROFILE_FEED' ||
+        !publishJobHasVideo(activeExecution.post)
+      ) {
+        sendResponse({ ok: false });
+        return;
+      }
+      const updatedJob = await updateJobStatus(message.jobId, {
+        status: 'SUCCESS',
+        submissionResult: { status: 'PUBLISHED' },
+      });
+      if (updatedJob) {
+        await saveBackgroundPostingStep(message.jobId, 'profile_video_publish_accepted_saved')
+          .catch(() => undefined);
+      }
+      sendResponse({ ok: Boolean(updatedJob) });
+    })().catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  if (message.type === 'PROFILE_VIDEO_TRACKING_HEARTBEAT' && typeof message.jobId === 'string') {
+    sendResponse({ ok: isCurrentExecutionResult(message, sender) });
+    return;
+  }
+
   if (message.type === 'FACEBOOK_SESSION_STATUS') {
     void reportSession(
       message.sessionDetected as boolean,
@@ -798,9 +855,21 @@ let finishExecutionHandshake: (() => void) | null = null;
 let activeExecution: {
   jobId: string;
   tabId: number;
-  group?: any;
-  post?: any;
+  target: PublishJob['target'];
+  post: PublishJob['post'];
+  profileVideoNotificationBaselineKeys?: string[] | null;
 } | null = null;
+
+interface ProcessedProfileVideoNotificationScanResult {
+  key: string;
+  notificationId?: string;
+  postUrl: string;
+}
+
+function publishJobHasVideo(post: PublishJob['post'] | undefined): boolean {
+  const mediaUrls = Array.isArray(post?.mediaUrls) ? post.mediaUrls : [];
+  return mediaUrls.some((url: unknown) => typeof url === 'string' && url.startsWith('data:video/'));
+}
 
 void chrome.storage.local.get('publishQueuePaused').then((result) => {
   const paused = result.publishQueuePaused as Partial<NonNullable<typeof publishQueuePaused>> | undefined;
@@ -835,46 +904,59 @@ async function checkPendingJobs() {
   }
   isProcessingJob = true;
 
-  const job = await apiFetch('/api/jobs/next');
-  if (!job || !job.postId) {
+  const job = normalizePublishJob(await apiFetch('/api/jobs/next'));
+  if (!job) {
     console.log('[PostFlow] No pending jobs');
     isProcessingJob = false;
     return;
   }
+  const executionJob = job;
 
-  console.log('[PostFlow] Found pending job:', job._id);
+  console.log('[PostFlow] Found pending job', { jobId: executionJob.id, targetType: executionJob.target.type });
 
   try {
     // 1. Mark as running
-    await updateJobStatus(job._id, { status: 'RUNNING' });
+    await updateJobStatus(executionJob.id, { status: 'RUNNING' });
 
-    // 2. Find or create a Facebook tab for the group
-    const targetUrl = getSafeFacebookGroupUrl(job.groupId, job.groupId.url);
+    const targetUrl = executionJob.target.type === 'GROUP'
+      ? getSafeFacebookGroupUrl(executionJob.target, executionJob.target.url)
+      : getSafeFacebookProfileUrl(executionJob.target);
     if (!targetUrl) {
-      console.error('[PostFlow] Refusing to navigate to invalid Facebook group URL', {
-        jobId: job._id,
-        group: job.groupId,
+      console.error('[PostFlow] Refusing to navigate to invalid Facebook target URL', {
+        jobId: executionJob.id,
+        targetType: executionJob.target.type,
       });
-      await updateJobStatus(job._id, { status: 'FAILED', error: 'Invalid Facebook group URL' });
+      await updateJobStatus(executionJob.id, { status: 'FAILED', error: 'Invalid Facebook target URL' });
       isProcessingJob = false;
       return;
     }
+
+    if (executionJob.target.type === 'PROFILE_FEED' && !(await verifyProfileTargetIdentity(executionJob.target))) {
+      await failProfileIdentityMismatch(executionJob);
+      return;
+    }
+
+    const profileVideoNotificationBaselineKeys =
+      executionJob.target.type === 'PROFILE_FEED' && publishJobHasVideo(executionJob.post)
+        ? await snapshotProcessedProfileVideoNotificationKeys(executionJob.id)
+        : undefined;
     
-    const fbTab = await openFacebookGroupTab(targetUrl);
+    const fbTab = await openFacebookTargetTab(targetUrl);
 
     const tabId = fbTab.id;
     if (!tabId) {
-      await updateJobStatus(job._id, { status: 'FAILED', error: 'Could not get tab ID' });
+      await updateJobStatus(executionJob.id, { status: 'FAILED', error: 'Could not get tab ID' });
       isProcessingJob = false;
       activeExecution = null;
       return;
     }
     const readyTabId = tabId;
     activeExecution = {
-      jobId: job._id,
+      jobId: executionJob.id,
       tabId: readyTabId,
-      group: job.groupId,
-      post: job.postId,
+      target: executionJob.target,
+      post: executionJob.post,
+      profileVideoNotificationBaselineKeys,
     };
 
     // tabs.update/tabs.create resolves before the old Facebook document has
@@ -882,21 +964,21 @@ async function checkPendingJobs() {
     // the previous page open its composer. Wait for the target group document.
     const targetReady = await waitForFacebookTabDocument(readyTabId, targetUrl, POSTING_TIMING.facebookTabReadyTimeoutMs);
     if (!targetReady) {
-      console.error('[PostFlow] Target Facebook group page did not finish loading', targetUrl);
-      await updateJobStatus(job._id, {
+      console.error('[PostFlow] Target Facebook page did not finish loading', { targetType: executionJob.target.type });
+      await updateJobStatus(executionJob.id, {
         status: 'FAILED',
-        error: 'Target Facebook group page did not finish loading',
+        error: 'Target Facebook page did not finish loading',
       });
       isProcessingJob = false;
       activeExecution = null;
       return;
     }
-    console.log('[PostFlow] Target Facebook group page is loaded; waiting for content script', targetUrl);
+    console.log('[PostFlow] Target Facebook page is loaded; waiting for content script', { targetType: executionJob.target.type });
 
-    const latestJob = await apiFetch(`/api/jobs/${job._id}`) as { status?: string } | null;
+    const latestJob = await apiFetch(`/api/jobs/${executionJob.id}`) as { status?: string } | null;
     if (latestJob?.status === 'CANCEL_REQUESTED') {
-      console.warn('[PostFlow] Job was canceled before Facebook execution started:', job._id);
-      await updateJobStatus(job._id, { status: 'CANCELED' });
+      console.warn('[PostFlow] Job was canceled before Facebook execution started:', executionJob.id);
+      await updateJobStatus(executionJob.id, { status: 'CANCELED' });
       isProcessingJob = false;
       activeExecution = null;
       checkPendingJobs();
@@ -905,36 +987,55 @@ async function checkPendingJobs() {
 
       let sent = false;
       let sendInFlight = false;
+      let identityFailureHandled = false;
       let timeoutHandle: ReturnType<typeof setTimeout>;
       let retryHandle: ReturnType<typeof setInterval> | null = null;
 
-    function sendExecuteJob(force = false) {
-        if (activeExecution?.jobId !== job._id || activeExecution?.tabId !== readyTabId) {
+    async function sendExecuteJob() {
+        if (activeExecution?.jobId !== executionJob.id || activeExecution?.tabId !== readyTabId) {
           console.warn('[PostFlow] Skipping stale EXECUTE_JOB send', {
-            jobId: job._id,
+            jobId: executionJob.id,
             tabId: readyTabId,
             activeExecution,
           });
           return;
         }
-        if (sent && !force) return;
+        if (sent) return;
         if (sendInFlight) {
-          console.log('[PostFlow] Skipping overlapping EXECUTE_JOB send', job._id);
+          console.log('[PostFlow] Skipping overlapping EXECUTE_JOB send', executionJob.id);
           return;
         }
         sendInFlight = true;
+        if (executionJob.target.type === 'PROFILE_FEED' && !(await verifyProfileTargetIdentity(executionJob.target))) {
+          sendInFlight = false;
+          if (!identityFailureHandled) {
+            identityFailureHandled = true;
+            cleanup();
+            await failProfileIdentityMismatch(executionJob);
+          }
+          return;
+        }
         console.log('[PostFlow] Sending EXECUTE_JOB to Facebook tab', {
           tabId: readyTabId,
-          jobId: job._id,
-          force,
+          jobId: executionJob.id,
+          targetType: executionJob.target.type,
         });
         chrome.tabs.sendMessage(readyTabId, {
           type: 'EXECUTE_JOB',
-          jobId: job._id,
-          post: job.postId,
-          group: job.groupId,
-        }).then(() => {
+          jobId: executionJob.id,
+          post: executionJob.post,
+          target: executionJob.target,
+          profileVideoNotificationBaselineKeys,
+        }).then((response) => {
           sendInFlight = false;
+          if (response?.accepted !== true) {
+            sent = false;
+            console.warn('[PostFlow] Facebook content script did not accept EXECUTE_JOB', {
+              jobId: executionJob.id,
+              error: response?.error,
+            });
+            return;
+          }
           sent = true;
           console.log('[PostFlow] Facebook content script accepted EXECUTE_JOB');
         }).catch(() => {
@@ -946,19 +1047,23 @@ async function checkPendingJobs() {
 
       function onMessage(message: any, sender: chrome.runtime.MessageSender) {
         if (message.type === 'CONTENT_SCRIPT_READY' && sender.tab?.id === readyTabId) {
-          if (activeExecution?.jobId !== job._id || activeExecution?.tabId !== readyTabId) {
+          if (activeExecution?.jobId !== executionJob.id || activeExecution?.tabId !== readyTabId) {
             console.warn('[PostFlow] Ignoring stale content-script ready handler', {
-              jobId: job._id,
+              jobId: executionJob.id,
               tabId: readyTabId,
               activeExecution,
             });
             cleanup();
             return;
           }
-          // Facebook can tear down the content script when the composer is
-          // clicked. Force delivery to the replacement content-script instance.
-          console.log('[PostFlow] Facebook content script ready; resuming job', job._id);
-          sendExecuteJob(true);
+          // A successful send means a content script already accepted this
+          // job. Never redeliver it to a replacement document: that can click
+          // Facebook's Post button twice.
+          console.log('[PostFlow] Facebook content script ready', {
+            jobId: executionJob.id,
+            deliveryAlreadyAccepted: sent,
+          });
+          void sendExecuteJob();
         }
       }
 
@@ -971,14 +1076,14 @@ async function checkPendingJobs() {
     finishExecutionHandshake = cleanup;
 
     chrome.runtime.onMessage.addListener(onMessage);
-    sendExecuteJob();
-    retryHandle = setInterval(sendExecuteJob, POSTING_TIMING.facebookMessageRetryIntervalMs);
+    void sendExecuteJob();
+    retryHandle = setInterval(() => void sendExecuteJob(), POSTING_TIMING.facebookMessageRetryIntervalMs);
 
     timeoutHandle = setTimeout(async () => {
         if (sent) return;
         cleanup();
         console.error('[PostFlow] Timed out waiting for Facebook tab to be ready');
-        await updateJobStatus(job._id, {
+        await updateJobStatus(executionJob.id, {
           status: 'FAILED',
           error: 'Timed out waiting for Facebook page to load',
         });
@@ -988,13 +1093,46 @@ async function checkPendingJobs() {
 
   } catch (err) {
     console.error('[PostFlow] Error processing job:', err);
-    await updateJobStatus(job._id, { 
+    await updateJobStatus(executionJob.id, {
       status: 'FAILED', 
       error: 'Extension error while processing job' 
     });
     isProcessingJob = false;
     activeExecution = null;
   }
+}
+
+async function verifyProfileTargetIdentity(target: ProfileFeedPublishTarget): Promise<boolean> {
+  if (!/^\d+$/.test(target.facebookUserId)) return false;
+  const verified = await refreshFacebookSession();
+  const identity = await chrome.storage.local.get(['expectedFacebookUserId', 'detectedFacebookUserId']);
+  const expected = typeof identity.expectedFacebookUserId === 'string' ? identity.expectedFacebookUserId : null;
+  const detected = typeof identity.detectedFacebookUserId === 'string' ? identity.detectedFacebookUserId : null;
+  const matchesTarget = expected === target.facebookUserId && detected === target.facebookUserId;
+  console.log('[PostFlow] Profile target identity check', {
+    targetType: target.type,
+    verified,
+    matchesTarget,
+  });
+  return verified && matchesTarget;
+}
+
+async function failProfileIdentityMismatch(job: PublishJob): Promise<void> {
+  console.warn('[PostFlow] Profile job stopped because Facebook identity did not match', {
+    jobId: job.id,
+    targetType: job.target.type,
+  });
+  await reportWorkerStatus('ACCOUNT_MISMATCH', 'Facebook account does not match this profile target');
+  publishQueuePaused = {
+    reason: 'Facebook account does not match this profile target',
+    status: 'ACCOUNT_MISMATCH',
+    jobId: job.id,
+    pausedAt: Date.now(),
+  };
+  await chrome.storage.local.set({ publishQueuePaused });
+  await updateJobStatus(job.id, { status: 'FAILED', error: 'ACCOUNT_MISMATCH' });
+  isProcessingJob = false;
+  activeExecution = null;
 }
 
 function getSafeFacebookGroupUrl(group: any, fallback?: string): string | null {
@@ -1010,7 +1148,7 @@ function getSafeFacebookGroupUrl(group: any, fallback?: string): string | null {
   return `https://www.facebook.com/groups/${groupId}/`;
 }
 
-async function openFacebookGroupTab(targetUrl: string): Promise<chrome.tabs.Tab> {
+async function openFacebookTargetTab(targetUrl: string): Promise<chrome.tabs.Tab> {
   const tabs = await chrome.tabs.query({ url: '*://*.facebook.com/*' });
   const existingTab = tabs.find((tab) => tab.id !== undefined);
   let lastError: unknown;
@@ -1056,8 +1194,11 @@ async function openFacebookGroupTab(targetUrl: string): Promise<chrome.tabs.Tab>
 async function waitForFacebookTabDocument(tabId: number, targetUrl: string, timeoutMs: number): Promise<boolean> {
   const startedAt = Date.now();
   let targetPath = '';
+  let targetProfileId = '';
   try {
-    targetPath = new URL(targetUrl).pathname.replace(/\/+$/, '').toLowerCase();
+    const expectedUrl = new URL(targetUrl);
+    targetPath = expectedUrl.pathname.replace(/\/+$/, '').toLowerCase();
+    targetProfileId = targetPath === '/profile.php' ? expectedUrl.searchParams.get('id') ?? '' : '';
   } catch {
     return false;
   }
@@ -1066,14 +1207,203 @@ async function waitForFacebookTabDocument(tabId: number, targetUrl: string, time
     try {
       const tab = await chrome.tabs.get(tabId);
       const currentUrl = tab.url ?? '';
-      const currentPath = currentUrl ? new URL(currentUrl).pathname.replace(/\/+$/, '').toLowerCase() : '';
-      if (tab.status === 'complete' && currentPath === targetPath) return true;
+      const currentFacebookUrl = currentUrl ? new URL(currentUrl) : null;
+      const currentPath = currentFacebookUrl?.pathname.replace(/\/+$/, '').toLowerCase() ?? '';
+      if (
+        tab.status === 'complete' &&
+        currentPath === targetPath &&
+        (!targetProfileId || currentFacebookUrl?.searchParams.get('id') === targetProfileId)
+      ) return true;
     } catch {
       return false;
     }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
   return false;
+}
+
+function parseProcessedProfileVideoNotificationScan(
+  response: unknown,
+): { surfaceReady: boolean; notifications: ProcessedProfileVideoNotificationScanResult[] } | null {
+  if (typeof response !== 'object' || response === null) return null;
+  const value = response as Record<string, unknown>;
+  if (value.ok !== true || !Array.isArray(value.notifications)) return null;
+
+  const notifications: ProcessedProfileVideoNotificationScanResult[] = [];
+  const seenKeys = new Set<string>();
+  for (const candidate of value.notifications) {
+    if (typeof candidate !== 'object' || candidate === null) continue;
+    const item = candidate as Record<string, unknown>;
+    if (
+      typeof item.key !== 'string' ||
+      !/^(?:notification:[^\s]+|reel:\d+)$/.test(item.key) ||
+      typeof item.postUrl !== 'string' ||
+      !/^https:\/\/www\.facebook\.com\/reel\/\d+\/$/.test(item.postUrl)
+    ) continue;
+    if (seenKeys.has(item.key)) continue;
+    seenKeys.add(item.key);
+    notifications.push({
+      key: item.key,
+      ...(typeof item.notificationId === 'string' ? { notificationId: item.notificationId } : {}),
+      postUrl: item.postUrl,
+    });
+  }
+
+  return {
+    surfaceReady: value.surfaceReady === true,
+    notifications,
+  };
+}
+
+async function scanProcessedProfileVideoNotifications(
+  tabId: number,
+  jobId: string,
+): Promise<{ surfaceReady: boolean; notifications: ProcessedProfileVideoNotificationScanResult[] } | null> {
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, {
+      type: 'GET_PROFILE_VIDEO_NOTIFICATIONS',
+      jobId,
+    });
+    return parseProcessedProfileVideoNotificationScan(response);
+  } catch {
+    return null;
+  }
+}
+
+async function saveBackgroundPostingStep(
+  jobId: string,
+  step: string,
+  details: Record<string, string | number | boolean | null | undefined> = {},
+): Promise<void> {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    jobId,
+    step,
+    url: FACEBOOK_NOTIFICATIONS_URL,
+    details,
+    tabId: null,
+  };
+  console.log('[PostFlow][posting-log]', entry);
+  const result = await chrome.storage.local.get('postingLogs');
+  const logs = Array.isArray(result.postingLogs) ? result.postingLogs : [];
+  logs.push(entry);
+  await chrome.storage.local.set({ postingLogs: logs.slice(-500) });
+}
+
+async function snapshotProcessedProfileVideoNotificationKeys(jobId: string): Promise<string[] | null> {
+  let tabId: number | undefined;
+  try {
+    const tab = await chrome.tabs.create({ url: FACEBOOK_NOTIFICATIONS_URL, active: false });
+    tabId = tab.id;
+    if (
+      tabId === undefined ||
+      !(await waitForFacebookTabAfterNavigation(
+        tabId,
+        FACEBOOK_NOTIFICATIONS_URL,
+        POSTING_TIMING.facebookTabReadyTimeoutMs,
+      ))
+    ) throw new Error('Facebook notifications page did not finish loading');
+
+    const identities = new Set<string>();
+    const postUrls = new Set<string>();
+    const startedAt = Date.now();
+    let surfaceReadyAt: number | null = null;
+    while (Date.now() - startedAt < POSTING_TIMING.facebookTabReadyTimeoutMs) {
+      const scan = await scanProcessedProfileVideoNotifications(tabId, jobId);
+      if (scan?.surfaceReady) {
+        surfaceReadyAt ??= Date.now();
+        for (const notification of scan.notifications) {
+          identities.add(notification.key);
+          identities.add(`post:${notification.postUrl}`);
+          postUrls.add(notification.postUrl);
+        }
+        // Let Facebook hydrate the notification list before freezing the baseline.
+        if (Date.now() - surfaceReadyAt >= 3000) {
+          await saveBackgroundPostingStep(jobId, 'profile_video_notification_baseline_captured', {
+            notificationCount: postUrls.size,
+          }).catch(() => undefined);
+          return [...identities];
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, POSTING_TIMING.profileVideoNotificationPollIntervalMs));
+    }
+    throw new Error('Timed out waiting for the Facebook notifications surface');
+  } catch (error) {
+    console.warn('[PostFlow] Could not capture the processed-video notification baseline', {
+      jobId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    await saveBackgroundPostingStep(jobId, 'profile_video_notification_baseline_failed', {
+      reason: error instanceof Error ? error.message : String(error),
+    }).catch(() => undefined);
+    return null;
+  } finally {
+    if (tabId !== undefined) await chrome.tabs.remove(tabId).catch(() => undefined);
+  }
+}
+
+async function waitForNewProcessedProfileVideoNotification(
+  jobId: string,
+  baselineKeys: readonly string[],
+): Promise<ProcessedProfileVideoNotificationScanResult | null> {
+  let tabId: number | undefined;
+  try {
+    const tab = await chrome.tabs.create({ url: FACEBOOK_NOTIFICATIONS_URL, active: false });
+    tabId = tab.id;
+    if (
+      tabId === undefined ||
+      !(await waitForFacebookTabAfterNavigation(
+        tabId,
+        FACEBOOK_NOTIFICATIONS_URL,
+        POSTING_TIMING.facebookTabReadyTimeoutMs,
+      ))
+    ) return null;
+
+    const baseline = new Set(baselineKeys);
+    const startedAt = Date.now();
+    let lastRefreshAt = startedAt;
+    while (Date.now() - startedAt < POSTING_TIMING.profileVideoNotificationTimeoutMs) {
+      const scan = await scanProcessedProfileVideoNotifications(tabId, jobId);
+      const found = scan?.notifications.find((notification) =>
+        !baseline.has(notification.key) && !baseline.has(`post:${notification.postUrl}`),
+      );
+      if (found) {
+        await saveBackgroundPostingStep(jobId, 'profile_video_notification_matched', {
+          postUrl: found.postUrl,
+          notificationId: found.notificationId ?? null,
+        }).catch(() => undefined);
+        return found;
+      }
+
+      if (Date.now() - lastRefreshAt >= POSTING_TIMING.profileVideoNotificationRefreshIntervalMs) {
+        await chrome.tabs.reload(tabId).catch(() => undefined);
+        await waitForFacebookTabAfterNavigation(
+          tabId,
+          FACEBOOK_NOTIFICATIONS_URL,
+          POSTING_TIMING.facebookTabReadyTimeoutMs,
+        );
+        lastRefreshAt = Date.now();
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, POSTING_TIMING.profileVideoNotificationPollIntervalMs));
+      }
+    }
+
+    await saveBackgroundPostingStep(jobId, 'profile_video_notification_not_found', {
+      baselineIdentityCount: baseline.size,
+    }).catch(() => undefined);
+    return null;
+  } catch (error) {
+    console.warn('[PostFlow] Profile-video notification reconciliation failed', {
+      jobId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    await saveBackgroundPostingStep(jobId, 'profile_video_notification_check_failed', {
+      reason: error instanceof Error ? error.message : String(error),
+    }).catch(() => undefined);
+    return null;
+  } finally {
+    if (tabId !== undefined) await chrome.tabs.remove(tabId).catch(() => undefined);
+  }
 }
 
 function isCurrentExecutionResult(message: any, sender: chrome.runtime.MessageSender) {
@@ -1113,15 +1443,65 @@ chrome.runtime.onMessage.addListener((message, sender) => {
         status: 'SUCCESS',
         submissionResult: message.submissionResult,
       });
+
+      const completedPostHasVideo = publishJobHasVideo(completedExecution?.post);
+      const shouldReconcileProfileVideoNotification = Boolean(
+        completedExecution?.target.type === 'PROFILE_FEED' &&
+        completedPostHasVideo &&
+        message.submissionResult?.status === 'PUBLISHED' &&
+        !message.submissionResult.postUrl &&
+        Array.isArray(completedExecution.profileVideoNotificationBaselineKeys),
+      );
+
+      if (
+        shouldReconcileProfileVideoNotification &&
+        completedExecution?.target.type === 'PROFILE_FEED' &&
+        Array.isArray(completedExecution.profileVideoNotificationBaselineKeys)
+      ) {
+        console.log('[PostFlow] Waiting for a new processed profile-video notification', {
+          jobId: message.jobId,
+          baselineIdentityCount: completedExecution.profileVideoNotificationBaselineKeys.length,
+        });
+        const identityStillMatches = await verifyProfileTargetIdentity(completedExecution.target);
+        const notification = identityStillMatches
+          ? await waitForNewProcessedProfileVideoNotification(
+              message.jobId,
+              completedExecution.profileVideoNotificationBaselineKeys,
+            )
+          : null;
+        if (notification) {
+          const updatedJob = await updateJobStatus(message.jobId, {
+            status: 'SUCCESS',
+            submissionResult: {
+              status: 'PUBLISHED',
+              postUrl: notification.postUrl,
+            },
+          });
+          if (updatedJob) {
+            await saveBackgroundPostingStep(message.jobId, 'profile_video_post_url_saved', {
+              postUrl: notification.postUrl,
+            }).catch(() => undefined);
+            console.log('[PostFlow] Profile-video job enriched with its canonical reel URL', {
+              jobId: message.jobId,
+              postUrl: notification.postUrl,
+            });
+          } else {
+            await saveBackgroundPostingStep(message.jobId, 'profile_video_post_url_update_failed', {
+              postUrl: notification.postUrl,
+            }).catch(() => undefined);
+          }
+        } else if (!identityStillMatches) {
+          await saveBackgroundPostingStep(message.jobId, 'profile_video_notification_check_skipped', {
+            reason: 'Facebook identity no longer matches the profile target',
+          }).catch(() => undefined);
+        }
+      }
+
       isProcessingJob = false;
       activeExecution = null;
 
-      const completedMediaUrls = Array.isArray(completedExecution?.post?.mediaUrls)
-        ? completedExecution.post.mediaUrls
-        : [];
-      const completedPostHasVideo = completedMediaUrls.some((url: unknown) => typeof url === 'string' && url.startsWith('data:video/'));
       const shouldRunAutomaticPostLinkCheck = Boolean(
-        completedExecution?.group &&
+        completedExecution?.target.type === 'GROUP' &&
         completedExecution.post &&
         (
           (
@@ -1135,14 +1515,14 @@ chrome.runtime.onMessage.addListener((message, sender) => {
         ),
       );
 
-      if (shouldRunAutomaticPostLinkCheck && completedExecution?.group && completedExecution.post) {
+      if (shouldRunAutomaticPostLinkCheck && completedExecution?.target.type === 'GROUP' && completedExecution.post) {
         const syncPost: PendingFacebookPost = {
           id: message.jobId,
-          groupId: String(completedExecution.group._id ?? completedExecution.group.id ?? ''),
-          groupExternalId: completedExecution.group.externalId,
-          groupUrl: completedExecution.group.url,
+          groupId: completedExecution.target.groupId,
+          groupExternalId: completedExecution.target.externalId,
+          groupUrl: completedExecution.target.url,
           status: 'PENDING_APPROVAL',
-          content: completedExecution.post.content,
+          content: typeof completedExecution.post.content === 'string' ? completedExecution.post.content : '',
           submittedAt: new Date().toISOString(),
           mediaCount: Array.isArray(completedExecution.post.mediaUrls)
             ? completedExecution.post.mediaUrls.length
@@ -1427,6 +1807,8 @@ async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlread
   isCheckingEngagement = true;
   const requestId = `engagement-${++engagementCheckSequence}`;
   let syncTabId: number | undefined;
+  let previousActiveTabId: number | undefined;
+  let foregroundRetryUsed = false;
   const postUrl = normalizeStoredFacebookPostUrl(post.postUrl);
   if (!postUrl) {
     console.error('[PostAnalytics] Invalid stored Facebook post URL', { postId: post.id, postUrl: post.postUrl });
@@ -1435,6 +1817,8 @@ async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlread
     return { status: 'CHECK_FAILED', reason: 'Stored Facebook post URL is invalid' };
   }
   try {
+    const [previousActiveTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    previousActiveTabId = previousActiveTab?.id;
     console.log('[PostAnalytics] Opening published post', {
       postId: post.id,
       postUrl,
@@ -1452,31 +1836,60 @@ async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlread
       return { status: 'CHECK_FAILED', reason: 'Target Facebook post did not finish loading' };
     }
 
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < POSTING_TIMING.facebookTabReadyTimeoutMs) {
-      try {
-        console.log('[PostAnalytics] Sending engagement check to Facebook tab', {
+    for (let renderAttempt = 0; renderAttempt < 2; renderAttempt += 1) {
+      if (renderAttempt === 1) {
+        foregroundRetryUsed = true;
+        console.warn('[PostAnalytics] Empty background Facebook surface; retrying in foreground', {
           postId: post.id,
+          targetType: post.targetType ?? 'GROUP',
           tabId: fbTab.id,
-          requestId,
         });
-        const response = await chrome.tabs.sendMessage(fbTab.id, {
-          type: 'CHECK_POST_ENGAGEMENT', requestId, post: { ...post, postUrl },
-        });
-        console.log('[PostAnalytics] Facebook tab response received', { postId: post.id, tabId: fbTab.id, response });
-        if (response?.ok && response.result) {
-          console.log('[PostAnalytics] Engagement check completed', { postId: post.id, result: response.result });
-          return response.result as PostEngagementSyncResult;
+        await chrome.tabs.update(fbTab.id, { active: true });
+        await chrome.tabs.reload(fbTab.id);
+        const foregroundReady = await waitForFacebookTabAfterNavigation(
+          fbTab.id,
+          postUrl,
+          POSTING_TIMING.facebookTabReadyTimeoutMs,
+        );
+        if (!foregroundReady) {
+          return { status: 'CHECK_FAILED', reason: 'Target Facebook post did not finish loading in foreground' };
         }
-      } catch (error) {
-        console.log('[PostAnalytics] Facebook content script unavailable; retrying', {
-          postId: post.id,
-          tabId: fbTab.id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        // The content script can be replaced while Facebook finishes navigation.
       }
-      await new Promise((resolve) => setTimeout(resolve, POSTING_TIMING.facebookMessageRetryIntervalMs));
+
+      const startedAt = Date.now();
+      let retryInForeground = false;
+      while (Date.now() - startedAt < POSTING_TIMING.facebookTabReadyTimeoutMs) {
+        try {
+          console.log('[PostAnalytics] Sending engagement check to Facebook tab', {
+            postId: post.id,
+            tabId: fbTab.id,
+            requestId,
+            renderAttempt: renderAttempt + 1,
+          });
+          const response = await chrome.tabs.sendMessage(fbTab.id, {
+            type: 'CHECK_POST_ENGAGEMENT', requestId, post: { ...post, postUrl },
+          });
+          console.log('[PostAnalytics] Facebook tab response received', { postId: post.id, tabId: fbTab.id, response });
+          if (response?.ok && response.result) {
+            if (renderAttempt === 0 && response.emptySurface === true) {
+              retryInForeground = true;
+              break;
+            }
+            console.log('[PostAnalytics] Engagement check completed', { postId: post.id, result: response.result });
+            return response.result as PostEngagementSyncResult;
+          }
+        } catch (error) {
+          console.log('[PostAnalytics] Facebook content script unavailable; retrying', {
+            postId: post.id,
+            tabId: fbTab.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          // The content script can be replaced while Facebook finishes navigation.
+        }
+        await new Promise((resolve) => setTimeout(resolve, POSTING_TIMING.facebookMessageRetryIntervalMs));
+      }
+      if (retryInForeground) continue;
+      break;
     }
     console.error('[PostAnalytics] Timed out waiting for Facebook engagement content script', {
       postId: post.id,
@@ -1488,6 +1901,9 @@ async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlread
   } finally {
     if (syncTabId !== undefined) {
       await chrome.tabs.remove(syncTabId).catch(() => undefined);
+    }
+    if (foregroundRetryUsed && previousActiveTabId !== undefined && previousActiveTabId !== syncTabId) {
+      await chrome.tabs.update(previousActiveTabId, { active: true }).catch(() => undefined);
     }
     isCheckingEngagement = false;
     if (!lockAlreadyHeld) isFacebookSyncBusy = false;

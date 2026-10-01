@@ -17,9 +17,17 @@ interface Group {
   externalId?: string;
 }
 
+interface FacebookConnection {
+  _id: string;
+  displayName?: string;
+  facebookUserId?: string;
+}
+
 interface Job {
   _id: string;
-  groupId: Group;
+  targetType?: "GROUP" | "PROFILE_FEED";
+  groupId?: Group;
+  facebookConnectionId?: FacebookConnection | string;
   status: string;
   submissionStatus?: "PUBLISHED" | "PENDING_APPROVAL" | "UNKNOWN";
   postUrl?: string;
@@ -87,6 +95,34 @@ function timeAgo(dateStr: string): string {
 
 function getCreatorLabel(createdBy?: Post["createdBy"]): string {
   return createdBy?.fullName || createdBy?.email || createdBy?.clerkUserId || "Unknown";
+}
+
+function isProfileJob(job: Job): boolean {
+  return job.targetType === "PROFILE_FEED" || (!job.groupId && Boolean(job.facebookConnectionId));
+}
+
+function isGroupJob(job: Job): job is Job & { groupId: Group } {
+  return !isProfileJob(job) && Boolean(job.groupId);
+}
+
+function getProfileLabel(connection?: FacebookConnection | string): string {
+  if (connection && typeof connection === "object") {
+    if (connection.displayName) return connection.displayName;
+    if (connection.facebookUserId) return `Facebook ending ${connection.facebookUserId.slice(-4)}`;
+  }
+  return "Facebook profile feed";
+}
+
+function getTargetLabel(job: Job): string {
+  return isProfileJob(job) ? `${getProfileLabel(job.facebookConnectionId)} · Profile feed` : job.groupId?.name ?? "Facebook group";
+}
+
+function getTargetSummary(jobs: Job[]): string {
+  const profileCount = jobs.filter(isProfileJob).length;
+  const groupCount = jobs.filter(isGroupJob).length;
+  if (profileCount && groupCount) return `${groupCount} groups · ${profileCount} profile feeds`;
+  if (profileCount) return `${profileCount} profile feed${profileCount === 1 ? "" : "s"}`;
+  return `${groupCount} group${groupCount === 1 ? "" : "s"}`;
 }
 
 function JobStatusBadge({ job }: { job: Job }) {
@@ -213,6 +249,14 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
       </div>
     );
   }
+  const groupJobs = post.jobs.filter(isGroupJob);
+  const publishedEngagementJobs = post.jobs.filter(
+    (job) => job.submissionStatus === "PUBLISHED" && job.postUrl,
+  );
+  const pendingGroupJobs = groupJobs.filter(
+    (job) => job.submissionStatus === "PENDING_APPROVAL",
+  );
+
   return (
     <div className="page-shell">
       {/* Header */}
@@ -241,18 +285,18 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
               </div>
               <div className="flex items-center gap-1.5">
                 <Users className="h-4 w-4" />
-                {post.jobs.length} target groups
+                {getTargetSummary(post.jobs)}
               </div>
             </div>
           </div>
           <div className="flex flex-col items-start gap-3 text-sm font-medium sm:flex-row sm:flex-wrap sm:items-center lg:justify-end">
             <OverallStatusBadge jobs={post.jobs} />
             <PostControlButtons postId={post._id} jobs={post.jobs} />
-            {post.jobs.some((job) => job.submissionStatus === "PUBLISHED" && job.postUrl) && (
+            {publishedEngagementJobs.length > 0 && (
               <RefreshAllPostEngagementButton postId={post._id} />
             )}
             <RefreshPostStatusControls
-              jobs={post.jobs.filter((job) => job.submissionStatus === "PENDING_APPROVAL").map((job) => ({
+              jobs={pendingGroupJobs.map((job) => ({
                 id: job._id,
                 groupId: job.groupId._id,
                 groupExternalId: job.groupId.externalId,
@@ -309,87 +353,92 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
           </div>
 
           <div className="space-y-3 lg:hidden">
-            {post.jobs.map((job) => (
-              <article key={job._id} className="rounded-xl border border-border bg-card p-4 shadow-sm">
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                  <div className="min-w-0">
-                    <p className="break-words font-medium text-foreground">{job.groupId.name}</p>
-                    <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
-                      <a
-                        href={job.groupId.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
-                      >
-                        View Group <ExternalLink className="h-3 w-3" />
-                      </a>
-                      {job.postUrl && (
-                        <a
-                          href={job.postUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 text-xs text-amber-600 hover:underline"
-                        >
-                          View Facebook post <ExternalLink className="h-3 w-3" />
-                        </a>
+            {post.jobs.map((job) => {
+              const groupJob = isGroupJob(job);
+              return (
+                <article key={job._id} className="rounded-xl border border-border bg-card p-4 shadow-sm">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                    <div className="min-w-0">
+                      <p className="break-words font-medium text-foreground">{getTargetLabel(job)}</p>
+                      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
+                        {groupJob && (
+                          <a
+                            href={job.groupId.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+                          >
+                            View Group <ExternalLink className="h-3 w-3" />
+                          </a>
+                        )}
+                        {job.postUrl && (
+                          <a
+                            href={job.postUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 text-xs text-amber-600 hover:underline"
+                          >
+                            View Facebook post <ExternalLink className="h-3 w-3" />
+                          </a>
+                        )}
+                      </div>
+                    </div>
+                    <JobStatusBadge job={job} />
+                  </div>
+
+                  {job.error && (
+                    <div className="mt-3 flex items-start gap-1.5 rounded-md border border-red-500/20 bg-red-500/10 px-2 py-1.5 text-xs text-red-500">
+                      <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      <span className="whitespace-pre-wrap break-words">{job.error}</span>
+                    </div>
+                  )}
+
+                  <div className="mt-4 grid gap-3 text-xs sm:grid-cols-3">
+                    <div>
+                      <p className="font-medium text-muted-foreground">Scheduled</p>
+                      <ScheduledTime value={job.scheduledFor} className="mt-1 block text-foreground" />
+                    </div>
+                    <div>
+                      <p className="font-medium text-muted-foreground">Engagement</p>
+                      {job.engagement ? (
+                        <div className="mt-1 space-y-1 text-foreground">
+                          <p>{job.engagement.reactionCount ?? "-"} reactions</p>
+                          <p>{job.engagement.commentCount ?? "-"} comments</p>
+                          <p className="text-muted-foreground">Updated {timeAgo(job.engagement.lastSyncedAt)}</p>
+                        </div>
+                      ) : (
+                        <p className="mt-1 text-foreground">Not synced</p>
+                      )}
+                      {job.lastEngagementSyncError && (
+                        <p className="mt-1 break-words text-red-500">{job.lastEngagementSyncError}</p>
                       )}
                     </div>
+                    <div>
+                      <p className="font-medium text-muted-foreground">Attempts</p>
+                      <p className="mt-1 text-foreground">{job.attempts > 0 ? job.attempts : "-"}</p>
+                    </div>
                   </div>
-                  <JobStatusBadge job={job} />
-                </div>
 
-                {job.error && (
-                  <div className="mt-3 flex items-start gap-1.5 rounded-md border border-red-500/20 bg-red-500/10 px-2 py-1.5 text-xs text-red-500">
-                    <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                    <span className="whitespace-pre-wrap break-words">{job.error}</span>
-                  </div>
-                )}
-
-                <div className="mt-4 grid gap-3 text-xs sm:grid-cols-3">
-                  <div>
-                    <p className="font-medium text-muted-foreground">Scheduled</p>
-                    <ScheduledTime value={job.scheduledFor} className="mt-1 block text-foreground" />
-                  </div>
-                  <div>
-                    <p className="font-medium text-muted-foreground">Engagement</p>
-                    {job.engagement ? (
-                      <div className="mt-1 space-y-1 text-foreground">
-                        <p>{job.engagement.reactionCount ?? "-"} reactions</p>
-                        <p>{job.engagement.commentCount ?? "-"} comments</p>
-                        <p className="text-muted-foreground">Updated {timeAgo(job.engagement.lastSyncedAt)}</p>
-                      </div>
-                    ) : (
-                      <p className="mt-1 text-foreground">Not synced</p>
+                  <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
+                    {job.submissionStatus === "PUBLISHED" && job.postUrl && (
+                      <RefreshPostEngagementButton postId={job._id} postUrl={job.postUrl} />
                     )}
-                    {job.lastEngagementSyncError && (
-                      <p className="mt-1 break-words text-red-500">{job.lastEngagementSyncError}</p>
+                    {groupJob && (job.submissionStatus === "PENDING_APPROVAL" ||
+                      (job.submissionStatus === "PUBLISHED" && (!job.postUrl || job.postUrl.includes("/pending_posts/")))) && (
+                      <RefreshGroupStatusButton job={{
+                        id: job._id,
+                        groupId: job.groupId._id,
+                        groupExternalId: job.groupId.externalId,
+                        groupUrl: job.groupId.url,
+                        content: post.content,
+                        submittedAt: job.submittedAt ?? post.createdAt,
+                        postUrl: job.postUrl,
+                      }} />
                     )}
                   </div>
-                  <div>
-                    <p className="font-medium text-muted-foreground">Attempts</p>
-                    <p className="mt-1 text-foreground">{job.attempts > 0 ? job.attempts : "-"}</p>
-                  </div>
-                </div>
-
-                <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-                  {job.submissionStatus === "PUBLISHED" && job.postUrl && (
-                    <RefreshPostEngagementButton postId={job._id} postUrl={job.postUrl} />
-                  )}
-                  {(job.submissionStatus === "PENDING_APPROVAL" ||
-                    (job.submissionStatus === "PUBLISHED" && (!job.postUrl || job.postUrl.includes("/pending_posts/")))) && (
-                    <RefreshGroupStatusButton job={{
-                      id: job._id,
-                      groupId: job.groupId._id,
-                      groupExternalId: job.groupId.externalId,
-                      groupUrl: job.groupId.url,
-                      content: post.content,
-                      submittedAt: job.submittedAt ?? post.createdAt,
-                      postUrl: job.postUrl,
-                    }} />
-                  )}
-                </div>
-              </article>
-            ))}
+                </article>
+              );
+            })}
           </div>
 
           <div className="hidden overflow-hidden rounded-xl border border-border bg-card shadow-sm lg:block">
@@ -397,7 +446,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
               <table className="w-full min-w-[760px] text-sm">
               <thead>
                 <tr className="border-b border-border bg-muted/40">
-                  <th className="px-4 py-3 text-left font-medium text-muted-foreground">Group</th>
+                  <th className="px-4 py-3 text-left font-medium text-muted-foreground">Target</th>
                   <th className="px-4 py-3 text-left font-medium text-muted-foreground">Scheduled</th>
                   <th className="px-4 py-3 text-left font-medium text-muted-foreground">Status</th>
                   <th className="px-4 py-3 text-left font-medium text-muted-foreground">Engagement</th>
@@ -405,12 +454,14 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                 </tr>
               </thead>
               <tbody className="divide-y divide-border">
-                {post.jobs.map((job) => (
+                {post.jobs.map((job) => {
+                  const groupJob = isGroupJob(job);
+                  return (
                   <tr key={job._id} className="hover:bg-muted/30 transition-colors">
                     <td className="px-4 py-3">
                       <div className="flex flex-col">
                         <span className="font-medium text-foreground truncate max-w-[200px] sm:max-w-[300px]">
-                          {job.groupId.name}
+                          {getTargetLabel(job)}
                         </span>
                         {job.error && (
                           <div className="mt-2 flex max-w-[360px] items-start gap-1.5 rounded-md border border-red-500/20 bg-red-500/10 px-2 py-1.5 text-xs text-red-500">
@@ -418,14 +469,16 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                             <span className="whitespace-pre-wrap break-words">{job.error}</span>
                           </div>
                         )}
-                        <a 
-                          href={job.groupId.url} 
-                          target="_blank" 
-                          rel="noopener noreferrer"
-                          className="text-xs text-primary hover:underline inline-flex items-center gap-1 mt-1"
-                        >
-                          View Group <ExternalLink className="w-3 h-3" />
-                        </a>
+                        {groupJob && (
+                          <a
+                            href={job.groupId.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs text-primary hover:underline inline-flex items-center gap-1 mt-1"
+                          >
+                            View Group <ExternalLink className="w-3 h-3" />
+                          </a>
+                        )}
                         {job.postUrl && (
                           <a
                             href={job.postUrl}
@@ -439,7 +492,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                         {job.submissionStatus === "PUBLISHED" && job.postUrl && (
                           <RefreshPostEngagementButton postId={job._id} postUrl={job.postUrl} />
                         )}
-                        {(job.submissionStatus === "PENDING_APPROVAL" ||
+                        {groupJob && (job.submissionStatus === "PENDING_APPROVAL" ||
                           (job.submissionStatus === "PUBLISHED" && (!job.postUrl || job.postUrl.includes("/pending_posts/")))) && (
                           <RefreshGroupStatusButton job={{
                             id: job._id,
@@ -481,7 +534,8 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                       {job.attempts > 0 ? job.attempts : '-'}
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
               </table>
             </div>
@@ -498,7 +552,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
         jobs={post.jobs
           .map((job) => ({
             _id: job._id,
-            groupName: job.groupId.name,
+            targetLabel: getTargetLabel(job),
             status: job.status,
             submissionStatus: job.submissionStatus,
             scheduledFor: job.scheduledFor,

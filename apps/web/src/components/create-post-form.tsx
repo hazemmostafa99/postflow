@@ -2,9 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { CheckSquare, ChevronDown, ImagePlus, Loader2, Search, Send, Square, Trash2, UserRound, Users, X } from "lucide-react";
+import { CalendarClock, CheckSquare, ChevronDown, Clock3, ImagePlus, Loader2, Search, Send, Square, Trash2, UserRound, Users, X } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 interface Group {
   _id: string;
@@ -13,14 +12,18 @@ interface Group {
   status: string;
   facebookConnectionId?: string;
 }
-
 interface FacebookConnection {
   _id: string;
   displayName?: string;
   facebookUserId?: string;
+  detectedFacebookUserId?: string;
   status: string;
   workerStatus: string;
 }
+
+type SelectedDestination =
+  | { key: string; type: "GROUP"; group: Group }
+  | { key: string; type: "PROFILE_FEED"; connection: FacebookConnection };
 
 interface CreatePostFormProps {
   groups?: Group[];
@@ -57,8 +60,11 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
   const router = useRouter();
   const [availableGroups, setAvailableGroups] = useState<Group[]>(groups);
   const [selectedGroupsById, setSelectedGroupsById] = useState<Map<string, Group>>(new Map());
+  const [selectedProfilesById, setSelectedProfilesById] = useState<Map<string, FacebookConnection>>(new Map());
+  const [selectedTargetKeys, setSelectedTargetKeys] = useState<string[]>([]);
   const [content, setContent] = useState("");
   const [mediaUrls, setMediaUrls] = useState<string[]>([]);
+  const [publishMode, setPublishMode] = useState<"NOW" | "SCHEDULED">("NOW");
   const [startTime, setStartTime] = useState("");
   const [spacePostsApart, setSpacePostsApart] = useState(false);
   const [spacingMinutes, setSpacingMinutes] = useState(3);
@@ -70,13 +76,25 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
   const [groupTotal, setGroupTotal] = useState(groups.length);
   const [groupTotalPages, setGroupTotalPages] = useState(Math.max(1, Math.ceil(groups.length / GROUPS_PER_PAGE)));
   const [connections, setConnections] = useState<FacebookConnection[]>([]);
-  const [selectedConnectionId, setSelectedConnectionId] = useState("");
+  const [selectedConnectionIds, setSelectedConnectionIds] = useState<string[]>([]);
+  const [isProfileMenuOpen, setIsProfileMenuOpen] = useState(false);
+  const [isGroupAccountMenuOpen, setIsGroupAccountMenuOpen] = useState(false);
   const [isGroupMenuOpen, setIsGroupMenuOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const selectedGroups = useMemo(
-    () => Array.from(selectedGroupsById.values()),
-    [selectedGroupsById],
+  const selectedDestinations = useMemo<SelectedDestination[]>(
+    () => selectedTargetKeys.flatMap((key): SelectedDestination[] => {
+      if (key.startsWith("GROUP:")) {
+        const group = selectedGroupsById.get(key.slice("GROUP:".length));
+        return group ? [{ key, type: "GROUP", group }] : [];
+      }
+      if (key.startsWith("PROFILE_FEED:")) {
+        const connection = selectedProfilesById.get(key.slice("PROFILE_FEED:".length));
+        return connection ? [{ key, type: "PROFILE_FEED", connection }] : [];
+      }
+      return [];
+    }),
+    [selectedGroupsById, selectedProfilesById, selectedTargetKeys],
   );
 
   const fetchGroupsPage = useCallback(async (page: number, search: string) => {
@@ -87,7 +105,7 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
         limit: String(GROUPS_PER_PAGE),
       });
       if (search.trim()) params.set("search", search.trim());
-      if (selectedConnectionId) params.set("connectionId", selectedConnectionId);
+      if (selectedConnectionIds.length > 0) params.set("connectionIds", selectedConnectionIds.join(","));
 
       const res = await fetch(`/api/groups?${params.toString()}`);
       if (!res.ok) throw new Error("Failed to load groups");
@@ -102,7 +120,7 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
     } finally {
       setIsLoadingGroups(false);
     }
-  }, [selectedConnectionId]);
+  }, [selectedConnectionIds]);
 
   useEffect(() => {
     let cancelled = false;
@@ -114,17 +132,13 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
       .then((data) => {
         if (cancelled) return;
         setConnections(data);
-        const connected = data.filter((connection) => connection.status === "CONNECTED");
-        if (!selectedConnectionId && connected.length === 1) {
-          setSelectedConnectionId(connected[0]._id);
-        }
       })
       .catch(() => undefined);
 
     return () => {
       cancelled = true;
     };
-  }, [selectedConnectionId]);
+  }, []);
 
   useEffect(() => {
     const handle = window.setTimeout(() => {
@@ -151,12 +165,22 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
       : "Unnamed profile";
   }, []);
 
+  const connectionAccountSuffix = useCallback((connection: FacebookConnection) => (
+    connection.facebookUserId ? `Account ending ${connection.facebookUserId.slice(-4)}` : "Facebook account"
+  ), []);
+
   const connectionStatus = useCallback((connection: FacebookConnection) => {
     if (connection.status === "CONNECTED") {
       return connection.workerStatus === "PUBLISHING" ? "Publishing" : "Ready";
     }
     return connection.status.replaceAll("_", " ").toLowerCase().replace(/\b\w/g, (letter) => letter.toUpperCase());
   }, []);
+
+  const isProfileReady = useCallback((connection: FacebookConnection) => (
+    connection.status === "CONNECTED" &&
+    Boolean(connection.facebookUserId) &&
+    connection.detectedFacebookUserId === connection.facebookUserId
+  ), []);
 
   const toggleGroup = useCallback((group: Group) => {
     setSelectedGroupsById((prev) => {
@@ -168,6 +192,9 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
       }
       return next;
     });
+    setSelectedTargetKeys((keys) => keys.includes(`GROUP:${group._id}`)
+      ? keys.filter((key) => key !== `GROUP:${group._id}`)
+      : [...keys, `GROUP:${group._id}`]);
   }, []);
 
   const selectAll = useCallback(() => {
@@ -178,10 +205,60 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
       }
       return next;
     });
+    setSelectedTargetKeys((keys) => [
+      ...keys,
+      ...availableGroups
+        .map((group) => `GROUP:${group._id}`)
+        .filter((key) => !keys.includes(key)),
+    ]);
   }, [availableGroups]);
+
+  const clearGroups = useCallback(() => {
+    setSelectedGroupsById(new Map());
+    setSelectedTargetKeys((keys) => keys.filter((key) => !key.startsWith("GROUP:")));
+  }, []);
+
+  const toggleProfile = useCallback((connection: FacebookConnection) => {
+    if (!isProfileReady(connection)) return;
+    const key = `PROFILE_FEED:${connection._id}`;
+    setSelectedProfilesById((prev) => {
+      const next = new Map(prev);
+      if (next.has(connection._id)) {
+        next.delete(connection._id);
+      } else {
+        next.set(connection._id, connection);
+      }
+      return next;
+    });
+    setSelectedTargetKeys((keys) => keys.includes(key)
+      ? keys.filter((item) => item !== key)
+      : [...keys, key]);
+  }, [isProfileReady]);
+
+  const clearProfiles = useCallback(() => {
+    setSelectedProfilesById(new Map());
+    setSelectedTargetKeys((keys) => keys.filter((key) => !key.startsWith("PROFILE_FEED:")));
+  }, []);
+
+  const updateGroupConnectionFilter = useCallback((connectionIds: string[]) => {
+    setSelectedConnectionIds(connectionIds);
+    setSelectedGroupsById(new Map());
+    setSelectedTargetKeys((keys) => keys.filter((key) => !key.startsWith("GROUP:")));
+    setGroupPage(1);
+  }, []);
+
+  const toggleGroupConnection = useCallback((connectionId: string) => {
+    updateGroupConnectionFilter(
+      selectedConnectionIds.includes(connectionId)
+        ? selectedConnectionIds.filter((id) => id !== connectionId)
+        : [...selectedConnectionIds, connectionId],
+    );
+  }, [selectedConnectionIds, updateGroupConnectionFilter]);
 
   const clearAll = useCallback(() => {
     setSelectedGroupsById(new Map());
+    setSelectedProfilesById(new Map());
+    setSelectedTargetKeys([]);
   }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -192,8 +269,12 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
       setError("Please write content or attach at least one image or video.");
       return;
     }
-    if (selectedGroupsById.size === 0) {
-      setError("Please select at least one group to publish to.");
+    if (selectedTargetKeys.length === 0) {
+      setError("Please select at least one publishing destination.");
+      return;
+    }
+    if (publishMode === "SCHEDULED" && !startTime) {
+      setError("Choose a date and time for the scheduled post.");
       return;
     }
     if (spacePostsApart && !startTime) {
@@ -209,8 +290,10 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
         body: JSON.stringify({
           content: content.trim(),
           mediaUrls,
-          targetGroupIds: Array.from(selectedGroupsById.keys()),
-          ...(startTime ? { startTime: new Date(startTime).toISOString() } : {}),
+          targets: selectedDestinations.map((destination) => destination.type === "GROUP"
+            ? { type: "GROUP", groupId: destination.group._id }
+            : { type: "PROFILE_FEED", facebookConnectionId: destination.connection._id }),
+          ...(publishMode === "SCHEDULED" && startTime ? { startTime: new Date(startTime).toISOString() } : {}),
           spacePostsApart,
           ...(spacePostsApart ? { spacingMinutes } : {}),
         }),
@@ -297,262 +380,352 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
     !isReadingMedia &&
     !isOverLimit &&
     (content.trim().length > 0 || mediaUrls.length > 0) &&
-    selectedGroupsById.size > 0;
-  const selectedConnection = connections.find((connection) => connection._id === selectedConnectionId);
+    selectedTargetKeys.length > 0 &&
+    (publishMode === "NOW" || Boolean(startTime));
+  const selectedGroupConnections = connections.filter((connection) => selectedConnectionIds.includes(connection._id));
+  const groupConnectionFilterLabel = selectedGroupConnections.length === 0
+    ? "Groups from all profiles"
+    : selectedGroupConnections.length === 1
+      ? connectionName(selectedGroupConnections[0])
+      : selectedGroupConnections.length + " profiles selected";
+  const publishTimingLabel = publishMode === "SCHEDULED" && startTime
+    ? new Date(startTime).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })
+    : "Publish now";
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-5">
-      <div className="space-y-2">
-        <label htmlFor="content" className="text-sm font-medium text-foreground">
-          Post Content
-        </label>
-        <textarea
-          id="content"
-          value={content}
-          onChange={(e) => setContent(e.target.value)}
-          placeholder="What would you like to share with your groups?"
-          rows={5}
-          className="w-full resize-none rounded-lg border border-border bg-background px-3 py-2.5 text-sm leading-6 shadow-sm placeholder:text-muted-foreground focus:outline-none focus:ring-3 focus:ring-ring/20"
-        />
-        <p className={`text-right text-xs ${isOverLimit ? "text-red-600" : "text-muted-foreground"}`}>
-          {isOverLimit ? `${Math.abs(charsLeft)} characters over limit` : `${charsLeft.toLocaleString()} characters remaining`}
-        </p>
-      </div>
+    <form onSubmit={handleSubmit} className="flex min-h-0 flex-col">
+      <div className="grid min-h-0 lg:grid-cols-[minmax(0,1.15fr)_minmax(19rem,0.85fr)]">
+        <div className="space-y-6 p-5 sm:p-6 lg:border-r lg:border-border">
+          <section className="space-y-2" aria-labelledby="post-content-label">
+            <div className="flex items-center justify-between gap-4">
+              <label id="post-content-label" htmlFor="content" className="text-sm font-semibold text-foreground">
+                Post content
+              </label>
+              <span className={isOverLimit ? "text-xs font-medium tabular-nums text-destructive" : "text-xs tabular-nums text-muted-foreground"}>
+                {isOverLimit ? Math.abs(charsLeft) + " over" : charsLeft.toLocaleString() + " left"}
+              </span>
+            </div>
 
-      <div className="space-y-3 rounded-lg border border-border bg-muted/20 p-3">
-        <div className="grid gap-3 sm:grid-cols-2">
-          <div className="space-y-1.5">
-            <label htmlFor="start-time" className="text-sm font-medium text-foreground">
-              Start time <span className="font-normal text-muted-foreground">(optional)</span>
-            </label>
-            <input
-              id="start-time"
-              type="datetime-local"
-              value={startTime}
-              onChange={(e) => setStartTime(e.target.value)}
-              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm shadow-sm focus:outline-none focus:ring-3 focus:ring-ring/20"
-            />
-          </div>
-          <label className="flex cursor-pointer items-center gap-2 self-end pb-2 text-sm font-medium text-foreground">
-            <input
-              type="checkbox"
-              checked={spacePostsApart}
-              onChange={(e) => setSpacePostsApart(e.target.checked)}
-              className="h-4 w-4 accent-primary"
-            />
-            Space posts apart
-          </label>
-        </div>
-        {spacePostsApart && (
-          <div className="max-w-xs space-y-1.5">
-            <label htmlFor="spacing-minutes" className="text-xs font-medium text-muted-foreground">
-              Minimum time between posts
-            </label>
-            <select
-              id="spacing-minutes"
-              value={spacingMinutes}
-              onChange={(e) => setSpacingMinutes(Number(e.target.value))}
-              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm shadow-sm focus:outline-none focus:ring-3 focus:ring-ring/20"
-            >
-              {[1, 2, 3, 5, 10, 15, 30].map((minutes) => (
-                <option key={minutes} value={minutes}>{minutes} minute{minutes === 1 ? "" : "s"}</option>
-              ))}
-            </select>
-          </div>
-        )}
-        {startTime && selectedGroups.length > 0 && (
-          <div className="text-xs text-muted-foreground">
-            {selectedGroups.map((group, index) => (
-              <div key={group._id} className="flex justify-between gap-4 py-0.5">
-                <span className="truncate">{index + 1}. {group.name}</span>
-                <span className="shrink-0">
-                  {new Date(new Date(startTime).getTime() + index * (spacePostsApart ? spacingMinutes : 0) * 60_000).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}
-                </span>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
+            <div className="overflow-hidden rounded-md border border-border bg-background shadow-sm transition focus-within:border-primary/50 focus-within:ring-3 focus-within:ring-ring/15">
+              <textarea
+                id="content"
+                value={content}
+                onChange={(event) => setContent(event.target.value)}
+                placeholder="Write your post..."
+                rows={7}
+                className="min-h-44 w-full resize-y bg-transparent px-4 py-3 text-sm leading-6 outline-none placeholder:text-muted-foreground"
+              />
 
-      <div className="space-y-2">
-        <div className="flex items-center justify-between">
-          <label className="text-sm font-medium text-foreground">
-            Media
-            <span className="ml-2 font-normal text-muted-foreground">
-              ({mediaUrls.length}/{MAX_MEDIA_FILES})
-            </span>
-          </label>
-          <label className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-xs font-medium text-primary transition-colors hover:bg-accent">
-            {isReadingMedia ? <Loader2 className="h-3 w-3 animate-spin" /> : <ImagePlus className="h-3 w-3" />}
-            Add images or video
-            <input
-              type="file"
-              accept="image/*,video/*"
-              multiple
-              onChange={handleMediaChange}
-              disabled={isReadingMedia || mediaUrls.length >= MAX_MEDIA_FILES}
-              className="sr-only"
-            />
-          </label>
-        </div>
+              {mediaUrls.length > 0 && (
+                <div className="grid grid-cols-2 gap-2 border-t border-border p-3 sm:grid-cols-4">
+                  {mediaUrls.map((url, index) => (
+                    <div key={url.slice(0, 32) + "-" + index} className="group relative aspect-square overflow-hidden rounded-md border border-border bg-muted">
+                      {url.startsWith("data:video/") ? (
+                        <video src={url} controls className="h-full w-full object-cover" />
+                      ) : (
+                        <img src={url} alt="" className="h-full w-full object-cover" />
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => removeMedia(index)}
+                        className="absolute right-1.5 top-1.5 inline-flex h-7 w-7 items-center justify-center rounded-md bg-background/95 text-muted-foreground opacity-100 shadow-sm transition-colors hover:text-destructive sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
+                        aria-label="Remove media"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
 
-        {mediaUrls.length > 0 && (
-          <div className="grid grid-cols-4 gap-2">
-            {mediaUrls.map((url, index) => (
-              <div key={`${url.slice(0, 32)}-${index}`} className="group relative aspect-square overflow-hidden rounded-lg border border-border bg-muted shadow-sm">
-                {url.startsWith("data:video/") ? (
-                  <video src={url} controls className="h-full w-full object-cover" />
-                ) : (
-                  <img src={url} alt="" className="h-full w-full object-cover" />
-                )}
-                <button
-                  type="button"
-                  onClick={() => removeMedia(index)}
-                  className="absolute right-1 top-1 inline-flex h-7 w-7 items-center justify-center rounded-md bg-background/95 text-muted-foreground opacity-0 shadow-sm transition-opacity hover:text-foreground group-hover:opacity-100"
-                  aria-label="Remove media"
+              <div className="flex min-h-12 items-center justify-between gap-3 border-t border-border bg-muted/25 px-3 py-2">
+                <label
+                  className={
+                    "inline-flex h-8 items-center gap-2 rounded-md px-2.5 text-xs font-medium transition-colors " +
+                    (isReadingMedia || mediaUrls.length >= MAX_MEDIA_FILES
+                      ? "cursor-not-allowed text-muted-foreground opacity-60"
+                      : "cursor-pointer text-primary hover:bg-primary/10")
+                  }
                 >
-                  <Trash2 className="h-3.5 w-3.5" />
+                  {isReadingMedia ? <Loader2 className="h-4 w-4 animate-spin" /> : <ImagePlus className="h-4 w-4" />}
+                  Add media
+                  <input
+                    type="file"
+                    accept="image/*,video/*"
+                    multiple
+                    onChange={handleMediaChange}
+                    disabled={isReadingMedia || mediaUrls.length >= MAX_MEDIA_FILES}
+                    className="sr-only"
+                  />
+                </label>
+                <span className="text-xs tabular-nums text-muted-foreground">{mediaUrls.length}/{MAX_MEDIA_FILES}</span>
+              </div>
+            </div>
+          </section>
+
+          {selectedDestinations.length > 0 && (
+            <section className="space-y-2" aria-labelledby="selected-destinations-label">
+              <div className="flex items-center justify-between gap-3">
+                <h3 id="selected-destinations-label" className="text-sm font-semibold text-foreground">Selected destinations</h3>
+                <button type="button" onClick={clearAll} className="text-xs font-medium text-muted-foreground hover:text-foreground">
+                  Clear all
                 </button>
               </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {connections.length > 0 && (
-        <div className="space-y-3 rounded-lg border border-border bg-muted/20 p-3">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <p className="text-sm font-medium text-foreground">Publish from</p>
-              <p className="text-xs text-muted-foreground">Choose the profile that owns these groups.</p>
-            </div>
-          </div>
-          <Select
-            value={selectedConnectionId || "all"}
-            onValueChange={(value) => {
-              const connectionId = value === "all" ? "" : String(value ?? "");
-              setSelectedConnectionId(connectionId);
-              setSelectedGroupsById(new Map());
-              setGroupPage(1);
-            }}
-          >
-            <SelectTrigger aria-label="Choose Facebook profile">
-              <SelectValue>
-                {() => (
-                  <span className="flex min-w-0 items-center gap-3 text-left">
-                    <span className={`grid h-8 w-8 shrink-0 place-items-center rounded-md ${selectedConnection ? "bg-emerald-50 text-emerald-700" : "bg-muted text-muted-foreground"}`}>
-                      {selectedConnection ? <UserRound className="h-4 w-4" /> : <Users className="h-4 w-4" />}
+              <div className="flex max-h-24 flex-wrap gap-1.5 overflow-y-auto">
+                {selectedDestinations.map((destination) => {
+                  const label = destination.type === "GROUP"
+                    ? destination.group.name
+                    : connectionName(destination.connection);
+                  return (
+                    <span
+                      key={destination.key}
+                      className="inline-flex h-8 max-w-full items-center gap-1.5 rounded-md border border-primary/20 bg-primary/10 pl-2.5 pr-1.5 text-xs font-medium text-foreground"
+                    >
+                      {destination.type === "PROFILE_FEED"
+                        ? <UserRound className="h-3.5 w-3.5 shrink-0 text-primary" />
+                        : <Users className="h-3.5 w-3.5 shrink-0 text-primary" />}
+                      <span className="max-w-48 truncate">{label}</span>
+                      <button
+                        type="button"
+                        onClick={() => destination.type === "GROUP" ? toggleGroup(destination.group) : toggleProfile(destination.connection)}
+                        className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-background hover:text-foreground"
+                        aria-label={"Remove " + label}
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
                     </span>
-                    <span className="min-w-0">
-                      <span className="block truncate text-sm font-medium text-foreground">
-                        {selectedConnection ? connectionName(selectedConnection) : "All profiles"}
-                      </span>
-                      <span className="block truncate text-xs text-muted-foreground">
-                        {selectedConnection ? connectionStatus(selectedConnection) : `Show groups from ${connections.length} profiles`}
-                      </span>
-                    </span>
-                  </span>
-                )}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent align="start" className="w-(--anchor-width)">
-              <SelectItem value="all">
-                <span className="block min-w-0">
-                  <span className="block truncate text-sm font-medium">All profiles</span>
-                  <span className="block truncate text-xs text-muted-foreground">Show groups from every account</span>
-                </span>
-              </SelectItem>
-              {connections.map((connection) => (
-                <SelectItem key={connection._id} value={connection._id}>
-                  <span className="block min-w-0">
-                    <span className="block truncate text-sm font-medium">{connectionName(connection)}</span>
-                    <span className="block truncate text-xs text-muted-foreground">{connectionStatus(connection)}</span>
-                  </span>
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+                  );
+                })}
+              </div>
+            </section>
+          )}
         </div>
-      )}
 
-      <div className="space-y-3">
-        <div className="rounded-lg border border-border bg-muted/20 p-3">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <p className="text-sm font-medium text-foreground">Target groups</p>
-              <p className="mt-0.5 text-xs text-muted-foreground">Choose where this post should be published.</p>
+        <div className="space-y-6 bg-muted/20 p-5 sm:p-6">
+          <section className="space-y-3" aria-labelledby="destinations-label">
+            <div className="flex items-center justify-between gap-3">
+              <h3 id="destinations-label" className="text-sm font-semibold text-foreground">Destinations</h3>
+              <span className="rounded-md bg-primary/10 px-2 py-1 text-xs font-semibold tabular-nums text-primary">
+                {selectedDestinations.length} selected
+              </span>
             </div>
-            <span className="shrink-0 rounded-full border border-border bg-background px-2 py-1 text-xs font-medium text-muted-foreground">
-              {selectedGroupsById.size} selected
-            </span>
-          </div>
-          <Popover open={isGroupMenuOpen} onOpenChange={setIsGroupMenuOpen}>
-            <PopoverTrigger
-              type="button"
-              aria-label={selectedGroupsById.size > 0 ? `${selectedGroupsById.size} target groups selected` : "Choose target groups"}
-              className="flex w-full items-center gap-3 rounded-lg border border-border bg-background px-3 py-2.5 text-left shadow-sm transition-colors hover:border-primary/50 focus:outline-none focus:ring-3 focus:ring-ring/20"
-            >
-              <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-primary/10 text-primary">
-                <Users className="h-4 w-4" />
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-sm font-medium text-foreground">
-                  {selectedGroupsById.size > 0 ? `${selectedGroupsById.size} groups selected` : "Choose target groups"}
-                </span>
-                <span className="block truncate text-xs text-muted-foreground">
-                  {isLoadingGroups ? "Loading groups..." : `${groupTotal.toLocaleString()} groups available`}
-                </span>
-              </span>
-              <ChevronDown className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${isGroupMenuOpen ? "rotate-180" : ""}`} />
-            </PopoverTrigger>
 
-            <PopoverContent align="start" className="w-(--anchor-width) p-0">
-                <div className="border-b border-border p-2">
-                  <div className="flex items-center justify-between gap-3 px-1 pb-2">
-                    <span className="text-xs font-medium text-muted-foreground">Select target groups</span>
-                    <div className="flex items-center gap-2">
-                      <button type="button" onClick={selectAll} className="text-xs font-medium text-primary hover:underline">
-                        Select visible
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-xs font-medium text-muted-foreground">Profile feeds</p>
+                {selectedProfilesById.size > 0 && <span className="text-[11px] font-medium text-primary">{selectedProfilesById.size} selected</span>}
+              </div>
+              {connections.length === 0 ? (
+                <div className="rounded-md border border-dashed border-border bg-background/60 px-3 py-4 text-center text-xs text-muted-foreground">
+                  No connected Facebook profiles
+                </div>
+              ) : (
+                <Popover open={isProfileMenuOpen} onOpenChange={setIsProfileMenuOpen}>
+                  <PopoverTrigger
+                    type="button"
+                    aria-label={selectedProfilesById.size > 0 ? selectedProfilesById.size + " profile feeds selected" : "Choose profile feeds"}
+                    className="flex min-h-11 w-full items-center gap-2.5 rounded-md border border-border bg-background px-3 py-2 text-left shadow-sm transition-colors hover:border-primary/40 focus:outline-none focus:ring-3 focus:ring-ring/20"
+                  >
+                    <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-emerald-50 text-emerald-700">
+                      <UserRound className="h-3.5 w-3.5" />
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-xs font-medium text-foreground">
+                        {selectedProfilesById.size > 0 ? selectedProfilesById.size + " profile feeds selected" : "Choose profile feeds"}
+                      </span>
+                      <span className="block truncate text-[11px] text-muted-foreground">
+                        {connections.filter(isProfileReady).length} available
+                      </span>
+                    </span>
+                    <ChevronDown className={"h-4 w-4 shrink-0 text-muted-foreground transition-transform " + (isProfileMenuOpen ? "rotate-180" : "")} />
+                  </PopoverTrigger>
+
+                  <PopoverContent align="start" className="w-(--anchor-width) p-0">
+                    <div className="flex items-center justify-between gap-3 border-b border-border px-3 py-2.5">
+                      <span className="text-xs font-medium text-muted-foreground">Select profile feeds</span>
+                      {selectedProfilesById.size > 0 && (
+                        <button type="button" onClick={clearProfiles} className="text-xs font-medium text-muted-foreground hover:text-foreground">
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                    <div role="listbox" aria-label="Profile feed destinations" aria-multiselectable="true" className="max-h-64 overflow-y-auto p-1.5">
+                      {connections.map((connection) => {
+                        const ready = isProfileReady(connection);
+                        const isSelected = selectedProfilesById.has(connection._id);
+                        return (
+                          <button
+                            key={connection._id}
+                            type="button"
+                            role="option"
+                            aria-selected={isSelected}
+                            aria-disabled={!ready}
+                            disabled={!ready}
+                            onClick={() => toggleProfile(connection)}
+                            className={
+                              "flex min-h-11 w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left transition-colors " +
+                              (isSelected
+                                ? "bg-primary/10 text-foreground"
+                                : ready
+                                  ? "text-foreground hover:bg-accent"
+                                  : "cursor-not-allowed text-muted-foreground opacity-60")
+                            }
+                          >
+                            {isSelected
+                              ? <CheckSquare className="h-3.5 w-3.5 shrink-0 text-primary" />
+                              : <Square className="h-3.5 w-3.5 shrink-0" />}
+                            <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-emerald-50 text-emerald-700">
+                              <UserRound className="h-3.5 w-3.5" />
+                            </span>
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-xs font-medium">{connectionName(connection)}</span>
+                              <span className="block truncate text-[11px] text-muted-foreground">
+                                {ready
+                                  ? connectionStatus(connection) + " - " + connectionAccountSuffix(connection)
+                                  : connection.status === "CONNECTED"
+                                    ? "Profile not verified - " + connectionAccountSuffix(connection)
+                                    : connectionStatus(connection)}
+                              </span>
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <div className="border-t border-border px-3 py-2 text-[11px] text-muted-foreground">
+                      {selectedProfilesById.size} of {connections.filter(isProfileReady).length} selected
+                    </div>
+                  </PopoverContent>
+                </Popover>
+              )}
+              <p className="text-[11px] leading-4 text-muted-foreground">Profile posts keep the audience currently set on Facebook.</p>
+            </div>
+
+            <div className="space-y-2 border-t border-border pt-3">
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-xs font-medium text-muted-foreground">Facebook groups</p>
+                {selectedGroupsById.size > 0 && <span className="text-[11px] font-medium text-primary">{selectedGroupsById.size} selected</span>}
+              </div>
+
+              {connections.length > 0 && (
+                <Popover open={isGroupAccountMenuOpen} onOpenChange={setIsGroupAccountMenuOpen}>
+                  <PopoverTrigger
+                    type="button"
+                    aria-label="Filter groups by Facebook profiles"
+                    className="flex min-h-11 w-full items-center gap-2.5 rounded-md border border-border bg-background px-3 py-2 text-left shadow-sm transition-colors hover:border-primary/40 focus:outline-none focus:ring-3 focus:ring-ring/20"
+                  >
+                    <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-emerald-50 text-emerald-700">
+                      {selectedGroupConnections.length > 0 ? <UserRound className="h-3.5 w-3.5" /> : <Users className="h-3.5 w-3.5" />}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-xs font-medium text-foreground">{groupConnectionFilterLabel}</span>
+                      <span className="block truncate text-[11px] text-muted-foreground">Filter groups by account</span>
+                    </span>
+                    <ChevronDown className={"h-4 w-4 shrink-0 text-muted-foreground transition-transform " + (isGroupAccountMenuOpen ? "rotate-180" : "")} />
+                  </PopoverTrigger>
+
+                  <PopoverContent align="start" className="w-(--anchor-width) p-0">
+                    <div className="border-b border-border px-3 py-2.5">
+                      <span className="text-xs font-medium text-muted-foreground">Groups from profiles</span>
+                    </div>
+                    <div role="listbox" aria-label="Facebook accounts for group filtering" aria-multiselectable="true" className="max-h-64 overflow-y-auto p-1.5">
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={selectedConnectionIds.length === 0}
+                        onClick={() => updateGroupConnectionFilter([])}
+                        className={"flex min-h-11 w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left transition-colors " + (selectedConnectionIds.length === 0 ? "bg-primary/10 text-foreground" : "text-foreground hover:bg-accent")}
+                      >
+                        {selectedConnectionIds.length === 0
+                          ? <CheckSquare className="h-3.5 w-3.5 shrink-0 text-primary" />
+                          : <Square className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />}
+                        <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-muted text-muted-foreground"><Users className="h-3.5 w-3.5" /></span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-xs font-medium">All profiles</span>
+                          <span className="block truncate text-[11px] text-muted-foreground">Include groups from every account</span>
+                        </span>
                       </button>
-                      <button type="button" onClick={clearAll} className="text-xs font-medium text-muted-foreground hover:text-foreground hover:underline">
-                        Clear
-                      </button>
+                      {connections.map((connection) => {
+                        const isSelected = selectedConnectionIds.includes(connection._id);
+                        return (
+                          <button
+                            key={connection._id}
+                            type="button"
+                            role="option"
+                            aria-selected={isSelected}
+                            onClick={() => toggleGroupConnection(connection._id)}
+                            className={"flex min-h-11 w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left transition-colors " + (isSelected ? "bg-primary/10 text-foreground" : "text-foreground hover:bg-accent")}
+                          >
+                            {isSelected
+                              ? <CheckSquare className="h-3.5 w-3.5 shrink-0 text-primary" />
+                              : <Square className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />}
+                            <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-emerald-50 text-emerald-700"><UserRound className="h-3.5 w-3.5" /></span>
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-xs font-medium">{connectionName(connection)}</span>
+                              <span className="block truncate text-[11px] text-muted-foreground">{connectionStatus(connection)}</span>
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <div className="border-t border-border px-3 py-2 text-[11px] text-muted-foreground">
+                      {selectedConnectionIds.length === 0 ? "All profiles included" : selectedConnectionIds.length + " of " + connections.length + " selected"}
+                    </div>
+                  </PopoverContent>
+                </Popover>
+              )}
+
+              <Popover open={isGroupMenuOpen} onOpenChange={setIsGroupMenuOpen}>
+                <PopoverTrigger
+                  type="button"
+                  aria-label={selectedGroupsById.size > 0 ? selectedGroupsById.size + " target groups selected" : "Choose target groups"}
+                  className="flex min-h-11 w-full items-center gap-2.5 rounded-md border border-border bg-background px-3 py-2 text-left shadow-sm transition-colors hover:border-primary/40 focus:outline-none focus:ring-3 focus:ring-ring/20"
+                >
+                  <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-primary/10 text-primary">
+                    <Users className="h-3.5 w-3.5" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-xs font-medium text-foreground">
+                      {selectedGroupsById.size > 0 ? selectedGroupsById.size + " groups selected" : "Choose groups"}
+                    </span>
+                    <span className="block truncate text-[11px] text-muted-foreground">
+                      {isLoadingGroups ? "Loading..." : groupTotal.toLocaleString() + " available"}
+                    </span>
+                  </span>
+                  <ChevronDown className={"h-4 w-4 shrink-0 text-muted-foreground transition-transform " + (isGroupMenuOpen ? "rotate-180" : "")} />
+                </PopoverTrigger>
+
+                <PopoverContent align="start" className="w-(--anchor-width) p-0">
+                  <div className="border-b border-border p-2">
+                    <div className="flex items-center justify-between gap-3 px-1 pb-2">
+                      <span className="text-xs font-medium text-muted-foreground">Select groups</span>
+                      <div className="flex items-center gap-3">
+                        <button type="button" onClick={selectAll} className="text-xs font-medium text-primary hover:underline">Select visible</button>
+                        <button type="button" onClick={clearGroups} className="text-xs font-medium text-muted-foreground hover:text-foreground">Clear</button>
+                      </div>
+                    </div>
+                    <div className="relative">
+                      <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                      <input
+                        type="text"
+                        placeholder="Search groups"
+                        value={searchQuery}
+                        onChange={(event) => {
+                          setSearchQuery(event.target.value);
+                          setGroupPage(1);
+                        }}
+                        aria-label="Search target groups"
+                        autoFocus
+                        className="w-full rounded-md border border-border bg-background py-2 pl-9 pr-3 text-sm shadow-sm placeholder:text-muted-foreground focus:outline-none focus:ring-3 focus:ring-ring/20"
+                      />
                     </div>
                   </div>
-                  <div className="relative">
-                    <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                    <input
-                      type="text"
-                      placeholder="Search groups..."
-                      value={searchQuery}
-                      onChange={(event) => {
-                        setSearchQuery(event.target.value);
-                        setGroupPage(1);
-                      }}
-                      aria-label="Search target groups"
-                      autoFocus
-                      className="w-full rounded-lg border border-border bg-background py-2 pl-9 pr-3 text-sm shadow-sm placeholder:text-muted-foreground focus:outline-none focus:ring-3 focus:ring-ring/20"
-                    />
-                  </div>
-                </div>
 
-                <div
-                  role="listbox"
-                  aria-label="Target groups"
-                  aria-multiselectable="true"
-                  className="max-h-64 space-y-1 overflow-y-auto p-2"
-                >
-                  {availableGroups.length === 0 ? (
-                    <div className="px-3 py-8 text-center">
-                      <p className="text-sm text-muted-foreground">
+                  <div role="listbox" aria-label="Target groups" aria-multiselectable="true" className="max-h-64 overflow-y-auto p-1.5">
+                    {availableGroups.length === 0 ? (
+                      <p className="px-3 py-8 text-center text-sm text-muted-foreground">
                         {searchQuery ? "No groups match your search." : "No groups synced yet."}
                       </p>
-                      <p className="mt-1 text-xs text-muted-foreground/70">
-                        {searchQuery ? "Try a different group name." : "Open the extension on Facebook to collect groups."}
-                      </p>
-                    </div>
-                  ) : (
-                    availableGroups.map((group) => {
+                    ) : availableGroups.map((group) => {
                       const isSelected = selectedGroupsById.has(group._id);
                       return (
                         <button
@@ -561,109 +734,162 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
                           role="option"
                           aria-selected={isSelected}
                           onClick={() => toggleGroup(group)}
-                          className={`flex w-full items-center gap-2 rounded-md border px-2.5 py-2 text-left transition-colors ${
-                            isSelected
-                              ? "border-primary/30 bg-primary/10 text-foreground"
-                              : "border-transparent text-muted-foreground hover:border-border hover:bg-accent hover:text-foreground"
-                          }`}
+                          className={"flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left transition-colors " + (isSelected ? "bg-primary/10 text-foreground" : "text-muted-foreground hover:bg-accent hover:text-foreground")}
                         >
-                          {isSelected ? (
-                            <CheckSquare className="h-3.5 w-3.5 shrink-0 text-primary" />
-                          ) : (
-                            <Square className="h-3.5 w-3.5 shrink-0" />
-                          )}
+                          {isSelected
+                            ? <CheckSquare className="h-3.5 w-3.5 shrink-0 text-primary" />
+                            : <Square className="h-3.5 w-3.5 shrink-0" />}
                           <span className="min-w-0 flex-1">
                             <span className="block truncate text-xs font-medium">{group.name}</span>
-                            <span className="block truncate text-[10px] text-muted-foreground">
-                              {connectionLabel(group.facebookConnectionId)}
-                            </span>
+                            <span className="block truncate text-[10px] text-muted-foreground">{connectionLabel(group.facebookConnectionId)}</span>
                           </span>
                         </button>
                       );
-                    })
-                  )}
-                </div>
-
-                <div className="flex items-center justify-between gap-2 border-t border-border px-3 py-2 text-xs text-muted-foreground">
-                  <span>
-                    {isLoadingGroups ? "Loading..." : `${groupTotal.toLocaleString()} groups - page ${groupPage} of ${groupTotalPages}`}
-                  </span>
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => setGroupPage((page) => Math.max(1, page - 1))}
-                      disabled={groupPage <= 1 || isLoadingGroups}
-                      className="rounded-md border border-border bg-background px-2 py-1 hover:bg-accent disabled:opacity-40"
-                    >
-                      Prev
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setGroupPage((page) => Math.min(groupTotalPages, page + 1))}
-                      disabled={groupPage >= groupTotalPages || isLoadingGroups}
-                      className="rounded-md border border-border bg-background px-2 py-1 hover:bg-accent disabled:opacity-40"
-                    >
-                      Next
-                    </button>
+                    })}
                   </div>
-                </div>
-            </PopoverContent>
-          </Popover>
-        </div>
 
-        {selectedGroups.length > 0 && (
-          <div className="rounded-lg border border-border bg-muted/35 p-3">
-            <div className="mb-2 flex items-center justify-between gap-3">
-              <p className="text-xs font-medium text-muted-foreground">Selected groups</p>
-              <button type="button" onClick={clearAll} className="text-xs text-muted-foreground hover:text-foreground">
-                Clear all
+                  <div className="flex items-center justify-between gap-2 border-t border-border px-3 py-2 text-xs text-muted-foreground">
+                    <span>{isLoadingGroups ? "Loading..." : "Page " + groupPage + " of " + groupTotalPages}</span>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setGroupPage((page) => Math.max(1, page - 1))}
+                        disabled={groupPage <= 1 || isLoadingGroups}
+                        className="rounded-md border border-border bg-background px-2 py-1 hover:bg-accent disabled:opacity-40"
+                      >
+                        Prev
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setGroupPage((page) => Math.min(groupTotalPages, page + 1))}
+                        disabled={groupPage >= groupTotalPages || isLoadingGroups}
+                        className="rounded-md border border-border bg-background px-2 py-1 hover:bg-accent disabled:opacity-40"
+                      >
+                        Next
+                      </button>
+                    </div>
+                  </div>
+                </PopoverContent>
+              </Popover>
+            </div>
+          </section>
+
+          <section className="space-y-3 border-t border-border pt-5" aria-labelledby="publishing-time-label">
+            <h3 id="publishing-time-label" className="text-sm font-semibold text-foreground">Publishing time</h3>
+            <div className="grid grid-cols-2 rounded-md bg-muted p-1" aria-label="Publishing time" role="group">
+              <button
+                type="button"
+                onClick={() => {
+                  setPublishMode("NOW");
+                  setStartTime("");
+                  setSpacePostsApart(false);
+                }}
+                className={"inline-flex h-8 items-center justify-center gap-1.5 rounded text-xs font-medium transition-colors " + (publishMode === "NOW" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground")}
+                aria-pressed={publishMode === "NOW"}
+              >
+                <Clock3 className="h-3.5 w-3.5" />
+                Now
+              </button>
+              <button
+                type="button"
+                onClick={() => setPublishMode("SCHEDULED")}
+                className={"inline-flex h-8 items-center justify-center gap-1.5 rounded text-xs font-medium transition-colors " + (publishMode === "SCHEDULED" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground")}
+                aria-pressed={publishMode === "SCHEDULED"}
+              >
+                <CalendarClock className="h-3.5 w-3.5" />
+                Schedule
               </button>
             </div>
-            <div className="flex max-h-16 flex-wrap gap-1.5 overflow-y-auto pr-1">
-              {selectedGroups.map((group) => (
-                <span
-                  key={group._id}
-                  className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-primary/20 bg-primary/10 px-2 py-1 text-xs font-medium text-foreground"
-                >
-                  <span className="max-w-56 truncate">{group.name}</span>
-                  <button
-                    type="button"
-                    onClick={() => toggleGroup(group)}
-                    className="text-muted-foreground hover:text-foreground"
-                    aria-label={`Remove ${group.name}`}
-                  >
-                    <X className="h-3 w-3" />
-                  </button>
-                </span>
-              ))}
-            </div>
-          </div>
-        )}
 
+            {publishMode === "SCHEDULED" && (
+              <div className="space-y-3">
+                <div className="space-y-1.5">
+                  <label htmlFor="start-time" className="text-xs font-medium text-muted-foreground">Date and time</label>
+                  <input
+                    id="start-time"
+                    type="datetime-local"
+                    value={startTime}
+                    onChange={(event) => setStartTime(event.target.value)}
+                    className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm shadow-sm focus:outline-none focus:ring-3 focus:ring-ring/20"
+                  />
+                </div>
+                <label className="flex cursor-pointer items-center justify-between gap-3 rounded-md border border-border bg-background px-3 py-2.5">
+                  <span className="text-xs font-medium text-foreground">Space destinations apart</span>
+                  <input
+                    type="checkbox"
+                    checked={spacePostsApart}
+                    onChange={(event) => setSpacePostsApart(event.target.checked)}
+                    className="h-4 w-4 accent-primary"
+                  />
+                </label>
+                {spacePostsApart && (
+                  <div className="space-y-1.5">
+                    <label htmlFor="spacing-minutes" className="text-xs font-medium text-muted-foreground">Time between posts</label>
+                    <select
+                      id="spacing-minutes"
+                      value={spacingMinutes}
+                      onChange={(event) => setSpacingMinutes(Number(event.target.value))}
+                      className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm shadow-sm focus:outline-none focus:ring-3 focus:ring-ring/20"
+                    >
+                      {[1, 2, 3, 5, 10, 15, 30].map((minutes) => (
+                        <option key={minutes} value={minutes}>{minutes} minute{minutes === 1 ? "" : "s"}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+                {startTime && selectedDestinations.length > 1 && (
+                  <div className="max-h-24 space-y-1 overflow-y-auto border-l-2 border-primary/30 pl-3 text-[11px] text-muted-foreground">
+                    {selectedDestinations.map((destination, index) => (
+                      <div key={destination.key} className="flex justify-between gap-3">
+                        <span className="truncate">
+                          {destination.type === "GROUP" ? destination.group.name : connectionName(destination.connection) + " - Profile"}
+                        </span>
+                        <span className="shrink-0 tabular-nums">
+                          {new Date(new Date(startTime).getTime() + index * (spacePostsApart ? spacingMinutes : 0) * 60_000).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+        </div>
       </div>
 
-      {error && (
-        <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-sm text-red-600">
-          {error}
+      <div className="sticky bottom-0 z-10 border-t border-border bg-card/95 px-5 py-3 backdrop-blur sm:px-6">
+        {error && (
+          <div role="alert" className="mb-3 rounded-md border border-destructive/20 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {error}
+          </div>
+        )}
+        <div className="flex items-center justify-between gap-4">
+          <div className="hidden min-w-0 sm:block">
+            <p className="truncate text-xs font-medium text-foreground">
+              {selectedDestinations.length === 0
+                ? "No destinations selected"
+                : selectedDestinations.length + " destination" + (selectedDestinations.length === 1 ? "" : "s")}
+            </p>
+            <p className="truncate text-[11px] text-muted-foreground">{publishTimingLabel}</p>
+          </div>
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onCancel ?? (() => router.back())}
+              className="h-9 rounded-md px-3.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={!canSubmit}
+              className="inline-flex h-9 min-w-32 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {isSubmitting || isReadingMedia ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+              {isSubmitting ? "Publishing..." : isReadingMedia ? "Preparing..." : publishMode === "SCHEDULED" ? "Schedule post" : "Publish now"}
+            </button>
+          </div>
         </div>
-      )}
-
-      <div className="flex items-center justify-end gap-2 border-t border-border pt-4">
-        <button
-          type="button"
-          onClick={onCancel ?? (() => router.back())}
-          className="h-9 rounded-lg border border-border px-4 text-sm font-medium transition-colors hover:bg-accent"
-        >
-          Cancel
-        </button>
-        <button
-          type="submit"
-          disabled={!canSubmit}
-          className="inline-flex h-9 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {isSubmitting || isReadingMedia ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-          {isSubmitting ? "Publishing..." : isReadingMedia ? "Preparing..." : "Publish Now"}
-        </button>
       </div>
     </form>
   );

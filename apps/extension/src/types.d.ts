@@ -22,6 +22,10 @@ interface PostFlowPostingTimingConfig {
   postButtonEnableTimeoutMs: number;
   publishConfirmationTimeoutMs: number;
   videoPublishConfirmationTimeoutMs: number;
+  profileVideoPermalinkTimeoutMs: number;
+  profileVideoNotificationTimeoutMs: number;
+  profileVideoNotificationPollIntervalMs: number;
+  profileVideoNotificationRefreshIntervalMs: number;
   publishPollIntervalMs: number;
   mediaButtonDelayMs: number;
   mediaInputTimeoutMs: number;

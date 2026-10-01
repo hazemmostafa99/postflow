@@ -51,25 +51,35 @@ export class GroupsController {
     @Query('page') page?: string,
     @Query('limit') limit?: string,
     @Query('connectionId') connectionId?: string,
+    @Query('connectionIds') connectionIds?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
+    const requestedConnectionIds = connectionIds
+      ?.split(',')
+      .map((id) => id.trim())
+      .filter(Boolean);
+    const groupConnectionIds = requestedConnectionIds?.length
+      ? requestedConnectionIds
+      : connectionId
+        ? [connectionId]
+        : undefined;
     if (page || limit) {
       return this.groupsService.listGroups(clerkUserId, {
         search,
         page: page ? Number(page) : undefined,
         limit: limit ? Number(limit) : undefined,
-        connectionId,
+        connectionIds: groupConnectionIds,
       });
     }
     if (search?.trim()) {
       return this.groupsService.searchGroups(
         clerkUserId,
         search.trim(),
-        connectionId,
+        groupConnectionIds,
       );
     }
-    return this.groupsService.getGroups(clerkUserId, connectionId);
+    return this.groupsService.getGroups(clerkUserId, groupConnectionIds);
   }
 
   /** DELETE /api/groups - delete all synced groups and their jobs */

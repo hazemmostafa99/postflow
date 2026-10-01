@@ -47,7 +47,7 @@ export function NewPostDialog({ label = "New Post", compact = false }: NewPostDi
 
       {open && (
         <div
-          className="fixed inset-0 z-50 flex min-h-screen items-center justify-center overflow-y-auto bg-stone-950/55 p-4 backdrop-blur-sm"
+          className="fixed inset-0 z-50 flex min-h-screen items-center justify-center overflow-y-auto bg-stone-950/55 p-0 backdrop-blur-sm sm:p-4"
           role="dialog"
           aria-modal="true"
           aria-labelledby="new-post-title"
@@ -55,14 +55,14 @@ export function NewPostDialog({ label = "New Post", compact = false }: NewPostDi
             if (event.target === event.currentTarget) close();
           }}
         >
-          <div className="my-auto max-h-[calc(100vh-2rem)] w-full max-w-2xl overflow-hidden rounded-xl border border-border bg-card shadow-2xl">
-            <div className="flex items-center justify-between border-b border-border bg-muted/35 px-5 py-4">
+          <div className="my-auto flex h-dvh w-full max-w-5xl flex-col overflow-hidden border border-border bg-card shadow-2xl sm:h-auto sm:max-h-[calc(100vh-2rem)] sm:rounded-lg">
+            <div className="flex shrink-0 items-center justify-between border-b border-border px-5 py-4 sm:px-6">
               <div>
-                <h2 id="new-post-title" className="text-lg font-semibold tracking-tight">
-                  New Post
+                <h2 id="new-post-title" className="text-base font-semibold">
+                  Create new post
                 </h2>
                 <p className="text-xs text-muted-foreground">
-                  Write content, attach media, and choose target groups.
+                  Facebook profiles and groups
                 </p>
               </div>
               <button
@@ -74,7 +74,7 @@ export function NewPostDialog({ label = "New Post", compact = false }: NewPostDi
                 <X className="h-4 w-4" />
               </button>
             </div>
-            <div className="max-h-[calc(100vh-9rem)] overflow-y-auto p-5">
+            <div className="min-h-0 flex-1 overflow-y-auto">
               <CreatePostForm onCancel={close} onSuccess={close} />
             </div>
           </div>
