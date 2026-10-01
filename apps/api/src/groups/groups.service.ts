@@ -1,4 +1,8 @@
-import { ForbiddenException, Injectable } from '@nestjs/common';
+import {
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+} from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { Types } from 'mongoose';
@@ -24,7 +28,7 @@ export interface ListGroupsOptions {
   search?: string;
   page?: number;
   limit?: number;
-  connectionId?: string;
+  connectionIds?: string[];
 }
 
 const UI_NAME_SUBSTRINGS = [
@@ -58,6 +62,18 @@ function canonicalizeGroupUrl(externalId: string, url?: string): string {
     return `https://www.facebook.com/groups/${externalId}/`;
   }
   return url ?? '';
+}
+
+function isDuplicateKeyError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as {
+    code?: unknown;
+    writeErrors?: Array<{ code?: unknown }>;
+  };
+  return (
+    candidate.code === 11000 ||
+    Boolean(candidate.writeErrors?.some((writeError) => writeError.code === 11000))
+  );
 }
 
 @Injectable()
@@ -119,35 +135,55 @@ export class GroupsService {
         const cleanName = normalizeGroupName(g.name);
         const skipName = isUiGroupName(cleanName);
         if (skipName) return null;
-        return {
-        updateOne: {
-          filter: {
-            clerkUserId,
-            externalId: g.externalId,
-            ...(connectionId ? { facebookConnectionId: connectionId } : {}),
-          },
-          update: {
-            $set: {
-              url,
-              lastSeenAt: new Date(),
-              status: 'ACTIVE',
-              ...(skipName ? {} : { name: cleanName }),
-            },
-            $setOnInsert: {
+        const filter = connectionId
+          ? {
               clerkUserId,
               externalId: g.externalId,
-              ...(connectionId ? { facebookConnectionId: connectionId } : {}),
+              $or: [
+                { facebookConnectionId: connectionId },
+                { facebookConnectionId: { $exists: false } },
+                { facebookConnectionId: null },
+              ],
+            }
+          : {
+              clerkUserId,
+              externalId: g.externalId,
+            };
+        return {
+          updateOne: {
+            filter,
+            update: {
+              $set: {
+                url,
+                lastSeenAt: new Date(),
+                status: 'ACTIVE',
+                ...(skipName ? {} : { name: cleanName }),
+                ...(connectionId ? { facebookConnectionId: connectionId } : {}),
+              },
+              $setOnInsert: {
+                clerkUserId,
+                externalId: g.externalId,
+              },
             },
+            upsert: true,
           },
-          upsert: true,
-        },
         };
       })
       .filter((op): op is NonNullable<typeof op> => op !== null);
 
     if (!ops.length) return { synced: 0 };
 
-    const result = await this.groupModel.bulkWrite(ops);
+    let result: { upsertedCount: number; modifiedCount: number };
+    try {
+      result = await this.groupModel.bulkWrite(ops);
+    } catch (error) {
+      if (isDuplicateKeyError(error)) {
+        throw new ConflictException(
+          'Group sync hit a legacy unique index. Run `npm run repair-indexes` from apps/api, then retry group sync.',
+        );
+      }
+      throw error;
+    }
 
     // Calculate total groups for this user to help with debugging mismatches
     const totalInDb = await this.groupModel.countDocuments({
@@ -168,8 +204,8 @@ export class GroupsService {
   /**
    * Return all groups belonging to the given user.
    */
-  async getGroups(clerkUserId: string, connectionId?: string) {
-    const filter = this.getGroupFilter(clerkUserId, connectionId);
+  async getGroups(clerkUserId: string, connectionIds?: string[]) {
+    const filter = this.getGroupFilter(clerkUserId, connectionIds);
     const groups = await this.groupModel
       .find(filter)
       .sort({ lastSeenAt: -1 })
@@ -182,10 +218,10 @@ export class GroupsService {
   /**
    * Search groups by name (case-insensitive).
    */
-  async searchGroups(clerkUserId: string, query: string, connectionId?: string) {
+  async searchGroups(clerkUserId: string, query: string, connectionIds?: string[]) {
     const groups = await this.groupModel
       .find({
-        ...this.getGroupFilter(clerkUserId, connectionId),
+        ...this.getGroupFilter(clerkUserId, connectionIds),
         name: { $regex: query, $options: 'i' },
       })
       .sort({ lastSeenAt: -1 })
@@ -200,7 +236,7 @@ export class GroupsService {
     const limit = Math.min(100, Math.max(1, options.limit ?? 20));
     const search = options.search?.trim();
     const filter = {
-      ...this.getGroupFilter(clerkUserId, options.connectionId),
+      ...this.getGroupFilter(clerkUserId, options.connectionIds),
       ...(search ? { name: { $regex: search, $options: 'i' } } : {}),
     };
 
@@ -226,14 +262,19 @@ export class GroupsService {
     };
   }
 
-  private getGroupFilter(clerkUserId: string, connectionId?: string) {
-    if (!connectionId?.trim()) return { clerkUserId };
-    if (!Types.ObjectId.isValid(connectionId)) {
+  private getGroupFilter(clerkUserId: string, connectionIds?: string[]) {
+    const uniqueConnectionIds = [...new Set(
+      connectionIds?.map((id) => id.trim()).filter(Boolean) ?? [],
+    )];
+    if (uniqueConnectionIds.length === 0) return { clerkUserId };
+    if (uniqueConnectionIds.some((id) => !Types.ObjectId.isValid(id))) {
       throw new ForbiddenException('Invalid Facebook connection ID.');
     }
     return {
       clerkUserId,
-      facebookConnectionId: new Types.ObjectId(connectionId),
+      facebookConnectionId: {
+        $in: uniqueConnectionIds.map((id) => new Types.ObjectId(id)),
+      },
     };
   }
 

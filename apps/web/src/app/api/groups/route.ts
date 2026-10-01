@@ -12,12 +12,14 @@ export async function GET(request: Request) {
   const page = searchParams.get("page") ?? "";
   const limit = searchParams.get("limit") ?? "";
   const connectionId = searchParams.get("connectionId") ?? "";
+  const connectionIds = searchParams.get("connectionIds") ?? "";
 
   const url = new URL(`${API_BASE}/api/groups`);
   if (search) url.searchParams.set("search", search);
   if (page) url.searchParams.set("page", page);
   if (limit) url.searchParams.set("limit", limit);
   if (connectionId) url.searchParams.set("connectionId", connectionId);
+  if (connectionIds) url.searchParams.set("connectionIds", connectionIds);
 
   let response: Response;
   try {

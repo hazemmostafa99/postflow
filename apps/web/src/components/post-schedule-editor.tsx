@@ -6,7 +6,7 @@ import { useRouter } from "next/navigation";
 
 interface ScheduleJob {
   _id: string;
-  groupName: string;
+  targetLabel: string;
   status: string;
   submissionStatus?: "PUBLISHED" | "PENDING_APPROVAL" | "UNKNOWN";
   scheduledFor?: string;
@@ -167,7 +167,7 @@ export function PostScheduleEditor({
           <div className="space-y-1">
             {preview.map((job) => (
               <div key={job._id} className="flex justify-between gap-4">
-                <span className="truncate">{job.groupName}</span>
+                <span className="truncate">{job.targetLabel}</span>
                 <span className="shrink-0 text-muted-foreground">{formatLocalTime(job.scheduledAt)}</span>
               </div>
             ))}

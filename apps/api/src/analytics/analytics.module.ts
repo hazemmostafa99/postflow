@@ -10,6 +10,10 @@ import {
 } from '../schemas/publishing-job.schema';
 import { User, UserSchema } from '../schemas/user.schema';
 import { Team, TeamSchema } from '../schemas/team.schema';
+import {
+  FacebookConnection,
+  FacebookConnectionSchema,
+} from '../schemas/facebook-connection.schema';
 
 @Module({
   imports: [
@@ -19,6 +23,7 @@ import { Team, TeamSchema } from '../schemas/team.schema';
       { name: Group.name, schema: GroupSchema },
       { name: User.name, schema: UserSchema },
       { name: Team.name, schema: TeamSchema },
+      { name: FacebookConnection.name, schema: FacebookConnectionSchema },
     ]),
   ],
   controllers: [AnalyticsController],

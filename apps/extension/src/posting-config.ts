@@ -46,6 +46,21 @@ const postingTiming: PostFlowPostingTimingConfig = {
   // Facebook may keep a video-processing notice visible before the final post card/permalink appears.
   videoPublishConfirmationTimeoutMs: 60000,
 
+  // Profile videos can remain in processing before the new TimelineFeedUnit
+  // exposes its reel identity. Return as soon as it appears, up to this limit.
+  profileVideoPermalinkTimeoutMs: 180000,
+
+  // After Facebook accepts a profile video, its processed-reel notification
+  // can expose the canonical URL before the profile feed does.
+  profileVideoNotificationTimeoutMs: 180000,
+
+  // Poll the already-open notifications document without creating more tabs.
+  profileVideoNotificationPollIntervalMs: 2000,
+
+  // Reload occasionally because Facebook does not always stream a new
+  // notification into an inactive tab.
+  profileVideoNotificationRefreshIntervalMs: 15000,
+
   // How often to re-check the dialog/page while waiting for publish confirmation.
   publishPollIntervalMs: 500,
 

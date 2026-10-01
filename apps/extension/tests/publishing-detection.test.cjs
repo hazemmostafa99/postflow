@@ -115,9 +115,26 @@ test('a re-rendered old post permalink is not treated as the submitted post', ()
   assert.equal(result, null);
 });
 
-test('media-only posts can match a newly inserted post with media', () => {
+test('media-only posts reject an undated card that could be an old feed item', () => {
   const app = setup(`<div role="article">
     <a href="https://www.facebook.com/groups/123/posts/video-new/">permalink</a>
+    <video src="blob:video-preview"></video>
+  </div>`);
+  const result = app.context.findPublishedPost({
+    root: app.document,
+    submittedText: '',
+    submittedAt: Date.parse('2026-09-19T12:00:00.000Z'),
+    existingPostElements: new Set(),
+    submittedMediaCount: 1,
+    currentGroupId: '123',
+  });
+  assert.equal(result, null);
+});
+
+test('media-only posts accept a newly timestamped post with media', () => {
+  const app = setup(`<div role="article">
+    <a href="https://www.facebook.com/groups/123/posts/video-new/">permalink</a>
+    <time datetime="2026-09-19T12:00:05.000Z"></time>
     <video src="blob:video-preview"></video>
   </div>`);
   const result = app.context.findPublishedPost({

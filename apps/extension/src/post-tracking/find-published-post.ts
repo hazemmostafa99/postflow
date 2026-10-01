@@ -139,13 +139,15 @@ function isNewEvidence(
   postElement: Element,
   submittedAt: number,
   existingPostElements?: ReadonlySet<Element>,
+  requireTimestamp = false,
 ): boolean {
   if (existingPostElements?.has(postElement)) return false;
   const timestamp = extractPostTimestamp(postElement);
   // Facebook frequently inserts the new article/link before hydrating its
   // <time> element. A new DOM node is still valid evidence in that window;
   // existing nodes remain rejected so an old post cannot be reused.
-  return timestamp === null || timestamp >= submittedAt - 30_000;
+  return (timestamp !== null || !requireTimestamp) &&
+    (timestamp === null || timestamp >= submittedAt - 30_000);
 }
 
 /** Find positive evidence that the submitted post appeared in the feed. */
@@ -159,6 +161,7 @@ function findPublishedPost({
   currentGroupId,
 }: FindPublishedPostOptions): PublishedPostMatch | null {
   const expectedGroupId = currentGroupId ?? getCurrentFacebookGroupId();
+  const isMediaOnlySubmission = !normalizePostText(submittedText) && Boolean(submittedMediaCount);
   const candidates: Element[] = [];
   if (root instanceof Element && root.matches(POST_SELECTOR)) candidates.push(root);
   candidates.push(...Array.from(root.querySelectorAll(POST_SELECTOR)));
@@ -168,7 +171,7 @@ function findPublishedPost({
     if (seen.has(candidate) || !isVisiblePostElement(candidate)) continue;
     seen.add(candidate);
     if (!isSubmittedPostMatch(candidate, submittedText, submittedMediaCount)) continue;
-    if (!isNewEvidence(candidate, submittedAt, existingPostElements)) continue;
+    if (!isNewEvidence(candidate, submittedAt, existingPostElements, isMediaOnlySubmission)) continue;
     const postUrl = extractPostPermalink(candidate, currentGroupId) ?? undefined;
     if (postUrl && existingPostUrls?.has((normalizeFacebookGroupPostUrl(postUrl) ?? postUrl).replace(/\/$/, '').toLowerCase())) continue;
     if (expectedGroupId && !postUrl) continue;

@@ -9,7 +9,7 @@ ADMIN
 scope = ALL
 
 MANAGER
-scope = MANAGED_TEAMS
+scope = ALL
 
 TEAM_LEADER
 scope = DIRECT_TEAM
@@ -27,17 +27,10 @@ the authenticated Clerk user ID; it must not send role or team scope decisions.
 
 Admins can see and operate on all posts in the company.
 
-### MANAGER - MANAGED_TEAMS
+### MANAGER - ALL
 
-Managers can see and operate on posts created by users whose `teamId` belongs
-to a team where:
-
-```text
-Team.managerId = Manager User._id
-```
-
-Managers are not assigned to teams by default. Their visibility is based on
-the teams they manage, not on arbitrary client input.
+Managers can see and operate on all posts in the company, regardless of which
+team created them.
 
 ### TEAM_LEADER - DIRECT_TEAM
 
@@ -106,7 +99,6 @@ Existing fields used:
 - `User.lastName`
 - `User.role`
 - `User.teamId`
-- `Team.managerId`
 
 ## Security Requirements
 
@@ -115,8 +107,7 @@ Existing fields used:
 - Do not trust role, team, or scope values from the client.
 - Team-scoped users with no `teamId` must not accidentally receive broader
   access.
-- Manager scope must be derived from persisted `Team.managerId`.
-- Admin scope is the only unfiltered post scope.
+- Admin and manager scopes are unfiltered across company posts.
 
 ## Non-Goals
 
