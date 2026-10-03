@@ -220,11 +220,20 @@ async function syncPhoneNumbersToBackend(): Promise<PhoneSyncResponse> {
       error: 'The collection source is missing. Collect the numbers again before syncing.',
     };
   }
+  const category = state.syncCategory?.trim().replace(/\s+/g, ' ');
+  if (category && category.length > 80) {
+    logPhoneSync('warn', 'Sync stopped: category is too long.', { code: 'INVALID_RESPONSE' });
+    return {
+      ok: false,
+      code: 'INVALID_RESPONSE',
+      error: 'Category may contain at most 80 characters.',
+    };
+  }
 
   logPhoneSync('info', 'Sending selected numbers to PostFlow.', { selected: selectedNumbers.length });
   const response = await apiFetch(
     '/api/phone-contacts/sync',
-    { numbers: selectedNumbers, source: state.source },
+    { numbers: selectedNumbers, source: state.source, ...(category ? { category } : {}) },
     'POST',
     true,
   );

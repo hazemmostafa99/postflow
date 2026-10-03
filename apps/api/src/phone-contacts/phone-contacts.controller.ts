@@ -6,7 +6,10 @@ import {
   Get,
   HttpCode,
   HttpStatus,
+  Param,
+  Patch,
   Post,
+  Delete,
   Query,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -21,6 +24,7 @@ export class PhoneContactsController {
   async list(
     @Headers('x-clerk-user-id') clerkUserId: string,
     @Query('search') search?: string,
+    @Query('category') category?: string,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
   ) {
@@ -30,9 +34,55 @@ export class PhoneContactsController {
     }
     return this.phoneContactsService.listPhoneContacts(normalizedUserId, {
       search,
+      category,
       page: page ? Number(page) : undefined,
       limit: limit ? Number(limit) : undefined,
     });
+  }
+
+  /** Adds a phone contact manually from the dashboard. */
+  @Post()
+  async create(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Body() body: unknown,
+  ) {
+    const normalizedUserId = clerkUserId?.trim();
+    if (!normalizedUserId) {
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    }
+    return this.phoneContactsService.createPhoneContact(normalizedUserId, body);
+  }
+
+  /** Updates a user-owned phone contact. */
+  @Patch(':id')
+  async update(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('id') id: string,
+    @Body() body: unknown,
+  ) {
+    const normalizedUserId = clerkUserId?.trim();
+    if (!normalizedUserId) {
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    }
+    return this.phoneContactsService.updatePhoneContact(
+      normalizedUserId,
+      id,
+      body,
+    );
+  }
+
+  /** Deletes a user-owned phone contact. */
+  @Delete(':id')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async remove(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('id') id: string,
+  ) {
+    const normalizedUserId = clerkUserId?.trim();
+    if (!normalizedUserId) {
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    }
+    await this.phoneContactsService.deletePhoneContact(normalizedUserId, id);
   }
 
   /** Accepts an explicit extension submission and syncs its numbers for the user. */

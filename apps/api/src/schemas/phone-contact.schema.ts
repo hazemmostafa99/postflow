@@ -2,15 +2,15 @@ import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { Document } from 'mongoose';
 
 export type PhoneContactDocument = PhoneContact & Document;
-export type PhoneContactSourceType = 'facebook' | 'generic';
+export type PhoneContactSourceType = 'facebook' | 'generic' | 'manual';
 
 @Schema({ _id: false })
 export class PhoneContactSource {
-  @Prop({ required: true, enum: ['facebook', 'generic'] })
+  @Prop({ required: true, enum: ['facebook', 'generic', 'manual'] })
   type: PhoneContactSourceType;
 
-  @Prop({ required: true, maxlength: 2048 })
-  url: string;
+  @Prop({ maxlength: 2048 })
+  url?: string;
 }
 
 export const PhoneContactSourceSchema =
@@ -23,6 +23,9 @@ export class PhoneContact {
 
   @Prop({ required: true, trim: true })
   normalizedNumber: string;
+
+  @Prop({ required: true, trim: true, maxlength: 80, default: 'Uncategorized' })
+  category: string;
 
   @Prop({ type: PhoneContactSourceSchema, required: true })
   source: PhoneContactSource;

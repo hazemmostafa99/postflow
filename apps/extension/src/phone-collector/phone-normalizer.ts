@@ -7,7 +7,7 @@ interface NormalizedPhoneCandidates {
   summary: PhoneCollectionSummary;
 }
 
-// Validates candidates for the review screen, normalizes them to E.164, and drops valid duplicates.
+// Validates candidates for the review screen and keeps only unique valid E.164 numbers.
 function normalizeAndDeduplicatePhoneCandidates(
   candidates: PhoneCollectionCandidate[],
 ): NormalizedPhoneCandidates {
@@ -21,14 +21,6 @@ function normalizeAndDeduplicatePhoneCandidates(
     const result = normalizePhoneNumber(candidate.raw);
     if (!result.valid) {
       invalid += 1;
-      numbers.push({
-        id: candidate.id,
-        raw: candidate.raw,
-        value: candidate.raw,
-        status: "invalid",
-        selected: false,
-        reason: result.reason,
-      });
       continue;
     }
 

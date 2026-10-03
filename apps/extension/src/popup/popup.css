@@ -58,6 +58,7 @@ body {
 
 .phone-collector-view {
   padding-top: 2px;
+  padding-bottom: 68px;
 }
 
 .collector-page {
@@ -934,7 +935,16 @@ h2 {
 }
 
 .sync-phone-button {
-  margin-top: 12px;
+  position: fixed;
+  z-index: 20;
+  right: 16px;
+  bottom: 14px;
+  left: 16px;
+  width: auto;
+  margin: 0;
+  box-shadow:
+    0 -10px 22px rgba(248, 250, 252, 0.96),
+    0 8px 18px rgba(37, 99, 235, 0.24);
 }
 
 .sync-result {
@@ -1009,6 +1019,40 @@ h2 {
 
 .sync-confirmation-copy strong {
   color: #111827;
+}
+
+.sync-category-field {
+  display: grid;
+  gap: 7px;
+  margin-top: 16px;
+  color: #334155;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.sync-category-field input {
+  width: 100%;
+  min-height: 40px;
+  box-sizing: border-box;
+  padding: 9px 11px;
+  border: 1px solid #cbd5e1;
+  border-radius: 7px;
+  color: #172033;
+  background: #ffffff;
+  font: inherit;
+  font-weight: 500;
+  outline: none;
+}
+
+.sync-category-field input:focus {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+
+.sync-category-field small {
+  color: #64748b;
+  font-size: 10px;
+  font-weight: 500;
 }
 
 .sync-dialog-actions {
