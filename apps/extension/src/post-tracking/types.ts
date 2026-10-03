@@ -63,14 +63,21 @@ interface PendingFacebookPost {
   content?: string;
   submittedAt: string;
   mediaCount?: number;
+  videoIds?: string[];
   textFingerprint?: string;
   lastCheckedAt?: string;
   nextCheckAt?: string;
   syncAttempts?: number;
   lastSyncError?: string;
+  englishGroupVideo?: boolean;
+  englishPendingApprovalLookup?: boolean;
 }
 
 type PendingPostSyncResult =
+  | {
+      status: "CONTENT_MATCHED";
+      copiedShareUrl?: string;
+    }
   | {
       status: "PUBLISHED";
       postUrl?: string;

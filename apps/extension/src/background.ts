@@ -1511,6 +1511,11 @@ chrome.runtime.onMessage.addListener((message, sender) => {
           (
             message.submissionResult?.status === 'UNKNOWN' &&
             completedPostHasVideo
+          ) ||
+          (
+            message.submissionResult?.status === 'PENDING_APPROVAL' &&
+            !message.submissionResult.postUrl &&
+            message.englishGroupFlow === true
           )
         ),
       );
@@ -1527,6 +1532,17 @@ chrome.runtime.onMessage.addListener((message, sender) => {
           mediaCount: Array.isArray(completedExecution.post.mediaUrls)
             ? completedExecution.post.mediaUrls.length
             : 0,
+          videoIds: Array.isArray(message.videoIds)
+            ? message.videoIds.filter((value: unknown): value is string =>
+                typeof value === 'string' && /^\d+$/.test(value)
+              )
+            : [],
+          ...(message.englishGroupFlow === true && completedPostHasVideo && message.submissionResult?.status !== 'PENDING_APPROVAL'
+            ? { englishGroupVideo: true }
+            : {}),
+          ...(message.englishGroupFlow === true && message.submissionResult?.status === 'PENDING_APPROVAL' && !message.submissionResult.postUrl
+            ? { englishPendingApprovalLookup: true }
+            : {}),
         };
         console.log('[PostFlow] Starting automatic post-link check after publish result', {
           jobId: message.jobId,
@@ -1548,9 +1564,19 @@ chrome.runtime.onMessage.addListener((message, sender) => {
         console.log('[PostFlow] Automatic post-link check finished', {
           jobId: message.jobId,
           status: syncResult.status,
+          postUrl: 'postUrl' in syncResult ? syncResult.postUrl : undefined,
           updated,
           persisted: shouldPersistAutomaticPostLinkCheck,
         });
+        if (syncPost.englishGroupVideo === true) {
+          await saveBackgroundPostingStep(message.jobId, 'english_video_post_url_persist_result', {
+            status: syncResult.status,
+            hasPostUrl: syncResult.status === 'PUBLISHED' && Boolean(syncResult.postUrl),
+            postUrl: syncResult.status === 'PUBLISHED' ? syncResult.postUrl : undefined,
+            updated,
+            persisted: shouldPersistAutomaticPostLinkCheck,
+          });
+        }
       }
 
       checkPendingJobs();
@@ -1596,9 +1622,112 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   }
 });
 
-/** Navigate to one pending post's group and ask the Facebook content script to
- * perform the DOM match. This function intentionally does not update the API;
- * persistence belongs to the next feature phase. */
+const ENGLISH_VIDEO_COPY_CAPTURE_SCRIPT_ID = 'postflow-english-video-copy-capture';
+const ENGLISH_PENDING_NETWORK_CAPTURE_SCRIPT_ID = 'postflow-english-pending-network-capture';
+
+function getBackgroundSiblingScriptFile(fileName: string): string {
+  const background = chrome.runtime.getManifest().background;
+  const serviceWorkerPath = background && 'service_worker' in background
+    ? background.service_worker
+    : '';
+  const scriptDirectory = serviceWorkerPath.includes('/')
+    ? serviceWorkerPath.slice(0, serviceWorkerPath.lastIndexOf('/') + 1)
+    : '';
+  return `${scriptDirectory}${fileName}`;
+}
+
+function getEnglishVideoCopyCaptureScriptFile(): string {
+  return getBackgroundSiblingScriptFile('facebook-copy-link-capture.js');
+}
+
+async function registerEnglishVideoCopyLinkCapture(): Promise<boolean> {
+  try {
+    await chrome.scripting.unregisterContentScripts({
+      ids: [ENGLISH_VIDEO_COPY_CAPTURE_SCRIPT_ID],
+    }).catch(() => undefined);
+    await chrome.scripting.registerContentScripts([{
+      id: ENGLISH_VIDEO_COPY_CAPTURE_SCRIPT_ID,
+      matches: ['https://www.facebook.com/groups/*'],
+      js: [getEnglishVideoCopyCaptureScriptFile()],
+      runAt: 'document_start',
+      world: 'MAIN',
+      persistAcrossSessions: false,
+    }]);
+    return true;
+  } catch (error) {
+    console.warn('[PendingPostSync] Could not register early English video Copy link capture', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+async function unregisterEnglishVideoCopyLinkCapture(): Promise<void> {
+  await chrome.scripting.unregisterContentScripts({
+    ids: [ENGLISH_VIDEO_COPY_CAPTURE_SCRIPT_ID],
+  }).catch(() => undefined);
+}
+
+async function isEnglishVideoCopyLinkCaptureInstalled(tabId: number): Promise<boolean> {
+  try {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: () => Boolean((window as Window & {
+        __postflowFacebookCopyLinkCaptureInstalled?: boolean;
+      }).__postflowFacebookCopyLinkCaptureInstalled),
+    });
+    return result?.result === true;
+  } catch {
+    return false;
+  }
+}
+
+async function registerEnglishPendingNetworkCapture(): Promise<boolean> {
+  try {
+    await chrome.scripting.unregisterContentScripts({
+      ids: [ENGLISH_PENDING_NETWORK_CAPTURE_SCRIPT_ID],
+    }).catch(() => undefined);
+    await chrome.scripting.registerContentScripts([{
+      id: ENGLISH_PENDING_NETWORK_CAPTURE_SCRIPT_ID,
+      matches: ['https://www.facebook.com/groups/*'],
+      js: [getBackgroundSiblingScriptFile('graphql-spy.js')],
+      runAt: 'document_start',
+      world: 'MAIN',
+      persistAcrossSessions: false,
+    }]);
+    return true;
+  } catch (error) {
+    console.warn('[PendingPostSync] Could not register early English pending-page network capture', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+async function unregisterEnglishPendingNetworkCapture(): Promise<void> {
+  await chrome.scripting.unregisterContentScripts({
+    ids: [ENGLISH_PENDING_NETWORK_CAPTURE_SCRIPT_ID],
+  }).catch(() => undefined);
+}
+
+async function isEnglishPendingNetworkCaptureInstalled(tabId: number): Promise<boolean> {
+  try {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: () => Boolean((window as Window & {
+        __postflowGraphqlSpyInstalled?: boolean;
+      }).__postflowGraphqlSpyInstalled),
+    });
+    return result?.result === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Navigate to one post's Group page and return the content script's match.
+ * The caller owns API persistence. */
 async function checkSinglePendingPost(post: PendingFacebookPost, lockAlreadyHeld = false): Promise<PendingPostSyncResult> {
   if (isProcessingJob) {
     return { status: 'CHECK_FAILED', reason: 'A new Facebook post is currently being published' };
@@ -1613,7 +1742,14 @@ async function checkSinglePendingPost(post: PendingFacebookPost, lockAlreadyHeld
 
   isCheckingPendingPost = true;
   const requestId = `pending-${++pendingCheckSequence}`;
+  const isEnglishVideoCheck = post.englishGroupVideo === true;
+  const isEnglishPendingApprovalLookup = post.englishPendingApprovalLookup === true;
+  const needsEnglishCopyCapture = isEnglishVideoCheck && !isEnglishPendingApprovalLookup;
   let syncTabId: number | undefined;
+  let previousActiveTabId: number | undefined;
+  let registeredEnglishCopyCapture = false;
+  let registeredEnglishPendingNetworkCapture = false;
+  let pendingLookupRefreshTimer: ReturnType<typeof setInterval> | undefined;
   try {
     const groupUrl = getSafeFacebookGroupUrl(post, post.groupUrl);
     if (!groupUrl) {
@@ -1624,6 +1760,12 @@ async function checkSinglePendingPost(post: PendingFacebookPost, lockAlreadyHeld
       groupUrl,
       requestId,
     });
+    if (isEnglishVideoCheck) {
+      await saveBackgroundPostingStep(post.id, 'english_video_fresh_tab_check_started', {
+        requestId,
+        groupUrl,
+      });
+    }
     // Status checks must never reuse or foreground the tab used for a new
     // publish. Reusing tabs here was the source of old posts appearing during
     // a different group's publish flow.
@@ -1638,49 +1780,333 @@ async function checkSinglePendingPost(post: PendingFacebookPost, lockAlreadyHeld
         // Fall back to the group feed when the saved pending URL is invalid.
       }
     }
-    const fbTab = await chrome.tabs.create({ url: checkUrl, active: false });
+    if (isEnglishPendingApprovalLookup && !post.postUrl) {
+      const parsedGroupUrl = new URL(groupUrl);
+      const groupPath = parsedGroupUrl.pathname.match(/^\/groups\/[^/]+/i)?.[0];
+      if (!groupPath) {
+        return { status: 'CHECK_FAILED', reason: 'Invalid Facebook group URL for pending-post lookup' };
+      }
+      checkUrl = `${parsedGroupUrl.origin}${groupPath}/pending_posts/`;
+      await saveBackgroundPostingStep(post.id, 'english_pending_fresh_tab_check_started', {
+        requestId,
+        checkUrl,
+      });
+    }
+    if (needsEnglishCopyCapture) {
+      const [previousActiveTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      previousActiveTabId = previousActiveTab?.id;
+      await saveBackgroundPostingStep(post.id, isEnglishPendingApprovalLookup
+        ? 'english_pending_copy_capture_install_started'
+        : 'english_video_copy_capture_install_started', {
+        mode: 'document_start',
+      });
+      registeredEnglishCopyCapture = await registerEnglishVideoCopyLinkCapture();
+      await saveBackgroundPostingStep(post.id, isEnglishPendingApprovalLookup
+        ? 'english_pending_copy_capture_install_finished'
+        : 'english_video_copy_capture_install_finished', {
+        installed: registeredEnglishCopyCapture,
+        mode: 'document_start',
+      });
+    }
+    if (isEnglishPendingApprovalLookup) {
+      await saveBackgroundPostingStep(post.id, 'english_pending_network_capture_install_started', {
+        mode: 'document_start',
+      });
+      registeredEnglishPendingNetworkCapture = await registerEnglishPendingNetworkCapture();
+      await saveBackgroundPostingStep(post.id, 'english_pending_network_capture_install_finished', {
+        installed: registeredEnglishPendingNetworkCapture,
+        mode: 'document_start',
+      });
+    }
+    const fbTab = await chrome.tabs.create({
+      url: checkUrl,
+      active: needsEnglishCopyCapture,
+    });
     syncTabId = fbTab.id;
+    if (isEnglishVideoCheck) {
+      await saveBackgroundPostingStep(post.id, 'english_video_fresh_tab_created', {
+        tabId: fbTab.id ?? null,
+        active: fbTab.active,
+      });
+    }
 
     if (!fbTab.id || !(await waitForFacebookTabAfterNavigation(fbTab.id, checkUrl, POSTING_TIMING.facebookTabReadyTimeoutMs))) {
       console.warn('[PendingPostSync] Facebook pending-post navigation failed', { postId: post.id, checkUrl });
+      if (isEnglishVideoCheck) {
+        await saveBackgroundPostingStep(post.id, 'english_video_fresh_tab_not_ready', {
+          tabId: fbTab.id ?? null,
+        });
+      }
       return { status: 'CHECK_FAILED', reason: 'Target Facebook group page did not finish loading' };
+    }
+    if (isEnglishPendingApprovalLookup && fbTab.id) {
+      await saveBackgroundPostingStep(post.id, 'english_pending_network_capture_document_ready', {
+        tabId: fbTab.id,
+        installed: await isEnglishPendingNetworkCaptureInstalled(fbTab.id),
+        mode: 'document_start',
+      });
+      const refreshIntervalMs = 15_000;
+      await saveBackgroundPostingStep(post.id, 'english_pending_page_refresh_scheduled', {
+        tabId: fbTab.id,
+        refreshIntervalMs,
+      });
+      pendingLookupRefreshTimer = setInterval(() => {
+        void chrome.tabs.reload(fbTab.id!).then(() => {
+          void saveBackgroundPostingStep(post.id, 'english_pending_page_refreshed', {
+            tabId: fbTab.id,
+          });
+        }).catch(() => undefined);
+      }, refreshIntervalMs);
+    }
+    if (isEnglishVideoCheck) {
+      await saveBackgroundPostingStep(post.id, 'english_video_fresh_tab_ready', {
+        tabId: fbTab.id,
+      });
+      await saveBackgroundPostingStep(post.id, 'english_video_copy_capture_document_ready', {
+        tabId: fbTab.id,
+        installed: await isEnglishVideoCopyLinkCaptureInstalled(fbTab.id),
+        mode: 'document_start',
+      });
     }
 
     const startedAt = Date.now();
-    while (Date.now() - startedAt < POSTING_TIMING.facebookTabReadyTimeoutMs) {
+    let deliveryAttempts = 0;
+    const pendingLookupTimeoutMs = isEnglishPendingApprovalLookup
+      ? POSTING_TIMING.profileVideoPermalinkTimeoutMs
+      : POSTING_TIMING.facebookTabReadyTimeoutMs;
+    while (Date.now() - startedAt < pendingLookupTimeoutMs) {
       try {
+        deliveryAttempts += 1;
         console.log('[PendingPostSync] Asking Facebook content script to check post', {
           postId: post.id,
           tabId: fbTab.id,
           requestId,
         });
+        if (isEnglishVideoCheck && deliveryAttempts === 1) {
+          await saveBackgroundPostingStep(post.id, 'english_video_content_check_sent', {
+            tabId: fbTab.id,
+            requestId,
+          });
+        }
         const response = await chrome.tabs.sendMessage(fbTab.id, {
           type: 'CHECK_PENDING_POST',
           requestId,
           post,
         });
         if (response?.ok && response.result) {
+          const result = response.result as PendingPostSyncResult;
           console.log('[PendingPostSync] Facebook content script returned result', {
             postId: post.id,
-            result: response.result,
+            result,
           });
-          return response.result as PendingPostSyncResult;
+          if (isEnglishVideoCheck) {
+            await saveBackgroundPostingStep(post.id, 'english_video_content_check_result', {
+              status: result.status,
+              deliveryAttempts,
+              hasCopiedShareUrl: result.status === 'CONTENT_MATCHED' && Boolean(result.copiedShareUrl),
+            });
+          }
+          if (isEnglishPendingApprovalLookup) {
+            await saveBackgroundPostingStep(post.id, 'english_pending_lookup_result', {
+              status: result.status,
+              postUrl: 'postUrl' in result ? result.postUrl : undefined,
+              reason: 'reason' in result ? result.reason : undefined,
+              deliveryAttempts,
+            });
+          }
+          if (result.status === 'CONTENT_MATCHED') {
+            console.log('[PendingPostSync] English Group video content match succeeded', {
+              postId: post.id,
+              tabId: fbTab.id,
+            });
+            if (result.copiedShareUrl) {
+              const canonicalPostUrl = await resolveEnglishGroupShareRedirect(
+                fbTab.id,
+                result.copiedShareUrl,
+                post,
+              );
+              if (canonicalPostUrl) {
+                console.log('[PendingPostSync] English video share link resolved to canonical Group post', {
+                  postId: post.id,
+                  canonicalPostUrl,
+                });
+                if (isEnglishPendingApprovalLookup) {
+                  await saveBackgroundPostingStep(post.id, 'english_pending_post_url_resolved', {
+                    status: /\/pending_posts\//i.test(canonicalPostUrl)
+                      ? 'STILL_PENDING'
+                      : 'PUBLISHED',
+                    postUrl: canonicalPostUrl,
+                  });
+                }
+                return {
+                  status: /\/pending_posts\//i.test(canonicalPostUrl)
+                    ? 'STILL_PENDING'
+                    : 'PUBLISHED',
+                  postUrl: canonicalPostUrl,
+                };
+              }
+              console.warn('[PendingPostSync] Copied English video share link did not resolve to the expected Group', {
+                postId: post.id,
+              });
+            }
+          }
+          return result;
         }
       } catch {
-        // Content scripts can be replaced during navigation; retry until timeout.
+        // The content script can be replaced during initial navigation. Keep
+        // retrying delivery, but perform only one DOM/render evaluation.
       }
       await new Promise((resolve) => setTimeout(resolve, POSTING_TIMING.facebookMessageRetryIntervalMs));
+    }
+    if (isEnglishPendingApprovalLookup) {
+      await saveBackgroundPostingStep(post.id, 'english_pending_lookup_deadline_reached', {
+        timeoutMs: pendingLookupTimeoutMs,
+        deliveryAttempts,
+      });
     }
     return { status: 'CHECK_FAILED', reason: 'Timed out waiting for pending post matcher' };
   } catch (err: any) {
     return { status: 'CHECK_FAILED', reason: err?.message ?? 'Pending post check failed' };
   } finally {
+    if (pendingLookupRefreshTimer !== undefined) {
+      clearInterval(pendingLookupRefreshTimer);
+      pendingLookupRefreshTimer = undefined;
+    }
     if (syncTabId !== undefined) {
       await chrome.tabs.remove(syncTabId).catch(() => undefined);
+      if (isEnglishVideoCheck) {
+        await saveBackgroundPostingStep(post.id, 'english_video_fresh_tab_closed', {
+          tabId: syncTabId,
+        }).catch(() => undefined);
+      } else if (isEnglishPendingApprovalLookup) {
+        await saveBackgroundPostingStep(post.id, 'english_pending_fresh_tab_closed', {
+          tabId: syncTabId,
+        }).catch(() => undefined);
+      }
+    }
+    if (needsEnglishCopyCapture && previousActiveTabId !== undefined && previousActiveTabId !== syncTabId) {
+      await chrome.tabs.update(previousActiveTabId, { active: true }).catch(() => undefined);
+      await saveBackgroundPostingStep(post.id, isEnglishPendingApprovalLookup
+        ? 'english_pending_previous_tab_restored'
+        : 'english_video_previous_tab_restored', {
+        tabId: previousActiveTabId,
+      }).catch(() => undefined);
+    }
+    if (registeredEnglishCopyCapture) {
+      await unregisterEnglishVideoCopyLinkCapture();
+      await saveBackgroundPostingStep(post.id, isEnglishPendingApprovalLookup
+        ? 'english_pending_copy_capture_unregistered'
+        : 'english_video_copy_capture_unregistered', {
+        mode: 'document_start',
+      }).catch(() => undefined);
+    }
+    if (registeredEnglishPendingNetworkCapture) {
+      await unregisterEnglishPendingNetworkCapture();
+      await saveBackgroundPostingStep(post.id, 'english_pending_network_capture_unregistered', {
+        mode: 'document_start',
+      }).catch(() => undefined);
     }
     isCheckingPendingPost = false;
     if (!lockAlreadyHeld) isFacebookSyncBusy = false;
   }
+}
+
+function normalizeResolvedEnglishGroupPostUrl(
+  value: string,
+  post: PendingFacebookPost,
+): string | null {
+  try {
+    const url = new URL(value);
+    if (url.hostname !== 'facebook.com' && !url.hostname.endsWith('.facebook.com')) return null;
+    const match = url.pathname.match(
+      /^\/groups\/([^/]+)\/(posts|permalink|pending_posts)\/([A-Za-z0-9_-]+)/i,
+    );
+    if (!match) return null;
+
+    const expectedGroups = new Set(
+      [post.groupId, post.groupExternalId]
+        .filter((groupId): groupId is string => typeof groupId === 'string' && Boolean(groupId))
+        .map((groupId) => groupId.toLowerCase()),
+    );
+    try {
+      const groupUrlId = new URL(post.groupUrl).pathname.match(/^\/groups\/([^/]+)/i)?.[1];
+      if (groupUrlId) expectedGroups.add(groupUrlId.toLowerCase());
+    } catch {
+      // The validated job target aliases above remain sufficient.
+    }
+    if (expectedGroups.size && !expectedGroups.has(match[1].toLowerCase())) return null;
+    const canonicalRoute = match[2].toLowerCase() === 'pending_posts'
+      ? 'pending_posts'
+      : 'posts';
+    return `https://www.facebook.com/groups/${match[1]}/${canonicalRoute}/${match[3]}/`;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveEnglishGroupShareRedirect(
+  tabId: number,
+  shareUrl: string,
+  post: PendingFacebookPost,
+): Promise<string | null> {
+  const directPostUrl = normalizeResolvedEnglishGroupPostUrl(shareUrl, post);
+  if (directPostUrl) return directPostUrl;
+
+  let parsedShareUrl: URL;
+  try {
+    parsedShareUrl = new URL(shareUrl);
+  } catch {
+    return null;
+  }
+  if (
+    (parsedShareUrl.hostname !== 'facebook.com' && !parsedShareUrl.hostname.endsWith('.facebook.com')) ||
+    !/^\/share\/v\/[A-Za-z0-9_-]+\/?$/i.test(parsedShareUrl.pathname)
+  ) return null;
+
+  await saveBackgroundPostingStep(post.id, 'english_video_share_redirect_started', {
+    tabId,
+    shareUrl: parsedShareUrl.href,
+  });
+  await chrome.tabs.update(tabId, { url: parsedShareUrl.href, active: true });
+  const startedAt = Date.now();
+  let lastObservedPath = '';
+  while (Date.now() - startedAt < POSTING_TIMING.facebookTabReadyTimeoutMs) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.url) {
+        try {
+          const observedUrl = new URL(tab.url);
+          const observedPath = `${observedUrl.pathname}${observedUrl.search}`;
+          if (observedPath !== lastObservedPath) {
+            lastObservedPath = observedPath;
+            await saveBackgroundPostingStep(post.id, 'english_video_share_redirect_location_changed', {
+              observedPath,
+              tabStatus: tab.status ?? null,
+            });
+          }
+        } catch {
+          // Continue polling until Facebook exposes a valid URL.
+        }
+      }
+      const canonicalPostUrl = tab.url
+        ? normalizeResolvedEnglishGroupPostUrl(tab.url, post)
+        : null;
+      if (canonicalPostUrl) {
+        await saveBackgroundPostingStep(post.id, 'english_video_canonical_post_url_resolved', {
+          canonicalPostUrl,
+        });
+        return canonicalPostUrl;
+      }
+    } catch {
+      await saveBackgroundPostingStep(post.id, 'english_video_share_redirect_tab_unavailable');
+      return null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  await saveBackgroundPostingStep(post.id, 'english_video_share_redirect_timed_out', {
+    lastObservedPath: lastObservedPath || null,
+  });
+  return null;
 }
 
 /**
@@ -1776,6 +2202,7 @@ async function syncPendingPostsBatch(): Promise<Array<{ postId: string; result: 
 }
 
 async function persistPendingSyncResult(post: PendingFacebookPost, result: PendingPostSyncResult): Promise<boolean> {
+  if (result.status === 'CONTENT_MATCHED') return false;
   const response = await apiFetch(`/api/jobs/${post.id}/pending-sync`, result);
   return Boolean(response);
 }
@@ -1967,6 +2394,10 @@ chrome.alarms.create(HEARTBEAT_ALARM, {
 chrome.alarms.create(PENDING_POST_SYNC_ALARM, {
   periodInMinutes: PENDING_POST_SYNC_INTERVAL_MINUTES,
 });
+// Remove state left by the retired English-video retry experiment. The
+// finalized flow performs one fresh-tab reconciliation immediately.
+void chrome.alarms.clear('postflow-english-video-link-sync');
+void chrome.storage.local.remove('englishGroupVideoLinkRetries');
 // Engagement checks are explicitly user-triggered from the dashboard. An
 // automatic alarm can open a previously stored post URL while a new post is
 // being published, so do not schedule background navigation for analytics.

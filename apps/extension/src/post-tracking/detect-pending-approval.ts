@@ -10,6 +10,9 @@ const APPROVAL_PHRASES = [
   "submitted to moderators",
   "waiting for approval",
   "awaiting approval",
+  "your post is pending",
+  "your post is awaiting admin approval",
+  "learn more about pending admin approval",
   "reviewing your post",
   "your post is awaiting approval",
   "your post is pending review",
@@ -47,6 +50,7 @@ const SEMANTIC_SURFACE_SELECTOR = [
   '[aria-modal="true"]',
   '[role="article"]',
   '[data-pagelet*="FeedUnit"]',
+  '[aria-posinset]',
 ].join(",");
 
 let lastLoggedEvidence: string | null = null;

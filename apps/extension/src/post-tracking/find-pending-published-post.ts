@@ -4,6 +4,7 @@ interface FindPendingPublishedPostOptions {
   submittedAt: number;
   currentGroupId?: string;
   expectedPostUrl?: string;
+  includeVirtualizedCards?: boolean;
 }
 
 interface PendingPublishedPostMatch {
@@ -62,12 +63,16 @@ function findPendingPublishedPost({
   submittedAt,
   currentGroupId,
   expectedPostUrl,
+  includeVirtualizedCards = false,
 }: FindPendingPublishedPostOptions): PendingPublishedPostMatch | null {
   if (!submittedText?.trim()) return null;
 
+  const candidateSelector = includeVirtualizedCards
+    ? `${POST_SELECTOR}, [aria-posinset]`
+    : POST_SELECTOR;
   const candidates: Element[] = [];
-  if (root instanceof Element && root.matches(POST_SELECTOR)) candidates.push(root);
-  candidates.push(...Array.from(root.querySelectorAll(POST_SELECTOR)));
+  if (root instanceof Element && root.matches(candidateSelector)) candidates.push(root);
+  candidates.push(...Array.from(root.querySelectorAll(candidateSelector)));
 
   const seen = new Set<Element>();
   const expectedPostIdentity = getFacebookPostIdentity(expectedPostUrl);
@@ -114,6 +119,7 @@ function checkPendingFacebookPost(
     submittedAt: Date.parse(post.submittedAt),
     currentGroupId: post.groupExternalId ?? post.groupId,
     expectedPostUrl: post.postUrl,
+    includeVirtualizedCards: post.englishPendingApprovalLookup === true,
   });
 
   if (!match) {

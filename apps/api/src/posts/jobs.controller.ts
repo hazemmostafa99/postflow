@@ -858,11 +858,16 @@ export class JobsController {
       const normalizedSubmissionPostUrl = normalizeFacebookGroupPostUrl(
         body.submissionResult.postUrl,
       );
+      const effectiveSubmissionStatus =
+        normalizedSubmissionPostUrl &&
+        isPendingFacebookPostUrl(normalizedSubmissionPostUrl)
+          ? FacebookSubmissionStatus.PENDING_APPROVAL
+          : body.submissionResult.status;
       let duplicatePermalink = false;
       if (
         normalizedSubmissionPostUrl &&
-        (body.submissionResult.status === FacebookSubmissionStatus.PUBLISHED ||
-          body.submissionResult.status ===
+        (effectiveSubmissionStatus === FacebookSubmissionStatus.PUBLISHED ||
+          effectiveSubmissionStatus ===
             FacebookSubmissionStatus.PENDING_APPROVAL)
       ) {
         const duplicateTargetFilter =
@@ -889,19 +894,19 @@ export class JobsController {
 
       job.submissionStatus = duplicatePermalink
         ? FacebookSubmissionStatus.UNKNOWN
-        : body.submissionResult.status;
+        : effectiveSubmissionStatus;
       // A later retry may report the status without repeating the permalink.
       // Never erase a URL that was already captured successfully.
       if (
         !duplicatePermalink &&
-        (body.submissionResult.status === FacebookSubmissionStatus.PUBLISHED ||
-          body.submissionResult.status ===
+        (effectiveSubmissionStatus === FacebookSubmissionStatus.PUBLISHED ||
+          effectiveSubmissionStatus ===
             FacebookSubmissionStatus.PENDING_APPROVAL) &&
         normalizedSubmissionPostUrl
       ) {
         job.postUrl = normalizedSubmissionPostUrl;
       }
-      if (body.submissionResult.status === FacebookSubmissionStatus.UNKNOWN) {
+      if (effectiveSubmissionStatus === FacebookSubmissionStatus.UNKNOWN) {
         job.postUrl = undefined;
       }
       job.submissionReason = duplicatePermalink
@@ -910,14 +915,13 @@ export class JobsController {
               ? 'profile feed'
               : 'group'
           }`
-        : body.submissionResult.status === FacebookSubmissionStatus.UNKNOWN
+        : effectiveSubmissionStatus === FacebookSubmissionStatus.UNKNOWN
           ? body.submissionResult.reason
           : undefined;
 
       if (
         !duplicatePermalink &&
-        body.submissionResult.status ===
-          FacebookSubmissionStatus.PENDING_APPROVAL &&
+        effectiveSubmissionStatus === FacebookSubmissionStatus.PENDING_APPROVAL &&
         !job.submittedAt
       ) {
         job.submittedAt = new Date();
@@ -929,7 +933,7 @@ export class JobsController {
 
       if (
         !duplicatePermalink &&
-        body.submissionResult.status === FacebookSubmissionStatus.PUBLISHED
+        effectiveSubmissionStatus === FacebookSubmissionStatus.PUBLISHED
       ) {
         job.publishedDetectedAt ??= new Date();
       }

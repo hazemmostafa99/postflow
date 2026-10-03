@@ -77,6 +77,8 @@ const groups = new Map<string, FacebookGroup>();
 let lastSentSignature = "";
 let isExecutingJob = false;
 let activeJobId: string | null = null;
+let activeJobUsesEnglishGroupFlow = false;
+let activeJobPublishedVideoIds: string[] = [];
 
 interface FacebookResponseCandidateDetail {
   requestUrl?: string;
@@ -86,6 +88,137 @@ interface FacebookResponseCandidateDetail {
   storyFbids?: unknown[];
   videoIds?: unknown[];
   uploadSessionIds?: unknown[];
+  pendingPostCandidates?: unknown[];
+}
+
+interface PendingPostNetworkCandidate {
+  postUrls: string[];
+  postIds: string[];
+  texts: string[];
+  videoIds: string[];
+  observedAt: number;
+}
+
+const pendingPostNetworkCandidates: PendingPostNetworkCandidate[] = [];
+const pendingPostNetworkCandidateKeys = new Set<string>();
+
+function normalizePendingCandidateText(value: string): string {
+  return value
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function trackPendingPageNetworkCandidates(detail: FacebookResponseCandidateDetail): void {
+  if (!/^\/groups\/[^/]+\/pending_posts\/?$/i.test(location.pathname)) return;
+  if (!Array.isArray(detail.pendingPostCandidates)) return;
+
+  for (const rawCandidate of detail.pendingPostCandidates) {
+    if (!rawCandidate || typeof rawCandidate !== 'object') continue;
+    const candidate = rawCandidate as Record<string, unknown>;
+    const postUrls = Array.isArray(candidate.postUrls)
+      ? candidate.postUrls.filter((value): value is string => typeof value === 'string')
+      : [];
+    const postIds = Array.isArray(candidate.postIds)
+      ? candidate.postIds.filter((value): value is string => typeof value === 'string' && /^\d+$/.test(value))
+      : [];
+    const texts = Array.isArray(candidate.texts)
+      ? candidate.texts.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      : [];
+    const videoIds = Array.isArray(candidate.videoIds)
+      ? candidate.videoIds.filter((value): value is string => typeof value === 'string' && /^\d+$/.test(value))
+      : [];
+    if (!texts.length || (!postUrls.length && !postIds.length)) continue;
+    const key = `${postUrls.join(',')}|${postIds.join(',')}|${texts.join('|')}|${videoIds.join(',')}`;
+    if (pendingPostNetworkCandidateKeys.has(key)) continue;
+    pendingPostNetworkCandidateKeys.add(key);
+    pendingPostNetworkCandidates.push({ postUrls, postIds, texts, videoIds, observedAt: Date.now() });
+  }
+  if (pendingPostNetworkCandidates.length > 200) {
+    pendingPostNetworkCandidates.splice(0, pendingPostNetworkCandidates.length - 200);
+  }
+}
+
+function getPendingLookupGroupId(post: PendingFacebookPost): string | null {
+  try {
+    return new URL(post.groupUrl).pathname.match(/^\/groups\/([^/]+)/i)?.[1] ??
+      post.groupExternalId ??
+      post.groupId ??
+      null;
+  } catch {
+    return post.groupExternalId ?? post.groupId ?? null;
+  }
+}
+
+function findMatchingPendingNetworkPostUrl(post: PendingFacebookPost): string | null {
+  const submittedText = normalizePendingCandidateText(post.content ?? '');
+  if (!submittedText) return null;
+  const expectedVideoIds = new Set((post.videoIds ?? []).filter((value) => /^\d+$/.test(value)));
+  const groupId = getPendingLookupGroupId(post);
+  if (!groupId) return null;
+
+  const textMatches = pendingPostNetworkCandidates.filter((candidate) =>
+    candidate.texts.some((value) => normalizePendingCandidateText(value) === submittedText),
+  );
+  if (!textMatches.length) return null;
+  const videoMatch = textMatches.find((candidate) =>
+    expectedVideoIds.size > 0 && candidate.videoIds.some((value) => expectedVideoIds.has(value)),
+  );
+  const candidate = videoMatch ?? textMatches[textMatches.length - 1];
+
+  for (const value of candidate.postUrls) {
+    const normalized = normalizeTrackedPostUrl(value);
+    if (!normalized || !/\/pending_posts\//i.test(normalized)) continue;
+    const candidateGroupId = extractFacebookGroupIdFromUrl(normalized);
+    if (candidateGroupId && candidateGroupId.toLowerCase() !== groupId.toLowerCase()) continue;
+    return normalized.endsWith('/') ? normalized : `${normalized}/`;
+  }
+  const postId = candidate.postIds[0];
+  return postId
+    ? `https://www.facebook.com/groups/${groupId}/pending_posts/${postId}/`
+    : null;
+}
+
+function getPendingNetworkMatchDiagnostics(post: PendingFacebookPost): PostingLogDetails {
+  const submittedText = normalizePendingCandidateText(post.content ?? '');
+  const expectedVideoIds = new Set((post.videoIds ?? []).filter((value) => /^\d+$/.test(value)));
+  let candidateTextCount = 0;
+  let exactTextMatchCount = 0;
+  let containingTextMatchCount = 0;
+  let expectedVideoOverlapCount = 0;
+  let exactTextAndVideoOverlapCount = 0;
+  let directPendingUrlCount = 0;
+
+  for (const candidate of pendingPostNetworkCandidates) {
+    const normalizedTexts = candidate.texts.map(normalizePendingCandidateText).filter(Boolean);
+    candidateTextCount += normalizedTexts.length;
+    const exactTextMatch = Boolean(submittedText) && normalizedTexts.some((value) => value === submittedText);
+    const containingTextMatch = Boolean(submittedText) && normalizedTexts.some((value) =>
+      value.includes(submittedText) || submittedText.includes(value)
+    );
+    const expectedVideoOverlap = expectedVideoIds.size > 0 &&
+      candidate.videoIds.some((value) => expectedVideoIds.has(value));
+    if (exactTextMatch) exactTextMatchCount += 1;
+    if (containingTextMatch) containingTextMatchCount += 1;
+    if (expectedVideoOverlap) expectedVideoOverlapCount += 1;
+    if (exactTextMatch && expectedVideoOverlap) exactTextAndVideoOverlapCount += 1;
+    if (candidate.postUrls.some((value) => /\/pending_posts\//i.test(value))) {
+      directPendingUrlCount += 1;
+    }
+  }
+
+  return {
+    submittedTextLength: submittedText.length,
+    expectedVideoIdCount: expectedVideoIds.size,
+    candidateTextCount,
+    exactTextMatchCount,
+    containingTextMatchCount,
+    expectedVideoOverlapCount,
+    exactTextAndVideoOverlapCount,
+    directPendingUrlCount,
+  };
 }
 
 type PublishCandidateSource = 'response-post-url' | 'response-story-fbid';
@@ -255,6 +388,14 @@ function getBestNetworkPostUrl(session: PublishTrackingSession): string | null {
       });
       continue;
     }
+    if (/\/pending_posts\//i.test(normalizedCandidate)) {
+      console.log('[PostTracking] Rejected published network candidate', {
+        jobId: session.jobId,
+        source: candidate.source,
+        reason: 'pending-approval-url',
+      });
+      continue;
+    }
     if (session.existingPostUrls.has(normalizedCandidate)) {
       console.log('[PostTracking] Rejected network candidate', {
         jobId: session.jobId,
@@ -329,12 +470,14 @@ function injectFacebookResponseSpy(): void {
 }
 
 window.addEventListener('postflow:facebook-response', ((event: CustomEvent<FacebookResponseCandidateDetail>) => {
+  trackPendingPageNetworkCandidates(event.detail ?? {});
   if (!isExecutingJob) return;
   trackFacebookResponseCandidates(event.detail ?? {});
 }) as EventListener, false);
 
 window.addEventListener('message', ((event: MessageEvent<FacebookResponseCandidateDetail & { source?: string; type?: string }>) => {
   if (event.source !== window || event.data?.source !== 'postflow-graphql-spy' || event.data.type !== 'facebook-response') return;
+  trackPendingPageNetworkCandidates(event.data);
   if (!isExecutingJob) return;
   trackFacebookResponseCandidates(event.data);
 }) as EventListener, false);
@@ -758,6 +901,123 @@ try {
   // Silently ignore if context is already gone (e.g. during hot reload)
 }
 
+function findMatchingEnglishVideoCard(
+  post: PendingFacebookPost,
+  allowVideoIdMismatch = false,
+): HTMLElement | null {
+  const submittedText = (post.content ?? '')
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+  const expectedVideoIds = new Set((post.videoIds ?? []).filter((value) => /^\d+$/.test(value)));
+
+  let textMatch: HTMLElement | null = null;
+  for (const item of Array.from(document.querySelectorAll<HTMLElement>('[aria-posinset]'))) {
+    const storyMessage = item.querySelector<HTMLElement>('[data-ad-rendering-role="story_message"]');
+    const storyText = (storyMessage?.innerText || storyMessage?.textContent || '')
+      .normalize('NFKC')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+    if (!submittedText || storyText !== submittedText) continue;
+
+    const candidateVideoIds = Array.from(item.querySelectorAll<HTMLElement>('[data-video-id]'))
+      .map((element) => element.getAttribute('data-video-id') ?? '')
+      .filter((value): value is string => /^\d+$/.test(value));
+    const videoIdMatches = !expectedVideoIds.size ||
+      !candidateVideoIds.length ||
+      candidateVideoIds.some((videoId) => expectedVideoIds.has(videoId));
+    if (videoIdMatches) return item;
+    if (allowVideoIdMismatch && !textMatch) textMatch = item;
+  }
+  return textMatch;
+}
+
+function normalizeEnglishVideoShareUrl(value: string): string | null {
+  try {
+    const url = new URL(value.trim());
+    if (url.hostname !== 'facebook.com' && !url.hostname.endsWith('.facebook.com')) return null;
+    const shareMatch = url.pathname.match(/^\/share\/v\/([A-Za-z0-9_-]+)\/?$/i);
+    if (shareMatch) return `https://www.facebook.com/share/v/${shareMatch[1]}/`;
+    const groupPostMatch = url.pathname.match(
+      /^\/groups\/([^/]+)\/(posts|permalink|pending_posts)\/([A-Za-z0-9_-]+)\/?$/i,
+    );
+    if (!groupPostMatch) return null;
+    return `https://www.facebook.com/groups/${groupPostMatch[1]}/${groupPostMatch[2]}/${groupPostMatch[3]}/`;
+  } catch {
+    return null;
+  }
+}
+
+async function copyMatchedEnglishVideoShareUrl(
+  post: PendingFacebookPost,
+  card: HTMLElement,
+): Promise<string | null> {
+  recordPostingStep(post.id, 'english_video_link_capture_started');
+  const actionsButton = card.querySelector<HTMLElement>(
+    '[role="button"][aria-haspopup="menu"][aria-label^="Actions for this post"]',
+  );
+  if (!actionsButton) {
+    recordPostingStep(post.id, 'english_video_actions_button_missing');
+    return null;
+  }
+  recordPostingStep(post.id, 'english_video_actions_button_found');
+
+  clickLikeUser(actionsButton);
+  recordPostingStep(post.id, 'english_video_actions_button_clicked');
+  const copyLinkItem = await waitForValue(() => {
+    return Array.from(document.querySelectorAll<HTMLElement>('[role="menuitem"]'))
+      .find((item) => (item.innerText || item.textContent || '')
+        .normalize('NFKC')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase() === 'copy link') ?? null;
+  }, 4000, 100);
+  if (!copyLinkItem) {
+    recordPostingStep(post.id, 'english_video_copy_link_item_missing');
+    return null;
+  }
+  recordPostingStep(post.id, 'english_video_copy_link_item_found');
+
+  const capturedShareUrl = new Promise<{ shareUrl: string; captureMethod: string } | null>((resolve) => {
+    const timeoutId = window.setTimeout(() => {
+      window.removeEventListener('message', onMessage);
+      resolve(null);
+    }, 4000);
+    const onMessage = (event: MessageEvent) => {
+      if (event.source !== window || event.data?.source !== 'postflow-facebook-copy-link') return;
+      const shareUrl = typeof event.data?.text === 'string'
+        ? normalizeEnglishVideoShareUrl(event.data.text)
+        : null;
+      if (!shareUrl) return;
+      window.clearTimeout(timeoutId);
+      window.removeEventListener('message', onMessage);
+      resolve({
+        shareUrl,
+        captureMethod: typeof event.data?.captureMethod === 'string'
+          ? event.data.captureMethod
+          : 'unknown',
+      });
+    };
+    window.addEventListener('message', onMessage);
+  });
+
+  recordPostingStep(post.id, 'english_video_share_link_capture_waiting');
+  clickLikeUser(copyLinkItem);
+  recordPostingStep(post.id, 'english_video_copy_link_item_clicked');
+  const captured = await capturedShareUrl;
+  if (captured) {
+    recordPostingStep(post.id, 'english_video_share_link_captured', {
+      shareUrl: captured.shareUrl,
+      captureMethod: captured.captureMethod,
+    });
+    return captured.shareUrl;
+  }
+  recordPostingStep(post.id, 'english_video_share_link_not_captured');
+  return null;
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === 'SCAN_NOW') {
     console.log('[PostFlow] Manual scan triggered by Web App');
@@ -800,23 +1060,128 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           requestId: message.requestId,
           url: location.href,
         });
-        const ready = await waitForCondition(
-          () => Boolean(
-            document.querySelector('[role="main"]') ||
-            document.querySelector('[data-pagelet*="Feed"]') ||
-            document.querySelector('[role="article"]'),
-          ),
-          POSTING_TIMING.groupPageReadyTimeoutMs,
-        );
+        const pendingPost = message.post as PendingFacebookPost;
+        const isEnglishPendingApprovalLookup = pendingPost.englishPendingApprovalLookup === true;
+        let matchedEnglishPendingCard: HTMLElement | null = null;
+        let resolvedEnglishPendingPostUrl: string | null = null;
+        let englishPendingUrlSource: 'network' | 'dom' | null = null;
+        if (isEnglishPendingApprovalLookup) {
+          let lastLoggedNetworkCandidateCount = -1;
+          recordPostingStep(pendingPost.id, 'english_pending_post_wait_started', {
+            timeoutMs: POSTING_TIMING.profileVideoPermalinkTimeoutMs,
+          });
+          const pendingEvidence = await waitForValue(
+            () => {
+              if (pendingPostNetworkCandidates.length !== lastLoggedNetworkCandidateCount) {
+                lastLoggedNetworkCandidateCount = pendingPostNetworkCandidates.length;
+                recordPostingStep(pendingPost.id, 'english_pending_network_candidates_observed', {
+                  candidateCount: pendingPostNetworkCandidates.length,
+                  candidatesWithPostId: pendingPostNetworkCandidates.filter((candidate) => candidate.postIds.length > 0).length,
+                  candidatesWithDirectUrl: pendingPostNetworkCandidates.filter((candidate) => candidate.postUrls.length > 0).length,
+                  ...getPendingNetworkMatchDiagnostics(pendingPost),
+                });
+              }
+              const networkPostUrl = findMatchingPendingNetworkPostUrl(pendingPost);
+              if (networkPostUrl) return { postUrl: networkPostUrl, source: 'network' as const };
+
+              const matchedCard = findMatchingEnglishVideoCard(pendingPost, true);
+              if (!matchedCard) return null;
+              matchedEnglishPendingCard = matchedCard;
+              const directPostUrl = extractPostPermalink(
+                matchedCard,
+                getPendingLookupGroupId(pendingPost) ?? undefined,
+              );
+              return directPostUrl
+                ? { postUrl: directPostUrl, source: 'dom' as const }
+                : null;
+            },
+            POSTING_TIMING.profileVideoPermalinkTimeoutMs,
+            1000,
+          );
+          resolvedEnglishPendingPostUrl = pendingEvidence?.postUrl ?? null;
+          englishPendingUrlSource = pendingEvidence?.source ?? null;
+        }
+        const ready = isEnglishPendingApprovalLookup
+          ? Boolean(resolvedEnglishPendingPostUrl)
+          : await waitForCondition(
+            () => Boolean(
+              document.querySelector('[role="main"]') ||
+              document.querySelector('[data-pagelet*="Feed"]') ||
+              document.querySelector('[role="article"]') ||
+              document.querySelector('[aria-posinset]'),
+            ),
+            POSTING_TIMING.groupPageReadyTimeoutMs,
+          );
         if (!ready) {
+          const reason = isEnglishPendingApprovalLookup
+            ? matchedEnglishPendingCard
+              ? 'The submitted pending post appeared, but Facebook exposed no post URL or network post ID before the lookup expired'
+              : 'The submitted post did not appear in Facebook pending posts before the upload wait expired'
+            : 'Facebook group feed did not load';
+          if (isEnglishPendingApprovalLookup) {
+            recordPostingStep(pendingPost.id, 'english_pending_lookup_surface_missing', {
+              pendingLinkCount: document.querySelectorAll('a[href*="/pending_posts/"]').length,
+              virtualizedItemCount: document.querySelectorAll('[aria-posinset]').length,
+              storyMessageCount: document.querySelectorAll('[aria-posinset] [data-ad-rendering-role="story_message"]').length,
+              actionButtonCount: document.querySelectorAll('[aria-posinset] [aria-label^="Actions for this post"]').length,
+              networkCandidateCount: pendingPostNetworkCandidates.length,
+              submittedCardMatched: Boolean(matchedEnglishPendingCard),
+              currentUrl: location.href,
+            });
+          }
           sendResponse({
             ok: true,
-            result: { status: 'CHECK_FAILED', reason: 'Facebook group feed did not load' },
+            result: { status: 'CHECK_FAILED', reason },
           });
           return;
         }
 
-        const result = checkPendingFacebookPost(message.post as PendingFacebookPost);
+        if (isEnglishPendingApprovalLookup) {
+          const matchedPendingCard = matchedEnglishPendingCard as HTMLElement | null;
+          recordPostingStep(pendingPost.id, 'english_pending_lookup_surface_ready', {
+            pendingLinkCount: document.querySelectorAll('a[href*="/pending_posts/"]').length,
+            virtualizedItemCount: document.querySelectorAll('[aria-posinset]').length,
+            matchedAriaPosInSet: matchedPendingCard?.getAttribute('aria-posinset') ?? null,
+            matchedVideoIdCount: matchedPendingCard?.querySelectorAll('[data-video-id]').length ?? 0,
+            networkCandidateCount: pendingPostNetworkCandidates.length,
+            urlSource: englishPendingUrlSource,
+            postUrl: resolvedEnglishPendingPostUrl,
+            currentUrl: location.href,
+          });
+        }
+        let result: PendingPostSyncResult = resolvedEnglishPendingPostUrl
+          ? { status: 'STILL_PENDING', postUrl: resolvedEnglishPendingPostUrl }
+          : checkPendingFacebookPost(pendingPost);
+        if (isEnglishPendingApprovalLookup && resolvedEnglishPendingPostUrl) {
+          recordPostingStep(pendingPost.id, 'english_pending_post_url_captured', {
+            source: englishPendingUrlSource,
+            postUrl: resolvedEnglishPendingPostUrl,
+            networkCandidateCount: pendingPostNetworkCandidates.length,
+          });
+        }
+        if (pendingPost.englishGroupVideo === true && !isEnglishPendingApprovalLookup) {
+          recordPostingStep(pendingPost.id, 'english_video_content_match_started', {
+            virtualizedItemCount: document.querySelectorAll('[aria-posinset]').length,
+          });
+          const matchedCard = findMatchingEnglishVideoCard(pendingPost);
+          if (matchedCard) {
+            const matchedVideoIdCount = matchedCard.querySelectorAll('[data-video-id]').length;
+            recordPostingStep(pendingPost.id, 'english_video_content_matched', {
+              matchedVideoIdCount,
+            });
+            console.log('[PendingPostSync] English Group video content matched successfully', {
+              postId: pendingPost.id,
+              matchedVideoIdCount,
+            });
+            const copiedShareUrl = await copyMatchedEnglishVideoShareUrl(pendingPost, matchedCard);
+            result = {
+              status: 'CONTENT_MATCHED',
+              ...(copiedShareUrl ? { copiedShareUrl } : {}),
+            };
+          } else {
+            recordPostingStep(pendingPost.id, 'english_video_content_match_not_found');
+          }
+        }
         console.log('[PendingPostSync] Content script matched pending post', {
           postId: message.post?.id,
           result,
@@ -896,6 +1261,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       targetType: target.type,
     });
     activeJobId = message.jobId;
+    activeJobUsesEnglishGroupFlow = false;
+    activeJobPublishedVideoIds = [];
     sendResponse({ ok: true, accepted: true });
     const profileVideoNotificationBaselineKeys = Array.isArray(message.profileVideoNotificationBaselineKeys)
       ? message.profileVideoNotificationBaselineKeys.filter((value: unknown): value is string => typeof value === 'string')
@@ -907,6 +1274,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       profileVideoNotificationBaselineKeys,
     )
       .then((submissionResult) => {
+        const publishedVideoIds = activeJobPublishedVideoIds;
+        activeJobPublishedVideoIds = [];
         if (isFacebookPublishFailureResult(submissionResult)) {
           chrome.runtime.sendMessage({
             type: 'JOB_FAILED',
@@ -927,9 +1296,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           jobId: message.jobId,
           postId: message.post?._id,
           submissionResult,
+          englishGroupFlow: target.type === 'GROUP' && activeJobUsesEnglishGroupFlow,
+          videoIds: publishedVideoIds,
         });
       })
       .catch((err) => {
+        activeJobPublishedVideoIds = [];
         const isAccountMismatch = err?.name === 'PostFlowAccountMismatch';
         chrome.runtime.sendMessage({
           type: err?.name === 'PostFlowJobCanceled' ? 'JOB_CANCELED' : 'JOB_FAILED',
@@ -973,6 +1345,39 @@ function extractFacebookGroupIdFromUrl(value?: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function hasEnglishGroupComposerTrigger(root: ParentNode = document): boolean {
+  const searchRoot = root.querySelector?.('[role="main"]') ?? root;
+  const candidates = Array.from(
+    searchRoot.querySelectorAll<HTMLElement>('[role="button"], button'),
+  );
+
+  return candidates.some((candidate) => {
+    if (candidate.closest('[role="article"], [role="dialog"], [aria-modal="true"]')) return false;
+    if (candidate.hidden || candidate.getAttribute('aria-hidden') === 'true') return false;
+
+    const style = window.getComputedStyle(candidate);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+
+    const text = [
+      candidate.getAttribute('aria-label'),
+      candidate.getAttribute('aria-placeholder'),
+      candidate.textContent,
+    ]
+      .filter(Boolean)
+      .join(' ')
+      .normalize('NFKC')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+
+    return text.length <= 120 && [
+      'write something',
+      "what's on your mind",
+      'create a post',
+    ].some((phrase) => text.includes(phrase));
+  });
 }
 
 async function executeFacebookPost(
@@ -1022,13 +1427,15 @@ async function executeFacebookPost(
       const pageReady = await waitForCondition(
         () => isProfileTarget
           ? isExpectedProfileFeed(target as ProfileFeedTarget) && Boolean(document.querySelector('[role="main"]'))
-          : Boolean(document.querySelector('[role="main"], [data-pagelet="GroupInlineComposer"]')) && Boolean(document.querySelector(
-            '[data-pagelet="GroupInlineComposer"] [role="button"], ' +
-            '[data-pagelet="GroupInlineComposer"] button, ' +
-            '[aria-label*="Create a post" i], ' +
-            '[aria-label*="Write something" i], ' +
-            '[aria-placeholder*="Write something" i]',
-          )),
+          : Boolean(document.querySelector('[role="main"], [data-pagelet="GroupInlineComposer"]')) && (
+            Boolean(document.querySelector(
+              '[data-pagelet="GroupInlineComposer"] [role="button"], ' +
+              '[data-pagelet="GroupInlineComposer"] button, ' +
+              '[aria-label*="Create a post" i], ' +
+              '[aria-label*="Write something" i], ' +
+              '[aria-placeholder*="Write something" i]',
+            )) || hasEnglishGroupComposerTrigger()
+          ),
         isProfileTarget ? POSTING_TIMING.facebookTabReadyTimeoutMs : POSTING_TIMING.groupPageReadyTimeoutMs,
       );
       if (!pageReady) {
@@ -1150,11 +1557,28 @@ async function executeFacebookPost(
         );
       }
 
+      const composerTriggerText = (
+        (composerTrigger as HTMLElement).innerText ||
+        composerTrigger.textContent ||
+        ''
+      )
+        .normalize('NFKC')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+      const isEnglishGroupComposerFlow = !isProfileTarget && [
+        'write something',
+        "what's on your mind",
+        'create a post',
+      ].some((phrase) => composerTriggerText.includes(phrase));
+      activeJobUsesEnglishGroupFlow = isEnglishGroupComposerFlow;
+
       recordPostingStep(jobId, 'composer_trigger_found', {
         tag: composerTrigger.tagName,
         role: composerTrigger.getAttribute('role'),
         label: composerTrigger.getAttribute('aria-label'),
         text: composerTrigger.textContent?.trim().slice(0, 80),
+        isEnglishGroupComposerFlow,
       });
 
       console.log('[PostFlow] Clicking composer trigger:', composerTrigger.getAttribute('aria-label') ?? composerTrigger.textContent?.substring(0, 40));
@@ -1238,11 +1662,20 @@ async function executeFacebookPost(
       ];
 
       let editor: Element | null = null;
-      for (const sel of editorSelectors) {
-        editor = dialog.querySelector(sel);
-        if (editor) {
-          console.log('[PostFlow] Found editor inside dialog with selector:', sel);
-          break;
+      if (isProfileTarget) {
+        editor = Array.from(dialog.querySelectorAll<HTMLElement>(editorSelectors.join(', ')))
+          .find((candidate) =>
+            isVisibleProfileComposerElement(candidate) &&
+            profileComposerTextMatches(candidate)
+          ) ?? null;
+        if (editor) console.log('[PostFlow] Found profile create-post editor inside modal dialog');
+      } else {
+        for (const sel of editorSelectors) {
+          editor = dialog.querySelector(sel);
+          if (editor) {
+            console.log('[PostFlow] Found editor inside dialog with selector:', sel);
+            break;
+          }
         }
       }
 
@@ -1250,9 +1683,69 @@ async function executeFacebookPost(
         throw new Error('Could not find the text editor inside the Create Post dialog');
       }
 
+      // In the supplied English Group DOM, the labelled "Create post" dialog
+      // is a header sibling rather than an ancestor of the editor. The editor
+      // belongs to the outer aria-modal dialog.
+      const facebookDocumentLocale = document.documentElement.lang.trim().toLowerCase();
+      const englishEditorPlaceholder = (editor.getAttribute('aria-placeholder') ?? '').toLowerCase();
+      const hasEnglishCreatePostSurface = Boolean(
+        document.querySelector('[role="dialog"][aria-label="Create post"]'),
+      );
+      // Only the user-visible trigger selects the English-specific DOM path.
+      // Facebook can expose English document/accessibility metadata while its
+      // visible UI is Arabic, so those signals are diagnostics only. Letting
+      // them activate this branch changes the previously reliable Arabic
+      // editor, media, submit, and video-result behavior.
+      const isEnglishGroupEditor = isEnglishGroupComposerFlow;
+      const isEnglishProfileEditor = isProfileTarget &&
+        englishEditorPlaceholder.includes("what's on your mind") &&
+        dialog.getAttribute('aria-modal') === 'true';
+      let englishGroupComposerResolution = 'not_english';
+      let englishGroupComposerDialog = isEnglishGroupEditor
+        ? editor.closest<HTMLElement>('[role="dialog"][aria-modal="true"]')
+        : null;
+      if (englishGroupComposerDialog) englishGroupComposerResolution = 'editor_ancestor';
+
+      if (isEnglishGroupEditor && !englishGroupComposerDialog) {
+        englishGroupComposerDialog = await waitForValue(() => (
+          Array.from(
+            document.querySelectorAll<HTMLElement>('[role="dialog"][aria-modal="true"]'),
+          ).find((candidate) => {
+            if (candidate.hidden || candidate.getAttribute('aria-hidden') === 'true') return false;
+            const style = window.getComputedStyle(candidate);
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+            return Boolean(
+              candidate.querySelector('[data-lexical-editor="true"][contenteditable="true"]') &&
+              candidate.querySelector('[aria-label="Post"]'),
+            );
+          }) ?? null
+        ), POSTING_TIMING.createPostDialogTimeoutMs);
+
+        const modalEditor = englishGroupComposerDialog?.querySelector<HTMLElement>(
+          '[data-lexical-editor="true"][contenteditable="true"]',
+        );
+        if (modalEditor) {
+          editor = modalEditor;
+          englishGroupComposerResolution = 'visible_modal_controls';
+        }
+      }
+      if (isEnglishGroupEditor && !englishGroupComposerDialog) {
+        throw new Error('Could not resolve the English Create post dialog from its editor');
+      }
+      const englishComposerSurface = englishGroupComposerDialog ??
+        (isEnglishProfileEditor ? dialog as HTMLElement : null);
+
       recordPostingStep(jobId, 'editor_found', {
         selector: editor.getAttribute('data-lexical-editor') === 'true' ? 'data-lexical-editor' : editor.tagName,
         role: editor.getAttribute('role'),
+        facebookDocumentLocale: facebookDocumentLocale || 'unknown',
+        englishEditorPlaceholder: englishEditorPlaceholder || undefined,
+        hasEnglishCreatePostSurface,
+        isEnglishGroupEditor,
+        isEnglishProfileEditor,
+        englishGroupComposerDialog: Boolean(englishGroupComposerDialog),
+        englishComposerScoped: Boolean(englishComposerSurface),
+        englishGroupComposerResolution,
       });
 
       console.log('[PostFlow] Focusing editor and injecting text...');
@@ -1275,9 +1768,23 @@ async function executeFacebookPost(
         try {
           const sel = window.getSelection();
           const range = document.createRange();
-          // Select all content and collapse to end so we start fresh
-          range.selectNodeContents(editorEl);
-          range.collapse(false); // false = collapse to end
+          const englishManagedLineBreak = englishComposerSurface
+            ? editorEl.querySelector('br[data-lexical-managed-linebreak="true"]')
+            : null;
+
+          if (englishManagedLineBreak?.parentNode) {
+            // The supplied English Lexical DOM starts with <p><br ...></p>.
+            // Insert inside that paragraph so Lexical accepts the mutation;
+            // inserting after the paragraph creates transient DOM that Lexical
+            // removes without enabling the Post button.
+            range.setStartBefore(englishManagedLineBreak);
+            range.collapse(true);
+          } else {
+            // Preserve the existing caret behavior for Arabic and other
+            // composer variants that do not use the supplied English shape.
+            range.selectNodeContents(editorEl);
+            range.collapse(false); // false = collapse to end
+          }
           sel?.removeAllRanges();
           sel?.addRange(range);
         } catch {
@@ -1297,6 +1804,12 @@ async function executeFacebookPost(
       recordPostingStep(jobId, 'text_insert_attempted', {
         execResult,
         textLength: textAfterExec.length,
+        caretTarget: englishComposerSurface ? 'english_lexical_paragraph' : 'editor_root',
+        englishPostButtonDisabled: englishComposerSurface
+          ? englishComposerSurface
+            .querySelector('[aria-label="Post"]')
+            ?.getAttribute('aria-disabled') === 'true'
+          : undefined,
       });
 
       if (!textAfterExec.trim()) {
@@ -1334,15 +1847,23 @@ async function executeFacebookPost(
       }
 
       if (hasMedia) {
-        recordPostingStep(jobId, 'media_attach_started', { mediaCount: mediaUrls.length });
-        await attachMediaToDialog(dialog, mediaUrls);
+        const mediaComposerSurface = englishComposerSurface ?? dialog;
+        recordPostingStep(jobId, 'media_attach_started', {
+          mediaCount: mediaUrls.length,
+          englishComposerScoped: Boolean(englishComposerSurface),
+        });
+        await attachMediaToDialog(
+          mediaComposerSurface,
+          mediaUrls,
+          Boolean(englishComposerSurface),
+        );
         recordPostingStep(jobId, 'media_attach_finished', { mediaCount: mediaUrls.length });
       }
 
       console.log('[PostFlow] Text injected successfully, waiting for Post button to enable...');
 
       // 3. Find the Post / Submit button — search inside the dialog we already found
-      const dialogSearchRoot = dialog;
+      const dialogSearchRoot = englishComposerSurface ?? dialog;
 
       // Try multiple labels since Facebook localizes these strings
       const postButtonSelectors = [
@@ -1354,6 +1875,25 @@ async function executeFacebookPost(
       ];
 
       const findPostButton = () => {
+        const exactEnglishPostButton = englishComposerSurface
+          ? dialogSearchRoot.querySelector<HTMLElement>('[aria-label="Post"]')
+          : null;
+        if (exactEnglishPostButton) {
+          if (exactEnglishPostButton.getAttribute('aria-disabled') === 'true') return null;
+
+          const style = window.getComputedStyle(exactEnglishPostButton);
+          if (
+            exactEnglishPostButton.hidden ||
+            exactEnglishPostButton.getAttribute('aria-hidden') === 'true' ||
+            style.display === 'none' ||
+            style.visibility === 'hidden' ||
+            style.opacity === '0'
+          ) return null;
+
+          console.log('[PostFlow] Found exact English Post button inside Create post dialog');
+          return exactEnglishPostButton;
+        }
+
         for (const sel of postButtonSelectors) {
           const candidates = Array.from(dialogSearchRoot.querySelectorAll(sel));
           const enabled = candidates.find(el =>
@@ -1555,6 +2095,10 @@ async function executeFacebookPost(
         'we\'re processing the video',
         'جارٍ معالجة الفيديو',
         'تجري الآن معالجة الفيديو',
+        ...(isEnglishGroupEditor ? [
+          'the video in your post is being processed',
+          'dismiss inline feed notice about video processing',
+        ] : []),
       ];
       const isVideoProcessingVisible = () => {
         if (!hasVideo) return false;
@@ -1620,6 +2164,9 @@ async function executeFacebookPost(
             shouldPauseQueue: typeof details.shouldPauseQueue === 'boolean' ? details.shouldPauseQueue : undefined,
           });
         },
+        onDiagnostic: (step, details = {}) => {
+          recordPostingStep(jobId, step, details);
+        },
       });
 
       recordPostingStep(jobId, 'submission_result_detected', {
@@ -1640,6 +2187,7 @@ async function executeFacebookPost(
         videoIds: Array.from(trackingSession.mediaVideoIds),
         uploadSessionIds: Array.from(trackingSession.uploadSessionIds),
       });
+      activeJobPublishedVideoIds = Array.from(trackingSession.mediaVideoIds);
       if (activePublishTrackingSession === trackingSession) activePublishTrackingSession = null;
       resolve(submissionResult);
       return;
@@ -1879,14 +2427,42 @@ function dataUrlToFile(dataUrl: string, index: number): File {
   return new File([bytes], `postflow-media-${index + 1}.${extension}`, { type: mimeType });
 }
 
-async function attachMediaToDialog(dialog: Element, mediaUrls: string[]) {
+async function attachMediaToDialog(
+  dialog: Element,
+  mediaUrls: string[],
+  restrictToEnglishComposer = false,
+) {
   console.log(`[PostFlow] Attaching ${mediaUrls.length} media file(s)`);
 
   const mediaFiles = mediaUrls.map((url, index) => dataUrlToFile(url, index));
   const transfer = new DataTransfer();
   mediaFiles.forEach((file) => transfer.items.add(file));
 
+  const initialImages = new Set(dialog.querySelectorAll('img'));
+  const initialVideos = new Set(dialog.querySelectorAll('video'));
+
+  const findEnglishComposerFileInput = () => {
+    if (!restrictToEnglishComposer) return null;
+    const mediaControl = dialog.querySelector<HTMLElement>('[aria-label="Photo/video"]');
+    let container = mediaControl?.parentElement ?? null;
+    while (container && container !== dialog) {
+      const directInput = Array.from(container.children).find((child) =>
+        child instanceof HTMLInputElement && child.type === 'file'
+      );
+      if (directInput instanceof HTMLInputElement) return directInput;
+
+      const nestedInput = container.querySelector<HTMLInputElement>('input[type="file"]');
+      if (nestedInput) return nestedInput;
+      container = container.parentElement;
+    }
+    return null;
+  };
+
   const findDialogFileInput = () => {
+    const pairedEnglishInput = findEnglishComposerFileInput();
+    if (pairedEnglishInput) return pairedEnglishInput;
+    if (restrictToEnglishComposer) return null;
+
     const inputs = Array.from(dialog.querySelectorAll<HTMLInputElement>('input[type="file"]'));
     return inputs.find((candidate) => {
       const accept = (candidate.getAttribute('accept') ?? '').toLowerCase();
@@ -1920,7 +2496,10 @@ async function attachMediaToDialog(dialog: Element, mediaUrls: string[]) {
     if (mediaButton) {
       mediaButton.click();
       await sleep(POSTING_TIMING.mediaButtonDelayMs);
-      input = await waitForValue(() => findDialogFileInput() ?? findAnyFileInput(), POSTING_TIMING.mediaInputTimeoutMs);
+      input = await waitForValue(
+        () => findDialogFileInput() ?? (restrictToEnglishComposer ? null : findAnyFileInput()),
+        POSTING_TIMING.mediaInputTimeoutMs,
+      );
     }
   }
 
@@ -1947,10 +2526,21 @@ async function attachMediaToDialog(dialog: Element, mediaUrls: string[]) {
     const hasPreviewImage = images.some((image) => {
       const src = image.currentSrc || image.src || '';
       const alt = image.alt.toLowerCase();
+      if (restrictToEnglishComposer) {
+        return !initialImages.has(image) &&
+          (src.startsWith('blob:') || src.startsWith('data:')) &&
+          !image.closest('[aria-label="Photo/video"]');
+      }
       return src.startsWith('blob:') || src.startsWith('data:') || alt.includes('photo') || alt.includes('image');
     });
     const videos = Array.from(dialog.querySelectorAll<HTMLVideoElement>('video'));
-    const hasPreviewVideo = videos.some((video) => video.currentSrc || video.src);
+    const hasPreviewVideo = videos.some((video) =>
+      restrictToEnglishComposer
+        ? !initialVideos.has(video) &&
+          ((video.currentSrc || video.src).startsWith('blob:') || (video.currentSrc || video.src).startsWith('data:'))
+        : Boolean(video.currentSrc || video.src)
+    );
+    if (restrictToEnglishComposer) return hasPreviewImage || hasPreviewVideo;
     return hasPreviewImage || hasPreviewVideo ||
       text.includes('photos/videos') ||
       text.includes('photo/video') ||
@@ -2005,6 +2595,13 @@ function waitForCreatePostDialog(timeoutMs: number, isProfileTarget = false): Pr
     const isLikelyComposerEditor = (element: Element) => {
       if (!isVisible(element) || isInsideArticle(element)) return false;
       const node = element as HTMLElement;
+      if (isProfileTarget) {
+        return (
+          (node.getAttribute('data-lexical-editor') === 'true' ||
+            (node.getAttribute('contenteditable') === 'true' && node.getAttribute('role') === 'textbox')) &&
+          profileComposerTextMatches(node)
+        );
+      }
       const combined = [
         node.getAttribute('aria-label'),
         node.getAttribute('aria-placeholder'),
@@ -2048,8 +2645,15 @@ function waitForCreatePostDialog(timeoutMs: number, isProfileTarget = false): Pr
 
     const check = () => {
       // Prefer the modal, because its Post button and editor belong together.
-      const dialogs = Array.from(document.querySelectorAll<HTMLElement>('div[role="dialog"], [aria-modal="true"]'));
-      const dialog = dialogs.find(d => Array.from(d.querySelectorAll(editorSelector)).some(isLikelyComposerEditor));
+      const dialogs = Array.from(document.querySelectorAll<HTMLElement>('div[role="dialog"], [aria-modal="true"]'))
+        .filter((candidate) => isVisible(candidate));
+      const dialog = dialogs.find((candidate) =>
+        (!isProfileTarget || candidate.getAttribute('aria-modal') === 'true') &&
+        Array.from(candidate.querySelectorAll(editorSelector)).some(isLikelyComposerEditor) &&
+        (!isProfileTarget || Boolean(candidate.querySelector(
+          '[aria-label="Post"], [aria-label="\u0646\u0634\u0631"]',
+        )))
+      );
       if (dialog) return dialog;
 
       if (!isProfileTarget) {
@@ -2059,6 +2663,11 @@ function waitForCreatePostDialog(timeoutMs: number, isProfileTarget = false): Pr
         const inlineEditor = inline && Array.from(inline.querySelectorAll(editorSelector)).find(isLikelyComposerEditor);
         if (inlineEditor) return inline;
       }
+
+      // Profile publishing must remain inside the opened modal composer. A
+      // loose profile-page Lexical editor can be a comment box, while a broad
+      // ancestor can expose unrelated controls such as Add cover photo.
+      if (isProfileTarget) return null;
 
       // Facebook sometimes mounts the opened composer in a sibling pagelet
       // instead of a dialog or GroupInlineComposer, especially after several
