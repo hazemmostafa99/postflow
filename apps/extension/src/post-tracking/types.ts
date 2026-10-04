@@ -69,6 +69,7 @@ interface PendingFacebookPost {
   nextCheckAt?: string;
   syncAttempts?: number;
   lastSyncError?: string;
+  claimToken?: string;
   englishGroupVideo?: boolean;
   englishPendingApprovalLookup?: boolean;
 }
@@ -97,6 +98,7 @@ interface PublishedFacebookPost {
   targetType?: "GROUP" | "PROFILE_FEED";
   postUrl: string;
   lastEngagementSyncAt?: string;
+  claimToken?: string;
 }
 
 interface FacebookPostEngagement {

@@ -1,5 +1,5 @@
 import * as React from "react"
-import { Send, LayoutDashboard, FileText, Users, UserCog, Link2, Phone } from "lucide-react"
+import { Send, LayoutDashboard, FileText, Users, UserCog, Link2, Phone, BarChart3, UsersRound } from "lucide-react"
 
 import {
   Sidebar,
@@ -18,8 +18,10 @@ import Link from "next/link"
 const items = [
   { title: "Overview", url: "/", icon: LayoutDashboard },
   { title: "Posts", url: "/posts", icon: FileText },
+  { title: "Reports", url: "/reports", icon: BarChart3 },
   { title: "Leads", url: "/leads", icon: Phone },
   { title: "Connections", url: "/connections", icon: Link2 },
+  { title: "Groups", url: "/groups", icon: UsersRound },
   { title: "Users", url: "/users", icon: UserCog },
   { title: "Teams", url: "/teams", icon: Users },
 ]

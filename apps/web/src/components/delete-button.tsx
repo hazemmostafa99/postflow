@@ -8,9 +8,10 @@ interface DeleteButtonProps {
   label: string;
   buttonLabel?: string;
   onDeleted?: () => void;
+  compact?: boolean;
 }
 
-export function DeleteButton({ endpoint, label, buttonLabel = "Delete", onDeleted }: DeleteButtonProps) {
+export function DeleteButton({ endpoint, label, buttonLabel = "Delete", onDeleted, compact = false }: DeleteButtonProps) {
   const [isDeleting, setIsDeleting] = useState(false);
 
   async function handleDelete() {
@@ -33,10 +34,13 @@ export function DeleteButton({ endpoint, label, buttonLabel = "Delete", onDelete
       onClick={handleDelete}
       disabled={isDeleting}
       aria-label={`Delete ${label}`}
-      className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-red-500/20 bg-red-500/5 px-3 text-xs font-medium text-red-600 transition-colors hover:bg-red-500/10 disabled:opacity-50 dark:text-red-400"
+      title={compact ? `Delete ${label}` : undefined}
+      className={compact
+        ? "inline-flex h-8 w-8 items-center justify-center rounded-lg border border-red-500/20 bg-red-500/5 text-red-600 transition-colors hover:bg-red-500/10 disabled:opacity-50 dark:text-red-400"
+        : "inline-flex h-9 items-center gap-1.5 rounded-lg border border-red-500/20 bg-red-500/5 px-3 text-xs font-medium text-red-600 transition-colors hover:bg-red-500/10 disabled:opacity-50 dark:text-red-400"}
     >
       {isDeleting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
-      {buttonLabel}
+      {!compact && buttonLabel}
     </button>
   );
 }

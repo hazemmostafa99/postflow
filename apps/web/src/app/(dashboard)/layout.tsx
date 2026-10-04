@@ -44,7 +44,7 @@ export default async function DashboardLayout({
       <div className="flex min-h-screen w-full bg-background">
         <AppSidebar role={postflowUser.role} />
         <main className="flex-1 flex flex-col min-h-screen">
-          <header className="sticky top-0 z-30 flex min-h-16 items-center gap-4 border-b border-border/80 bg-background/85 px-5 py-3 backdrop-blur">
+          <header className="sticky top-0 z-30 flex min-h-16 items-start gap-3 border-b border-border/80 bg-background/85 px-4 py-3 backdrop-blur sm:px-5 xl:items-center">
             <SidebarTrigger />
             <DashboardTopbar role={postflowUser.role} />
           </header>

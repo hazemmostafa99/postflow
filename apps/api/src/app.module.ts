@@ -31,6 +31,7 @@ import {
   FacebookConnection,
   FacebookConnectionSchema,
 } from './schemas/facebook-connection.schema';
+import { ReportsModule } from './reports/reports.module';
 
 const envFilePath = [
   resolve(process.cwd(), '.env'),
@@ -69,6 +70,7 @@ const envFilePath = [
     TeamsModule,
     InvitationsModule,
     AnalyticsModule,
+    ReportsModule,
     PhoneContactsModule,
   ],
   controllers: [AppController],

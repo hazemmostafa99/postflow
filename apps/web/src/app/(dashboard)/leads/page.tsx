@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import Link from "next/link";
 import { ExternalLink, Phone, Search } from "lucide-react";
 import { AddLeadButton, LeadActions } from "@/components/lead-management-controls";
+import { TopbarPortal } from "@/components/topbar-portal";
 
 const API_BASE = process.env.API_URL || "http://localhost:8000";
 const LEADS_PER_PAGE = 20;
@@ -113,27 +114,22 @@ export default async function LeadsPage({
 
   return (
     <div className="page-shell">
-      <section className="page-header">
-        <div>
-          <p className="page-kicker">Audience</p>
-          <h1 className="page-title">Leads</h1>
-          <p className="page-subtitle">Phone numbers collected from your pages</p>
-        </div>
-        <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row">
-          <form action="/leads" method="get" role="search" className="flex min-w-0 flex-1 flex-wrap gap-2">
+      <TopbarPortal>
+        <div className="flex w-full flex-wrap gap-2 xl:w-auto xl:flex-nowrap">
+          <form action="/leads" method="get" role="search" className="grid min-w-0 flex-1 grid-cols-2 gap-2 sm:flex xl:flex-none">
             <input
               type="search"
               name="search"
               defaultValue={search}
               placeholder="Search numbers or categories"
               aria-label="Search phone numbers or categories"
-              className="h-10 min-w-0 flex-1 rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-56 sm:flex-none"
+              className="col-span-2 h-9 min-w-0 rounded-md border border-input bg-background px-3 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring sm:col-span-1 sm:w-56"
             />
             <select
               name="category"
               defaultValue={category}
               aria-label="Filter by category"
-              className="h-10 min-w-40 rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="h-9 min-w-0 rounded-md border border-input bg-background px-2 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-w-36"
             >
               <option value="">All categories</option>
               {categories.map((option) => (
@@ -142,7 +138,7 @@ export default async function LeadsPage({
             </select>
             <button
               type="submit"
-              className="inline-flex h-10 shrink-0 items-center justify-center gap-2 rounded-md border border-border bg-card px-3 text-sm font-medium transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="inline-flex h-9 shrink-0 items-center justify-center gap-2 rounded-md border border-border bg-card px-3 text-xs font-medium transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <Search className="h-4 w-4" />
               Filter
@@ -150,7 +146,7 @@ export default async function LeadsPage({
           </form>
           <AddLeadButton />
         </div>
-      </section>
+      </TopbarPortal>
 
       {unavailable && (
         <p role="alert" className="rounded-md border border-red-500/25 bg-red-500/5 px-4 py-3 text-sm text-red-700">

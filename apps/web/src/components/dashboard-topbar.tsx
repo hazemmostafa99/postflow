@@ -10,6 +10,10 @@ const PAGE_TITLES: Array<{ match: (path: string) => boolean; title: string }> = 
   { match: (path) => path === "/", title: "Overview" },
   { match: (path) => path === "/posts", title: "Posts" },
   { match: (path) => path.startsWith("/posts/"), title: "Post Details" },
+  { match: (path) => path === "/reports", title: "Reports" },
+  { match: (path) => path === "/connections", title: "Connections" },
+  { match: (path) => path === "/groups", title: "Groups" },
+  { match: (path) => path === "/leads", title: "Leads" },
   { match: (path) => path === "/users", title: "Users" },
   { match: (path) => path === "/teams", title: "Teams" },
 ];
@@ -25,9 +29,9 @@ export function DashboardTopbar({ role }: { role?: string }) {
   }
 
   return (
-    <div className="flex min-w-0 flex-1 flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-      <h1 className="truncate text-base font-semibold tracking-tight text-foreground sm:text-lg">{title}</h1>
-      <div className="flex flex-wrap items-center gap-2">
+    <div className="flex min-w-0 flex-1 flex-col gap-2 xl:flex-row xl:items-center xl:justify-between">
+      <h1 className="shrink-0 truncate text-base font-semibold tracking-tight text-foreground sm:text-lg">{title}</h1>
+      <div id="dashboard-topbar-actions" className="flex min-w-0 flex-1 flex-wrap items-center gap-2 xl:justify-end">
         {searchable && (
           <div className="relative w-full sm:w-64">
             <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
@@ -51,10 +55,12 @@ export function DashboardTopbar({ role }: { role?: string }) {
         )}
         {pathname === "/posts" && (
           <>
-            <DeleteButton endpoint="/api/groups" label="all synced groups" buttonLabel="Delete groups" />
             <DeleteButton endpoint="/api/posts" label="all posts" buttonLabel="Delete posts" />
             <NewPostDialog />
           </>
+        )}
+        {pathname === "/groups" && (
+          <DeleteButton endpoint="/api/groups" label="all synced groups" buttonLabel="Delete groups" />
         )}
       </div>
     </div>

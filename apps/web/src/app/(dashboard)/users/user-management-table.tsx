@@ -123,7 +123,7 @@ function UserRow({ user, teams }: { user: User; teams: Team[] }) {
   }
 
   async function deleteUser() {
-    if (!confirm(`Delete ${displayName || user.email || "this user"} from PostFlow?`)) return;
+    if (!confirm(`Delete ${displayName || user.email || "this user"} from PostFlow? This action cannot be undone.`)) return;
     setIsDeleting(true);
     setMessage("");
     try {

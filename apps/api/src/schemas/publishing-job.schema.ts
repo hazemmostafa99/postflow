@@ -31,6 +31,11 @@ export enum PublishingJobStatus {
   CANCEL_REQUESTED = 'CANCEL_REQUESTED',
 }
 
+export enum MaintenanceClaimType {
+  PENDING_APPROVAL = 'PENDING_APPROVAL',
+  ENGAGEMENT = 'ENGAGEMENT',
+}
+
 @Schema({ timestamps: true })
 export class PublishingJob {
   @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'Post', required: true })
@@ -126,6 +131,19 @@ export class PublishingJob {
   @Prop()
   lastEngagementSyncError?: string;
 
+  /** Short-lived lease used by pending/analytics maintenance workers. */
+  @Prop()
+  maintenanceClaimedByExtensionInstanceId?: string;
+
+  @Prop({ enum: MaintenanceClaimType })
+  maintenanceClaimType?: MaintenanceClaimType;
+
+  @Prop()
+  maintenanceClaimToken?: string;
+
+  @Prop()
+  maintenanceClaimExpiresAt?: Date;
+
   @Prop()
   scheduledFor?: Date;
 
@@ -137,6 +155,8 @@ export class PublishingJob {
 }
 
 export const PublishingJobSchema = SchemaFactory.createForClass(PublishingJob);
+
+PublishingJobSchema.index({ postId: 1 });
 
 PublishingJobSchema.pre('validate', function () {
   const validationError = validatePublishingTarget({
@@ -155,5 +175,25 @@ PublishingJobSchema.index({
   status: 1,
   scheduledFor: 1,
   flowOrder: 1,
+  createdAt: 1,
+});
+
+// Connection-scoped maintenance queues must be able to find due work without
+// scanning all jobs for a user or returning legacy jobs that have no owner.
+PublishingJobSchema.index({
+  facebookConnectionId: 1,
+  status: 1,
+  submissionStatus: 1,
+  nextCheckAt: 1,
+  submittedAt: 1,
+  createdAt: 1,
+});
+
+PublishingJobSchema.index({
+  facebookConnectionId: 1,
+  status: 1,
+  submissionStatus: 1,
+  nextEngagementSyncAt: 1,
+  publishedDetectedAt: 1,
   createdAt: 1,
 });

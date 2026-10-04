@@ -2212,7 +2212,10 @@ async function syncPendingPostsBatch(): Promise<Array<{ postId: string; result: 
 
 async function persistPendingSyncResult(post: PendingFacebookPost, result: PendingPostSyncResult): Promise<boolean> {
   if (result.status === 'CONTENT_MATCHED') return false;
-  const response = await apiFetch(`/api/jobs/${post.id}/pending-sync`, result);
+  const response = await apiFetch(`/api/jobs/${post.id}/pending-sync`, {
+    ...result,
+    ...(post.claimToken ? { claimToken: post.claimToken } : {}),
+  });
   return Boolean(response);
 }
 
@@ -2359,7 +2362,10 @@ async function syncPublishedEngagementBatch(postId?: string) {
     const results = [];
     for (const post of posts as PublishedFacebookPost[]) {
       const result = await checkSinglePostEngagement(post, true);
-      const updated = Boolean(await apiFetch(`/api/jobs/${post.id}/engagement`, result));
+      const updated = Boolean(await apiFetch(`/api/jobs/${post.id}/engagement`, {
+        ...result,
+        ...(post.claimToken ? { claimToken: post.claimToken } : {}),
+      }));
       results.push({ postId: post.id, result, updated });
       console.log('[PostAnalytics] Engagement sync completed', { postId: post.id, result, updated });
     }

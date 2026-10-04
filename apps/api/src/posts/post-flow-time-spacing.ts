@@ -1,11 +1,5 @@
-export const MIN_POST_SPACING_MINUTES = 1;
-
-/**
- * Keep custom spacing bounded so a malformed request cannot create schedules
- * that are accidentally days apart. Presets can still be added later without
- * changing the scheduling contract.
- */
-export const MAX_POST_SPACING_MINUTES = 24 * 60;
+export const MIN_RANDOM_POST_SPACING_SECONDS = 30;
+export const MAX_RANDOM_POST_SPACING_SECONDS = 120;
 
 export interface PostFlowScheduleItem<T> {
   post: T;
@@ -19,34 +13,38 @@ export interface ScheduledPostFlowItem<T> extends PostFlowScheduleItem<T> {
 export interface CalculatePostScheduleOptions<T> {
   startTime: Date;
   posts: PostFlowScheduleItem<T>[];
-  spacePostsApart: boolean;
-  spacingMinutes: number | null;
+  /** Injectable for deterministic tests. Must behave like Math.random. */
+  random?: () => number;
 }
 
 /**
  * Calculate immutable schedule values in Post Flow order.
  *
- * The returned array is sorted by `order`, which keeps the result deterministic
- * even if callers provide posts in a different order. The original Date and
- * post objects are never mutated.
+ * The first destination uses `startTime`. Every following destination is
+ * spaced from the previous one by a newly generated 30-120 second delay.
+ * Generated timestamps are persisted by callers, so polling never rerolls
+ * the schedule.
  */
 export function calculatePostSchedule<T>({
   startTime,
   posts,
-  spacePostsApart,
-  spacingMinutes,
+  random = Math.random,
 }: CalculatePostScheduleOptions<T>): ScheduledPostFlowItem<T>[] {
   validateStartTime(startTime);
-  const normalizedSpacing = validateSpacing(spacePostsApart, spacingMinutes);
 
+  let elapsedMilliseconds = 0;
   return [...posts]
     .sort((left, right) => left.order - right.order)
-    .map((item, index) => ({
-      ...item,
-      scheduledAt: new Date(
-        startTime.getTime() + index * normalizedSpacing * 60 * 1000,
-      ),
-    }));
+    .map((item, index) => {
+      if (index > 0) {
+        elapsedMilliseconds += randomSpacingSeconds(random) * 1000;
+      }
+
+      return {
+        ...item,
+        scheduledAt: new Date(startTime.getTime() + elapsedMilliseconds),
+      };
+    });
 }
 
 function validateStartTime(startTime: Date) {
@@ -55,27 +53,13 @@ function validateStartTime(startTime: Date) {
   }
 }
 
-function validateSpacing(
-  spacePostsApart: boolean,
-  spacingMinutes: number | null,
-): number {
-  if (!spacePostsApart) return 0;
-
-  if (
-    spacingMinutes === null ||
-    !Number.isInteger(spacingMinutes) ||
-    spacingMinutes < MIN_POST_SPACING_MINUTES
-  ) {
-    throw new Error(
-      `Spacing must be an integer of at least ${MIN_POST_SPACING_MINUTES} minute`,
-    );
+function randomSpacingSeconds(random: () => number): number {
+  const value = random();
+  if (!Number.isFinite(value) || value < 0 || value >= 1) {
+    throw new Error('Random source must return a number from 0 up to 1');
   }
 
-  if (spacingMinutes > MAX_POST_SPACING_MINUTES) {
-    throw new Error(
-      `Spacing cannot exceed ${MAX_POST_SPACING_MINUTES} minutes`,
-    );
-  }
-
-  return spacingMinutes;
+  const inclusiveRange =
+    MAX_RANDOM_POST_SPACING_SECONDS - MIN_RANDOM_POST_SPACING_SECONDS + 1;
+  return MIN_RANDOM_POST_SPACING_SECONDS + Math.floor(value * inclusiveRange);
 }

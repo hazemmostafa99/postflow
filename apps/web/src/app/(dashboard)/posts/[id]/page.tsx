@@ -64,8 +64,6 @@ interface Post {
     teamId?: string | null;
   };
   startTime?: string;
-  spacePostsApart?: boolean;
-  spacingMinutes?: number;
   jobs: Job[];
 }
 
@@ -546,8 +544,6 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
       <PostScheduleEditor
         postId={post._id}
         startTime={post.startTime}
-        spacePostsApart={post.spacePostsApart}
-        spacingMinutes={post.spacingMinutes}
         readOnly={post.jobs.length > 0 && !post.jobs.some((job) => job.status === "PENDING")}
         jobs={post.jobs
           .map((job) => ({

@@ -70,7 +70,7 @@ function LeadEditor({ mode, id, initialNumber = "", initialCategory = "" }: Lead
         type="button"
         onClick={open}
         className={isCreate
-          ? "inline-flex h-10 shrink-0 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+          ? "inline-flex h-9 shrink-0 items-center justify-center gap-2 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
           : "inline-flex h-8 w-8 items-center justify-center rounded-md border border-border text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"}
         aria-label={isCreate ? undefined : `Edit ${initialNumber}`}
       >

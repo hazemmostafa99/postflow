@@ -11,6 +11,7 @@ jest.mock('@nestjs/mongoose', () => ({
 }));
 
 import { BadRequestException } from '@nestjs/common';
+import { Types } from 'mongoose';
 import { PublishingTargetType } from '../schemas/publishing-target';
 import { UserRole } from '../schemas/user.schema';
 import { PostsService } from './posts.service';
@@ -94,6 +95,7 @@ describe('PostsService.createPost', () => {
       connections: [connection],
     });
 
+    const startedAt = Date.now();
     const result = await service.createPost(userId, {
       content: 'Hello',
       targets: [
@@ -103,6 +105,7 @@ describe('PostsService.createPost', () => {
         },
       ],
     });
+    const finishedAt = Date.now();
 
     expect(jobModel.insertMany).toHaveBeenCalledWith([
       expect.objectContaining({
@@ -113,15 +116,21 @@ describe('PostsService.createPost', () => {
     ]);
     const [insertedJob] = insertedJobs[0] ?? [];
     expect(insertedJob).not.toHaveProperty('groupId');
+    expect(insertedJob.scheduledFor).toBeInstanceOf(Date);
+    expect(insertedJob.scheduledFor!.getTime()).toBeGreaterThanOrEqual(
+      startedAt,
+    );
+    expect(insertedJob.scheduledFor!.getTime()).toBeLessThanOrEqual(finishedAt);
     expect(result.schedule).toEqual([
-      {
+      expect.objectContaining({
         targetType: PublishingTargetType.PROFILE_FEED,
         targetId: connectionId,
-      },
+      }),
     ]);
   });
 
-  it('preserves mixed target order and spacing', async () => {
+  it('preserves mixed target order and applies random spacing', async () => {
+    const random = jest.spyOn(Math, 'random').mockReturnValue(0);
     const { service, insertedJobs } = createHarness({
       groups: [group()],
       connections: [verifiedConnection()],
@@ -137,9 +146,8 @@ describe('PostsService.createPost', () => {
         { type: PublishingTargetType.GROUP, groupId },
       ],
       startTime: '2026-10-01T10:00:00.000Z',
-      spacePostsApart: true,
-      spacingMinutes: 3,
     });
+    random.mockRestore();
 
     const jobs = insertedJobs[0] ?? [];
     expect(jobs.map((job) => job.targetType)).toEqual([
@@ -148,7 +156,7 @@ describe('PostsService.createPost', () => {
     ]);
     expect(jobs.map((job) => job.scheduledFor?.toISOString())).toEqual([
       '2026-10-01T10:00:00.000Z',
-      '2026-10-01T10:03:00.000Z',
+      '2026-10-01T10:00:30.000Z',
     ]);
     expect(result.schedule.map((item) => item.targetId)).toEqual([
       connectionId,
@@ -172,11 +180,13 @@ describe('PostsService.createPost', () => {
         flowOrder: 0,
       }),
     ]);
-    expect(result.schedule[0]).toEqual({
-      targetType: PublishingTargetType.GROUP,
-      targetId: groupId,
-      groupId,
-    });
+    expect(result.schedule[0]).toEqual(
+      expect.objectContaining({
+        targetType: PublishingTargetType.GROUP,
+        targetId: groupId,
+        groupId,
+      }),
+    );
   });
 
   it('rejects a connection owned by another user before creating a post', async () => {
@@ -225,6 +235,69 @@ describe('PostsService.createPost', () => {
       ),
     );
     expect(postModel.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('PostsService.updatePostSchedule', () => {
+  it('rerolls only pending jobs with random 30-second minimum gaps', async () => {
+    const postId = '64b000000000000000000010';
+    const userId = 'clerk-user-1';
+    const post = {
+      _id: { toString: () => postId },
+      startTime: undefined as Date | undefined,
+      spacingMinSeconds: 0,
+      spacingMaxSeconds: 0,
+      save: jest.fn().mockResolvedValue(undefined),
+      toObject: () => ({ _id: postId }),
+    };
+    const pendingJobs = [0, 1].map((flowOrder) => ({
+      _id: { toString: () => `job-${flowOrder}` },
+      flowOrder,
+      scheduledFor: undefined as Date | undefined,
+      save: jest.fn().mockResolvedValue(undefined),
+    }));
+    const postQuery = {
+      exec: jest.fn().mockResolvedValue(post),
+    };
+    const jobQuery = {
+      where: jest.fn().mockReturnThis(),
+      equals: jest.fn().mockReturnThis(),
+      sort: jest.fn().mockReturnThis(),
+      exec: jest.fn().mockResolvedValue(pendingJobs),
+    };
+    const jobModel = {
+      find: jest.fn().mockReturnValue(jobQuery),
+    };
+    const service = new PostsService(
+      { findOne: jest.fn().mockReturnValue(postQuery) } as never,
+      jobModel as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {
+        requireActiveUser: jest
+          .fn()
+          .mockResolvedValue({ role: UserRole.ADMIN }),
+      } as never,
+    );
+    const random = jest.spyOn(Math, 'random').mockReturnValue(0);
+
+    const result = await service.updatePostSchedule(userId, postId, {
+      startTime: '2026-10-01T10:00:00.000Z',
+    });
+    random.mockRestore();
+
+    expect(jobModel.find).toHaveBeenCalledWith({ status: 'PENDING' });
+    expect(pendingJobs.map((job) => job.scheduledFor?.toISOString())).toEqual([
+      '2026-10-01T10:00:00.000Z',
+      '2026-10-01T10:00:30.000Z',
+    ]);
+    expect(pendingJobs.every((job) => job.save.mock.calls.length === 1)).toBe(
+      true,
+    );
+    expect(post.spacingMinSeconds).toBe(30);
+    expect(post.spacingMaxSeconds).toBe(120);
+    expect(result.updatedJobs).toBe(2);
   });
 });
 
@@ -296,5 +369,38 @@ describe('PostsService.getPost', () => {
     expect(result.jobs[0]).toEqual(profileJob);
     expect(result.jobs[0].groupId).toBeUndefined();
     expect(result.jobs[0].facebookConnectionId.displayName).toBe('Hazem Profile');
+  });
+});
+
+describe('PostsService.deletePost', () => {
+  it('applies post visibility and deletes the selected post jobs', async () => {
+    const clerkUserId = 'clerk-user-1';
+    const postId = new Types.ObjectId('64b000000000000000000010');
+    const findOneAndDelete = jest.fn().mockReturnValue({
+      exec: jest.fn().mockResolvedValue({ _id: postId }),
+    });
+    const jobIn = jest.fn().mockReturnValue({
+      exec: jest.fn().mockResolvedValue({ deletedCount: 2 }),
+    });
+    const jobWhere = jest.fn().mockReturnValue({ in: jobIn });
+    const service = new PostsService(
+      { findOneAndDelete } as never,
+      { deleteMany: jest.fn().mockReturnValue({ where: jobWhere }) } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {
+        requireActiveUser: jest.fn().mockResolvedValue({ role: UserRole.SALES }),
+      } as never,
+    );
+
+    await service.deletePost(clerkUserId, postId.toString());
+
+    expect(findOneAndDelete).toHaveBeenCalledWith({
+      _id: postId.toString(),
+      clerkUserId,
+    });
+    expect(jobWhere).toHaveBeenCalledWith('postId');
+    expect(jobIn).toHaveBeenCalledWith([postId]);
   });
 });
