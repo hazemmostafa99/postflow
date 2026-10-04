@@ -291,7 +291,11 @@ describe('JobsController target-specific sync guards', () => {
   const extensionInstanceId = 'extension-1';
   const connectionObjectId = { toString: () => 'connection-1' };
 
-  function createProfileController(options?: { claimed?: boolean }) {
+  function createProfileController(options?: {
+    claimed?: boolean;
+    engagement?: { reactionCount?: number; commentCount?: number };
+    claimExpiresAt?: Date;
+  }) {
     const profileJob = {
       targetType: PublishingTargetType.PROFILE_FEED,
       facebookConnectionId: connectionObjectId,
@@ -299,12 +303,14 @@ describe('JobsController target-specific sync guards', () => {
       submissionStatus: 'PUBLISHED',
       postUrl: 'https://www.facebook.com/reel/1490054189671164/',
       engagementSyncAttempts: 0,
+      ...(options?.engagement ? { engagement: options.engagement } : {}),
       ...(options?.claimed
         ? {
             maintenanceClaimedByExtensionInstanceId: extensionInstanceId,
             maintenanceClaimType: MaintenanceClaimType.ENGAGEMENT,
             maintenanceClaimToken: 'claim-token',
-            maintenanceClaimExpiresAt: new Date(Date.now() + 60_000),
+            maintenanceClaimExpiresAt:
+              options.claimExpiresAt ?? new Date(Date.now() + 60_000),
           }
         : {}),
       save: jest.fn().mockResolvedValue(undefined),
@@ -357,6 +363,57 @@ describe('JobsController target-specific sync guards', () => {
     expect(profileJob.save).toHaveBeenCalled();
   });
 
+  it('preserves the previous known counter when an analytics result is partial', async () => {
+    const { controller, profileJob } = createProfileController({
+      claimed: true,
+      engagement: { reactionCount: 5, commentCount: 7 },
+    });
+
+    await controller.updateEngagement(
+      'clerk-user-1',
+      extensionInstanceId,
+      'job-1',
+      {
+        status: 'PARTIAL',
+        reactionCount: 9,
+        reason: 'Comment count was not detected',
+        claimToken: 'claim-token',
+      },
+    );
+
+    expect((profileJob as { engagement?: unknown }).engagement).toMatchObject({
+      reactionCount: 9,
+      commentCount: 7,
+    });
+  });
+
+  it('preserves all previous counters when an analytics check fails', async () => {
+    const engagement = { reactionCount: 5, commentCount: 7 };
+    const { controller, profileJob } = createProfileController({
+      claimed: true,
+      engagement,
+    });
+
+    await controller.updateEngagement(
+      'clerk-user-1',
+      extensionInstanceId,
+      'job-1',
+      {
+        status: 'CHECK_FAILED',
+        reason: 'Background surface was empty',
+        claimToken: 'claim-token',
+      },
+    );
+
+    expect((profileJob as { engagement?: unknown }).engagement).toBe(
+      engagement,
+    );
+    expect(
+      (profileJob as { lastEngagementSyncError?: string })
+        .lastEngagementSyncError,
+    ).toBe('Background surface was empty');
+  });
+
   it('rejects pending-approval sync for profile jobs', async () => {
     const { controller } = createProfileController();
 
@@ -386,6 +443,20 @@ describe('JobsController target-specific sync guards', () => {
       controller.updateEngagement('clerk-user-1', extensionInstanceId, 'job-1', {
         status: 'SUCCESS',
         claimToken: 'wrong-token',
+      }),
+    ).rejects.toThrow('Invalid or expired maintenance claim');
+  });
+
+  it('rejects and records an expired maintenance claim', async () => {
+    const { controller } = createProfileController({
+      claimed: true,
+      claimExpiresAt: new Date(Date.now() - 1_000),
+    });
+
+    await expect(
+      controller.updateEngagement('clerk-user-1', extensionInstanceId, 'job-1', {
+        status: 'SUCCESS',
+        claimToken: 'claim-token',
       }),
     ).rejects.toThrow('Invalid or expired maintenance claim');
   });
@@ -498,6 +569,104 @@ describe('JobsController maintenance claims', () => {
       maintenanceClaimedByExtensionInstanceId: extensionInstanceId,
       maintenanceClaimType: MaintenanceClaimType.ENGAGEMENT,
     });
+  });
+});
+
+describe('JobsController concurrent maintenance lease recovery', () => {
+  const clerkUserId = 'clerk-user-1';
+  const extensionInstanceId = 'extension-1';
+  const connectionObjectId = { toString: () => 'connection-1' };
+  const postObjectId = { toString: () => 'post-1' };
+
+  function createAtomicController(initialLeaseExpiresAt?: Date) {
+    let leaseExpiresAt = initialLeaseExpiresAt;
+    let activeClaimToken = initialLeaseExpiresAt ? 'old-claim-token' : undefined;
+    const claimedJob = {
+      _id: { toString: () => 'job-1' },
+      postId: { content: 'Pending content', mediaUrls: [] },
+      groupId: {
+        _id: { toString: () => 'group-1' },
+        externalId: 'group-1',
+        url: 'https://www.facebook.com/groups/group-1/',
+      },
+      submittedAt: new Date('2026-01-01T00:00:00.000Z'),
+    };
+    const findOneAndUpdate = jest.fn(
+      (_query: unknown, update: { $set: Record<string, unknown> }) => ({
+        populate: jest.fn().mockReturnThis(),
+        lean: jest.fn().mockReturnThis(),
+        exec: jest.fn(async () => {
+          await Promise.resolve();
+          if (leaseExpiresAt && leaseExpiresAt.getTime() > Date.now()) {
+            return null;
+          }
+          leaseExpiresAt = update.$set.maintenanceClaimExpiresAt as Date;
+          activeClaimToken = update.$set.maintenanceClaimToken as string;
+          return {
+            ...claimedJob,
+            maintenanceClaimToken: activeClaimToken,
+          };
+        }),
+      }),
+    );
+    const connection = {
+      _id: connectionObjectId,
+      extensionInstanceId,
+      status: 'CONNECTED',
+      facebookSessionDetected: true,
+      facebookUserId: 'facebook-user-1',
+      detectedFacebookUserId: 'facebook-user-1',
+    };
+    const connectionModel = {
+      findOne: jest.fn().mockReturnValue({
+        lean: jest.fn().mockReturnThis(),
+        exec: jest.fn().mockResolvedValue(connection),
+      }),
+    };
+    const postModel = {
+      find: jest.fn().mockReturnValue({
+        select: jest.fn().mockReturnThis(),
+        lean: jest.fn().mockReturnThis(),
+        exec: jest.fn().mockResolvedValue([{ _id: postObjectId }]),
+      }),
+    };
+    const controller = new JobsController(
+      { findOneAndUpdate } as never,
+      postModel as never,
+      connectionModel as never,
+    );
+    return {
+      controller,
+      getActiveClaimToken: () => activeClaimToken,
+    };
+  }
+
+  it('allows only one of two simultaneous requests to claim the same job', async () => {
+    const { controller } = createAtomicController();
+
+    const [first, second] = await Promise.all([
+      controller.getPendingPosts(clerkUserId, extensionInstanceId, '1'),
+      controller.getPendingPosts(clerkUserId, extensionInstanceId, '1'),
+    ]);
+
+    expect([...first, ...second]).toHaveLength(1);
+    expect([...first, ...second][0]).toMatchObject({ id: 'job-1' });
+  });
+
+  it('reclaims a job after its previous maintenance lease expires', async () => {
+    const { controller, getActiveClaimToken } = createAtomicController(
+      new Date(Date.now() - 1_000),
+    );
+
+    const result = await controller.getPendingPosts(
+      clerkUserId,
+      extensionInstanceId,
+      '1',
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0].claimToken).toEqual(expect.any(String));
+    expect(getActiveClaimToken()).not.toBe('old-claim-token');
   });
 });
 

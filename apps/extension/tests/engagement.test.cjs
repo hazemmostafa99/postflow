@@ -39,7 +39,7 @@ test('background controls cannot satisfy readiness for a loading target dialog',
   const app = setup(`<div role="article">${actions('9', '8')}</div>${modal('')}`);
   const result = await app.run();
   assert.equal(result.status, 'CHECK_FAILED');
-  assert.match(result.reason, /did not finish rendering.*v10/);
+  assert.match(result.reason, /did not finish rendering.*v12/);
 });
 
 test('waits for the target modal to be replaced and hydrated', async () => {
@@ -166,7 +166,7 @@ test('does not guess between multiple direct reel engagement control pairs', asy
 
   const result = await app.run();
   assert.equal(result.status, 'CHECK_FAILED');
-  assert.match(result.reason, /extractor=v10, targetFound=false/);
+  assert.match(result.reason, /extractor=v12, targetFound=false/);
 });
 
 test('recognizes active Arabic reel reaction and comment controls', async () => {
@@ -190,5 +190,5 @@ test('classifies an empty target page for a foreground rendering retry', async (
 
   assert.equal(result.status, 'CHECK_FAILED');
   assert.equal(result.emptySurface, true);
-  assert.match(result.reason, /extractor=v10.*articles=0.*likes=0.*comments=0/);
+  assert.match(result.reason, /extractor=v12.*articles=0.*likes=0.*comments=0/);
 });

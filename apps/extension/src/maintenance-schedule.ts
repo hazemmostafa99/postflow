@@ -1,6 +1,8 @@
 /** The scheduler's initial spread is intentionally small so a newly started
  * extension does not make every installation wake the API at the same time. */
 export const MAINTENANCE_STARTUP_JITTER_MAX_MS = 2 * 60 * 1000;
+export const PENDING_MAINTENANCE_WAKE_INTERVAL_MINUTES = 10;
+export const ENGAGEMENT_MAINTENANCE_WAKE_INTERVAL_MINUTES = 15;
 
 /**
  * Return a stable 0..2 minute offset for one extension instance.

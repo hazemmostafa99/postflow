@@ -385,6 +385,25 @@ Useful operational counters include:
 - Failed refreshes by reason.
 - Jobs rejected because of ownership mismatch.
 
+The extension persists these counters per Chrome profile in
+`chrome.storage.local` under `maintenanceDiagnosticsV1`. Structured events use
+masked instance identifiers and must never include claim tokens, cookies,
+Facebook DOM, or post content.
+
+---
+
+## Automatic Analytics Rollback
+
+Automatic analytics is controlled by the public build-time boolean
+`AUTOMATIC_ANALYTICS_ENABLED`. Development may enable it for validation;
+production defaults to disabled until rollout is approved.
+
+Turning the flag off and rebuilding must clear the analytics alarm while
+leaving publishing, pending-approval checks, and explicit manual analytics
+available. Existing counters, metrics, and next-sync timestamps are retained.
+No database rollback is required, and abandoned maintenance claims recover
+through their five-minute lease expiry.
+
 ---
 
 ## Migration
@@ -465,6 +484,11 @@ The migration must be safe to rerun.
 
 Use a feature flag for automatic analytics during initial rollout.
 
+The concrete deployment order, monitoring signals, halt conditions, and
+rollback steps are maintained in `rollout.md`. A repository-ready build is not
+the same as a production deployment: production activation and monitoring must
+be recorded separately in `progress.md`.
+
 ---
 
 ## Definition of Done
@@ -483,4 +507,3 @@ The feature is complete when:
 - Scheduled analytics never steals foreground focus.
 - Required automated tests pass.
 - Two-profile live validation confirms complete fault and ownership isolation.
-

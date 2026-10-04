@@ -19,10 +19,14 @@ function loadScheduleHelpers() {
 
 test('startup jitter is deterministic per extension instance', () => {
   const {
+    ENGAGEMENT_MAINTENANCE_WAKE_INTERVAL_MINUTES,
     MAINTENANCE_STARTUP_JITTER_MAX_MS,
+    PENDING_MAINTENANCE_WAKE_INTERVAL_MINUTES,
     getMaintenanceAlarmFirstRunAt,
     getMaintenanceStartupJitterMs,
   } = loadScheduleHelpers();
+  assert.equal(PENDING_MAINTENANCE_WAKE_INTERVAL_MINUTES, 10);
+  assert.equal(ENGAGEMENT_MAINTENANCE_WAKE_INTERVAL_MINUTES, 15);
   const first = getMaintenanceStartupJitterMs('pfi-profile-a');
   assert.equal(first, getMaintenanceStartupJitterMs('pfi-profile-a'));
   assert.ok(first >= 0 && first <= MAINTENANCE_STARTUP_JITTER_MAX_MS);

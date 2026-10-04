@@ -616,11 +616,24 @@ Scheduler:
 
 Frequency:
 
-- Every 30 minutes, with API-controlled next eligibility based on post age.
+- Every 15 minutes, with a deterministic 0–2 minute per-instance startup
+  offset and API-controlled next eligibility based on post age.
 
 Coordination with pending sync:
 
-- Both use the shared extension Facebook-sync lock.
+- Both use the shared extension maintenance coordinator and Facebook-sync
+  lock. Publishing work has priority between maintenance items.
+
+Automatic tab behavior:
+
+- Scheduled analytics opens an inactive tab and never retries in the
+  foreground. Explicit manual requests may still use the foreground retry.
+
+Rollout flag:
+
+- `AUTOMATIC_ANALYTICS_ENABLED` is enabled for development validation and
+  defaults to disabled in production. Disabling it clears only the analytics
+  alarm; manual refresh and other extension work remain available.
 
 Files changed:
 

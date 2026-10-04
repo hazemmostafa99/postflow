@@ -2,7 +2,11 @@
 
 import './posting-config.js';
 
-import { API_BASE_URL, BUILD_ENV } from './env.js';
+import {
+  API_BASE_URL,
+  AUTOMATIC_ANALYTICS_ENABLED,
+  BUILD_ENV,
+} from './env.js';
 import {
   getSafeFacebookProfileUrl,
   normalizePublishJob,
@@ -10,25 +14,47 @@ import {
   type PublishJob,
 } from './publishing-target.js';
 import {
+  ENGAGEMENT_MAINTENANCE_WAKE_INTERVAL_MINUTES,
+  PENDING_MAINTENANCE_WAKE_INTERVAL_MINUTES,
   getMaintenanceAlarmFirstRunAt,
   getMaintenanceStartupJitterMs,
 } from './maintenance-schedule.js';
+import {
+  getEngagementTabBehavior,
+  normalizeFacebookEngagementPermalink,
+  type EngagementSyncMode,
+} from './engagement-sync-policy.js';
+import {
+  createMaintenanceDiagnosticsSnapshot,
+  incrementMaintenanceMetric,
+  isMaintenanceDiagnosticsSnapshot,
+  maskExtensionInstanceId,
+  type MaintenanceDiagnosticsSnapshot,
+  type MaintenanceMetricName,
+  type MaintenanceWorkType,
+} from './maintenance-diagnostics.js';
 
-console.info(`[PostFlow] ${BUILD_ENV === 'production' ? 'PROD' : 'DEV'} environment | API: ${API_BASE_URL}`);
+console.info(
+  `[PostFlow] ${BUILD_ENV === 'production' ? 'PROD' : 'DEV'} environment | API: ${API_BASE_URL} | Automatic analytics: ${AUTOMATIC_ANALYTICS_ENABLED ? 'ON' : 'OFF'}`,
+);
 
 const HEARTBEAT_ALARM = 'postflow-heartbeat';
 const HEARTBEAT_INTERVAL_MINUTES = 1;
 const REGISTER_RETRY_ALARM = 'postflow-register-retry';
 const REGISTER_RETRY_DELAY_MINUTES = 1;
 const PENDING_POST_SYNC_ALARM = 'postflow-pending-post-sync';
-const PENDING_POST_SYNC_INTERVAL_MINUTES = 10;
+const PENDING_POST_SYNC_INTERVAL_MINUTES =
+  PENDING_MAINTENANCE_WAKE_INTERVAL_MINUTES;
 const MANUAL_MAINTENANCE_ALARM = 'postflow-manual-maintenance';
 const MANUAL_MAINTENANCE_INTERVAL_MINUTES = 1;
 const ENGAGEMENT_SYNC_ALARM = 'postflow-engagement-sync';
-const ENGAGEMENT_SYNC_INTERVAL_MINUTES = 30;
+const ENGAGEMENT_SYNC_INTERVAL_MINUTES =
+  ENGAGEMENT_MAINTENANCE_WAKE_INTERVAL_MINUTES;
 const MAINTENANCE_BATCH_LIMIT = 3;
 const MAINTENANCE_EXECUTION_BUDGET_MS = 45_000;
 const PENDING_POST_SYNC_ALARM_INITIALIZED_KEY = 'pendingPostSyncAlarmInitialized';
+const ENGAGEMENT_SYNC_ALARM_INITIALIZED_KEY = 'engagementSyncAlarmInitialized';
+const MAINTENANCE_DIAGNOSTICS_KEY = 'maintenanceDiagnosticsV1';
 const EXTENSION_INSTANCE_ID_KEY = 'extensionInstanceId';
 const EXTENSION_NAME_KEY = 'extensionName';
 const TAB_ACTION_RETRY_COUNT = 6;
@@ -104,12 +130,101 @@ async function getExtensionInstanceId(): Promise<string> {
 
       const extensionInstanceId = createExtensionInstanceId();
       await chrome.storage.local.set({ [EXTENSION_INSTANCE_ID_KEY]: extensionInstanceId });
-      console.log('[PostFlow] Created extension instance ID:', extensionInstanceId);
+      console.log(
+        '[PostFlow] Created extension instance ID:',
+        maskExtensionInstanceId(extensionInstanceId),
+      );
       return extensionInstanceId;
     })();
   }
 
   return extensionInstanceIdPromise;
+}
+
+type MaintenanceDiagnosticDetails = {
+  jobId?: string;
+  status?: string;
+  outcome?: string;
+  reasonCode?: string;
+  retryAt?: string;
+  manualOnly?: boolean;
+  itemCount?: number;
+};
+
+let maintenanceDiagnosticsSnapshotPromise:
+  | Promise<MaintenanceDiagnosticsSnapshot>
+  | null = null;
+let maintenanceDiagnosticsWriteQueue: Promise<void> = Promise.resolve();
+
+async function getMaintenanceDiagnosticsSnapshot(): Promise<MaintenanceDiagnosticsSnapshot> {
+  if (!maintenanceDiagnosticsSnapshotPromise) {
+    maintenanceDiagnosticsSnapshotPromise = (async () => {
+      const stored = await chrome.storage.local.get(MAINTENANCE_DIAGNOSTICS_KEY);
+      const snapshot = stored[MAINTENANCE_DIAGNOSTICS_KEY];
+      return isMaintenanceDiagnosticsSnapshot(snapshot)
+        ? snapshot
+        : createMaintenanceDiagnosticsSnapshot();
+    })();
+  }
+  return maintenanceDiagnosticsSnapshotPromise;
+}
+
+/** Persist small operational counters and emit a sanitized structured event. */
+function recordMaintenanceDiagnostic(
+  event: string,
+  workType: MaintenanceWorkType,
+  metric?: MaintenanceMetricName,
+  details: MaintenanceDiagnosticDetails = {},
+): Promise<void> {
+  const operation = maintenanceDiagnosticsWriteQueue.then(async () => {
+    const [snapshot, extensionInstanceId] = await Promise.all([
+      getMaintenanceDiagnosticsSnapshot(),
+      getExtensionInstanceId(),
+    ]);
+    const metricValue = metric
+      ? incrementMaintenanceMetric(snapshot, workType, metric)
+      : undefined;
+    if (metric) {
+      await chrome.storage.local.set({
+        [MAINTENANCE_DIAGNOSTICS_KEY]: snapshot,
+      });
+    }
+    console.info('[MaintenanceDiagnostic]', {
+      event,
+      workType,
+      extensionInstanceId: maskExtensionInstanceId(extensionInstanceId),
+      ...(metric ? { metric, metricValue } : {}),
+      ...details,
+    });
+  });
+  maintenanceDiagnosticsWriteQueue = operation.catch((error) => {
+    console.warn('[MaintenanceDiagnostic] Could not persist diagnostic event', {
+      event,
+      workType,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });
+  return operation;
+}
+
+function getMaintenanceWorkTypeForRequest(
+  path: string,
+  body?: Record<string, unknown>,
+): MaintenanceWorkType | null {
+  if (
+    path.includes('/pending-sync') ||
+    path.startsWith('/api/jobs/pending') ||
+    body?.type === 'PENDING_APPROVAL'
+  ) {
+    return 'PENDING_APPROVAL';
+  }
+  if (
+    path.includes('/engagement') ||
+    body?.type === 'ENGAGEMENT'
+  ) {
+    return 'ENGAGEMENT';
+  }
+  return null;
 }
 
 async function getClerkUserId(): Promise<string | null> {
@@ -187,6 +302,41 @@ async function apiFetch(
           message = typeof parsed.message === 'string' ? parsed.message : undefined;
         } catch {
           // Keep the compact status-only error for non-JSON responses.
+        }
+        const maintenanceWorkType = getMaintenanceWorkTypeForRequest(
+          path,
+          body,
+        );
+        if (response.status === 401 && maintenanceWorkType && message) {
+          if (
+            message.includes('another Facebook connection') ||
+            message.includes('not linked to a verified Facebook connection')
+          ) {
+            void recordMaintenanceDiagnostic(
+              'ownership.rejected',
+              maintenanceWorkType,
+              'ownershipRejections',
+              { reasonCode: 'OWNERSHIP_REJECTED' },
+            );
+          } else if (message.toLowerCase().includes('expired')) {
+            void recordMaintenanceDiagnostic(
+              'lease.expired',
+              maintenanceWorkType,
+              'leaseExpirations',
+              { reasonCode: 'CLAIM_EXPIRED' },
+            );
+          } else if (
+            message.includes('already claimed') ||
+            message.includes('Maintenance claim required') ||
+            message.includes('Invalid')
+          ) {
+            void recordMaintenanceDiagnostic(
+              'lease.conflict',
+              maintenanceWorkType,
+              'leaseConflicts',
+              { reasonCode: 'CLAIM_CONFLICT' },
+            );
+          }
         }
         return includeFailureDetails
           ? { apiFetchError: true, status: response.status, message }
@@ -2172,42 +2322,6 @@ async function waitForFacebookTabAfterNavigation(tabId: number, targetUrl: strin
   return false;
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.type !== 'TRIGGER_SINGLE_PENDING_SYNC' || typeof message.postId !== 'string') return;
-  void (async () => {
-    const claimedPost = await apiFetch(
-      `/api/jobs/${encodeURIComponent(message.postId)}/maintenance-claim`,
-      { type: 'PENDING_APPROVAL' },
-      'POST',
-      true,
-    );
-    if (!claimedPost || claimedPost.apiFetchError) {
-      const status = claimedPost?.status;
-      throw new Error(
-        typeof claimedPost?.message === 'string'
-          ? claimedPost.message
-          : status === 401
-            ? 'This post belongs to another Facebook connection.'
-            : 'Could not claim this pending post for the current extension.',
-      );
-    }
-    const post = claimedPost as PendingFacebookPost;
-    const result = await checkSinglePendingPost(post);
-    const updated = await persistPendingSyncResult(post, result);
-    return { post, result, updated };
-  })()
-    .then(async (result) => {
-      console.log('[PendingPostSync] Single check persisted', {
-        postId: result.post.id,
-        status: result.result.status,
-        updated: result.updated,
-      });
-      sendResponse({ ok: true, result: result.result, updated: result.updated, postId: result.post.id });
-    })
-    .catch((err) => sendResponse({ ok: false, error: err?.message ?? 'Pending post sync failed' }));
-  return true;
-});
-
 let isPendingBatchRunning = false;
 
 /** Fetch and process a small pending-post batch without opening concurrent tabs. */
@@ -2220,6 +2334,12 @@ async function syncPendingPostsBatch(
   isFacebookSyncBusy = true;
 
   try {
+    await recordMaintenanceDiagnostic(
+      'claim.requested',
+      'PENDING_APPROVAL',
+      'claimRequests',
+      { manualOnly },
+    );
     const pendingPosts = await apiFetch(
       `/api/jobs/pending?limit=${Math.min(MAINTENANCE_BATCH_LIMIT, Math.max(1, maxItems))}${manualOnly ? '&manualOnly=true' : ''}`,
     );
@@ -2227,9 +2347,23 @@ async function syncPendingPostsBatch(
       console.warn('[PendingPostSync] Could not fetch pending posts');
       return [];
     }
+    if (pendingPosts.length === 0) {
+      await recordMaintenanceDiagnostic(
+        'claim.empty',
+        'PENDING_APPROVAL',
+        'emptyClaims',
+        { manualOnly },
+      );
+    }
 
     const results: Array<{ postId: string; result: PendingPostSyncResult; updated: boolean }> = [];
     for (const post of pendingPosts as PendingFacebookPost[]) {
+      await recordMaintenanceDiagnostic(
+        'claim.created',
+        'PENDING_APPROVAL',
+        'claimsCreated',
+        { jobId: post.id, manualOnly },
+      );
       let result: PendingPostSyncResult;
       try {
         result = await checkSinglePendingPost(post, true);
@@ -2238,6 +2372,18 @@ async function syncPendingPostsBatch(
       }
 
       const updated = await persistPendingSyncResult(post, result);
+      await recordMaintenanceDiagnostic(
+        'result.completed',
+        'PENDING_APPROVAL',
+        updated && result.status !== 'CHECK_FAILED'
+          ? 'resultSuccesses'
+          : 'resultFailures',
+        {
+          jobId: post.id,
+          status: result.status,
+          outcome: updated ? 'UPDATED' : 'NOT_UPDATED',
+        },
+      );
       results.push({ postId: post.id, result, updated });
       console.log('[PendingPostSync] Completed pending post check', {
         postId: post.id,
@@ -2264,19 +2410,11 @@ let isEngagementBatchRunning = false;
 let engagementCheckSequence = 0;
 let isCheckingEngagement = false;
 
-function normalizeStoredFacebookPostUrl(value: string): string | null {
-  const markdownMatch = value.trim().match(/^\[[^\]]+\]\((https?:\/\/[^)]+)\)$/i);
-  const candidate = markdownMatch?.[1] ?? value.trim();
-  try {
-    const url = new URL(candidate);
-    if (!/facebook\.com$/i.test(url.hostname) && !/\.facebook\.com$/i.test(url.hostname)) return null;
-    return url.href;
-  } catch {
-    return null;
-  }
-}
-
-async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlreadyHeld = false): Promise<PostEngagementSyncResult> {
+async function checkSinglePostEngagement(
+  post: PublishedFacebookPost,
+  lockAlreadyHeld = false,
+  mode: EngagementSyncMode = 'MANUAL',
+): Promise<PostEngagementSyncResult> {
   if (isProcessingJob) {
     return { status: 'CHECK_FAILED', reason: 'A new Facebook post is currently being published' };
   }
@@ -2289,7 +2427,8 @@ async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlread
   let syncTabId: number | undefined;
   let previousActiveTabId: number | undefined;
   let foregroundRetryUsed = false;
-  const postUrl = normalizeStoredFacebookPostUrl(post.postUrl);
+  const tabBehavior = getEngagementTabBehavior(mode);
+  const postUrl = normalizeFacebookEngagementPermalink(post.postUrl);
   if (!postUrl) {
     console.error('[PostAnalytics] Invalid stored Facebook post URL', { postId: post.id, postUrl: post.postUrl });
     isCheckingEngagement = false;
@@ -2303,10 +2442,14 @@ async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlread
       postId: post.id,
       postUrl,
       requestId,
+      mode,
     });
     // Analytics runs in an isolated background tab. It must not navigate the
     // active publishing tab to a previously stored post URL.
-    const fbTab = await chrome.tabs.create({ url: postUrl, active: false });
+    const fbTab = await chrome.tabs.create({
+      url: postUrl,
+      active: tabBehavior.initiallyActive,
+    });
     syncTabId = fbTab.id;
     console.log('[PostAnalytics] Facebook tab opened', { tabId: fbTab.id, postId: post.id });
     const ready = Boolean(fbTab.id && await waitForFacebookTabAfterNavigation(fbTab.id, postUrl, POSTING_TIMING.facebookTabReadyTimeoutMs));
@@ -2316,7 +2459,8 @@ async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlread
       return { status: 'CHECK_FAILED', reason: 'Target Facebook post did not finish loading' };
     }
 
-    for (let renderAttempt = 0; renderAttempt < 2; renderAttempt += 1) {
+    const renderAttemptLimit = tabBehavior.allowForegroundRetry ? 2 : 1;
+    for (let renderAttempt = 0; renderAttempt < renderAttemptLimit; renderAttempt += 1) {
       if (renderAttempt === 1) {
         foregroundRetryUsed = true;
         console.warn('[PostAnalytics] Empty background Facebook surface; retrying in foreground', {
@@ -2352,6 +2496,17 @@ async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlread
           console.log('[PostAnalytics] Facebook tab response received', { postId: post.id, tabId: fbTab.id, response });
           if (response?.ok && response.result) {
             if (renderAttempt === 0 && response.emptySurface === true) {
+              if (!tabBehavior.allowForegroundRetry) {
+                console.warn('[PostAnalytics] Empty background Facebook surface; automatic foreground retry disabled', {
+                  postId: post.id,
+                  targetType: post.targetType ?? 'GROUP',
+                  tabId: fbTab.id,
+                });
+                return {
+                  status: 'CHECK_FAILED',
+                  reason: 'Facebook engagement did not render in the background tab',
+                };
+              }
               retryInForeground = true;
               break;
             }
@@ -2391,29 +2546,60 @@ async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlread
 }
 
 async function syncPublishedEngagementBatch(
-  postId?: string,
   manualOnly = false,
   maxItems = MAINTENANCE_BATCH_LIMIT,
+  mode: EngagementSyncMode = 'AUTOMATIC',
 ) {
   if (isEngagementBatchRunning || isFacebookSyncBusy || isProcessingJob) return [];
   isEngagementBatchRunning = true;
   isFacebookSyncBusy = true;
   try {
+    await recordMaintenanceDiagnostic(
+      'claim.requested',
+      'ENGAGEMENT',
+      'claimRequests',
+      { manualOnly },
+    );
     const queryParams = new URLSearchParams({
       limit: String(Math.min(MAINTENANCE_BATCH_LIMIT, Math.max(1, maxItems))),
-      ...(postId ? { postId } : {}),
       ...(manualOnly ? { manualOnly: 'true' } : {}),
     });
     const query = `/api/jobs/engagement-pending?${queryParams.toString()}`;
     const posts = await apiFetch(query);
     if (!Array.isArray(posts)) return [];
+    if (posts.length === 0) {
+      await recordMaintenanceDiagnostic(
+        'claim.empty',
+        'ENGAGEMENT',
+        'emptyClaims',
+        { manualOnly },
+      );
+    }
     const results = [];
     for (const post of posts as PublishedFacebookPost[]) {
-      const result = await checkSinglePostEngagement(post, true);
+      await recordMaintenanceDiagnostic(
+        'claim.created',
+        'ENGAGEMENT',
+        'claimsCreated',
+        { jobId: post.id, manualOnly },
+      );
+      const result = await checkSinglePostEngagement(post, true, mode);
       const updated = Boolean(await apiFetch(`/api/jobs/${post.id}/engagement`, {
         ...result,
         ...(post.claimToken ? { claimToken: post.claimToken } : {}),
       }));
+      await recordMaintenanceDiagnostic(
+        'result.completed',
+        'ENGAGEMENT',
+        updated && result.status !== 'CHECK_FAILED'
+          ? 'resultSuccesses'
+          : 'resultFailures',
+        {
+          jobId: post.id,
+          status: result.status,
+          outcome: updated ? 'UPDATED' : 'NOT_UPDATED',
+        },
+      );
       results.push({ postId: post.id, result, updated });
       console.log('[PostAnalytics] Engagement sync completed', { postId: post.id, result, updated });
     }
@@ -2428,7 +2614,7 @@ type MaintenanceCoordinatorOptions = {
   manualOnly?: boolean;
   pending?: boolean;
   analytics?: boolean;
-  postId?: string;
+  analyticsMode?: EngagementSyncMode;
 };
 
 let isMaintenanceCoordinatorRunning = false;
@@ -2463,7 +2649,7 @@ async function runMaintenanceCoordinator(
     manualOnly = false,
     pending = true,
     analytics = false,
-    postId,
+    analyticsMode = 'AUTOMATIC',
   } = options;
   isMaintenanceCoordinatorRunning = true;
   const startedAt = Date.now();
@@ -2473,7 +2659,7 @@ async function runMaintenanceCoordinator(
     manualOnly,
     pending,
     analytics,
-    postId: postId ?? null,
+    analyticsMode,
   });
   try {
     for (const workType of (pending ? ['pending', ...(analytics ? ['analytics'] : [])] : analytics ? ['analytics'] : [])) {
@@ -2481,7 +2667,11 @@ async function runMaintenanceCoordinator(
         if (!(await yieldMaintenanceToPublishing(deadline))) return results;
         const batch = workType === 'pending'
           ? await syncPendingPostsBatch(manualOnly, 1)
-          : await syncPublishedEngagementBatch(postId, manualOnly, 1);
+          : await syncPublishedEngagementBatch(
+              manualOnly,
+              1,
+              analyticsMode,
+            );
         if (!batch.length) break;
         results.push(...batch);
       }
@@ -2502,79 +2692,32 @@ async function syncManualMaintenanceRequests() {
     manualOnly: true,
     pending: true,
     analytics: true,
+    analyticsMode: 'MANUAL',
   });
 }
-
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.type === 'TRIGGER_SINGLE_ENGAGEMENT_SYNC' && typeof message.postId === 'string') {
-    console.log('[PostAnalytics] Manual engagement request received', {
-      postId: message.postId,
-    });
-    void (async () => {
-      const claimedPost = await apiFetch(
-        `/api/jobs/${encodeURIComponent(message.postId)}/maintenance-claim`,
-        { type: 'ENGAGEMENT' },
-        'POST',
-        true,
-      );
-      if (!claimedPost || claimedPost.apiFetchError) {
-        const status = claimedPost?.status;
-        throw new Error(
-          typeof claimedPost?.message === 'string'
-            ? claimedPost.message
-            : status === 401
-              ? 'This post belongs to another Facebook connection.'
-              : 'Could not claim this post for the current extension.',
-        );
-      }
-      const post = claimedPost as PublishedFacebookPost;
-      const result = await checkSinglePostEngagement(post);
-      const updated = Boolean(await apiFetch(`/api/jobs/${post.id}/engagement`, {
-        ...result,
-        ...(post.claimToken ? { claimToken: post.claimToken } : {}),
-      }));
-      return { post, result, updated };
-    })()
-      .then(async (result) => {
-        sendResponse({ ok: true, result: result.result, updated: result.updated, postId: result.post.id });
-      })
-      .catch((err) => sendResponse({ ok: false, error: err?.message ?? 'Engagement sync failed' }));
-    return true;
-  }
-  if (message.type !== 'TRIGGER_ENGAGEMENT_SYNC') return;
-  void runMaintenanceCoordinator({
-    pending: false,
-    analytics: true,
-    postId: typeof message.postId === 'string' ? message.postId : undefined,
-  })
-    .then((results) => sendResponse({ ok: true, results }))
-    .catch((err) => sendResponse({ ok: false, error: err?.message ?? 'Engagement sync failed' }));
-  return true;
-});
-
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.type !== 'TRIGGER_PENDING_POST_SYNC') return;
-  void runMaintenanceCoordinator({ pending: true })
-    .then((results) => sendResponse({ ok: true, results }))
-    .catch((err) => sendResponse({ ok: false, error: err?.message ?? 'Pending post batch failed' }));
-  return true;
-});
 
 // ── Alarms ──
 
 /**
- * Keep the ten-minute pending wake persistent across service-worker restarts,
- * but spread the first wake for each installation by a stable 0–2 minute
- * offset. The storage marker prevents a service-worker restart from moving an
- * already scheduled alarm back to "now + jitter".
+ * Keep automatic maintenance wakes persistent across service-worker restarts,
+ * but spread each first wake by a stable 0–2 minute offset. Storage markers
+ * prevent a service-worker restart from moving an already scheduled alarm
+ * back to "now + jitter".
  */
 async function ensureMaintenanceAlarms(): Promise<void> {
-  const existingPendingAlarm = await chrome.alarms.get(PENDING_POST_SYNC_ALARM);
-  const stored = await chrome.storage.local.get(
-    PENDING_POST_SYNC_ALARM_INITIALIZED_KEY,
-  );
+  const [existingPendingAlarm, existingEngagementAlarm, stored] =
+    await Promise.all([
+      chrome.alarms.get(PENDING_POST_SYNC_ALARM),
+      chrome.alarms.get(ENGAGEMENT_SYNC_ALARM),
+      chrome.storage.local.get([
+        PENDING_POST_SYNC_ALARM_INITIALIZED_KEY,
+        ENGAGEMENT_SYNC_ALARM_INITIALIZED_KEY,
+      ]),
+    ]);
   const pendingAlarmInitialized =
     stored[PENDING_POST_SYNC_ALARM_INITIALIZED_KEY] === true;
+  const engagementAlarmInitialized =
+    stored[ENGAGEMENT_SYNC_ALARM_INITIALIZED_KEY] === true;
 
   if (
     !existingPendingAlarm ||
@@ -2593,6 +2736,38 @@ async function ensureMaintenanceAlarms(): Promise<void> {
     console.log('[Maintenance] Pending scheduler armed', {
       intervalMinutes: PENDING_POST_SYNC_INTERVAL_MINUTES,
       jitterMs,
+    });
+  }
+
+  if (!AUTOMATIC_ANALYTICS_ENABLED) {
+    if (existingEngagementAlarm) {
+      await chrome.alarms.clear(ENGAGEMENT_SYNC_ALARM);
+    }
+    await chrome.storage.local.remove(ENGAGEMENT_SYNC_ALARM_INITIALIZED_KEY);
+    console.info('[MaintenanceDiagnostic]', {
+      event: 'scheduler.disabled',
+      workType: 'ENGAGEMENT',
+      reasonCode: 'FEATURE_FLAG_OFF',
+    });
+  } else if (
+    !existingEngagementAlarm ||
+    existingEngagementAlarm.periodInMinutes !== ENGAGEMENT_SYNC_INTERVAL_MINUTES ||
+    !engagementAlarmInitialized
+  ) {
+    const extensionInstanceId = await getExtensionInstanceId();
+    const analyticsJitterKey = `${extensionInstanceId}:analytics`;
+    const jitterMs = getMaintenanceStartupJitterMs(analyticsJitterKey);
+    chrome.alarms.create(ENGAGEMENT_SYNC_ALARM, {
+      when: getMaintenanceAlarmFirstRunAt(analyticsJitterKey),
+      periodInMinutes: ENGAGEMENT_SYNC_INTERVAL_MINUTES,
+    });
+    await chrome.storage.local.set({
+      [ENGAGEMENT_SYNC_ALARM_INITIALIZED_KEY]: true,
+    });
+    console.log('[Maintenance] Analytics scheduler armed', {
+      intervalMinutes: ENGAGEMENT_SYNC_INTERVAL_MINUTES,
+      jitterMs,
+      backgroundOnly: true,
     });
   }
 
@@ -2615,10 +2790,6 @@ void ensureMaintenanceAlarms();
 // finalized flow performs one fresh-tab reconciliation immediately.
 void chrome.alarms.clear('postflow-english-video-link-sync');
 void chrome.storage.local.remove('englishGroupVideoLinkRetries');
-// Engagement checks are explicitly user-triggered from the dashboard. An
-// automatic alarm can open a previously stored post URL while a new post is
-// being published, so do not schedule background navigation for analytics.
-void chrome.alarms.clear(ENGAGEMENT_SYNC_ALARM);
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === REGISTER_RETRY_ALARM) {
@@ -2631,6 +2802,17 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
   if (alarm.name === PENDING_POST_SYNC_ALARM) {
     void runMaintenanceCoordinator({ pending: true });
+  }
+  if (alarm.name === ENGAGEMENT_SYNC_ALARM) {
+    if (AUTOMATIC_ANALYTICS_ENABLED) {
+      void runMaintenanceCoordinator({
+        pending: false,
+        analytics: true,
+        analyticsMode: 'AUTOMATIC',
+      });
+    } else {
+      void chrome.alarms.clear(ENGAGEMENT_SYNC_ALARM);
+    }
   }
   if (alarm.name === MANUAL_MAINTENANCE_ALARM) {
     void syncManualMaintenanceRequests();

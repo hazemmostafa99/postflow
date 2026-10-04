@@ -340,8 +340,10 @@ Manual validation:
 
 - User logs confirmed the owner coordinator processed one analytics request in
   7.4 seconds and the foreign profile processed zero requests.
-- Publishing-priority and multi-job sequential behavior still need a dedicated
-  run.
+- A later two-profile automatic run confirmed one profile processed one job
+  while the other processed three distinct jobs sequentially in 19.1 seconds,
+  matching the configured batch limit. Publishing-priority behavior still
+  needs a dedicated run.
 ```
 
 ### Review Gate
@@ -377,7 +379,7 @@ Older than 7 days: 24 hours
 ### Review Notes
 
 ```text
-Status: IMPLEMENTED — awaiting two-profile manual validation
+Status: IMPLEMENTED — one-owner/two-profile isolation passed; recovery pending
 
 Alarm configuration:
 
@@ -407,6 +409,24 @@ Tests:
 - API schedule tests and the extension build pass. The extension test runner
   remains subject to the environment's existing `spawn EPERM` limitation.
 
+Manual validation received:
+
+- On 2026-10-04, one owner profile armed the pending alarm with a 102,204 ms
+  startup offset. Its manual-only coordinator correctly processed zero normal
+  scheduled jobs, then the automatic coordinator claimed its pending post and
+  persisted `STILL_PENDING` with `updated: true` in 5.2 seconds.
+- A later two-profile capture confirmed connection
+  `6ac121377d9ec29f45bd3556` (Facebook `61594593347843`, masked instance
+  `pfi_…3966`) claimed pending job `6ac29436664315e2492a665b`, checked it once,
+  and persisted `STILL_PENDING` with `updated: true` in 4.3 seconds.
+- At the same time, connection `6ac2932046e01d0c0d641d11` (Facebook
+  `100038098548578`, masked instance `pfi_…c173`) requested pending work,
+  received `claim.empty`, processed zero pending items, and performed no
+  pending-post navigation. This passes foreign-profile isolation for a job
+  owned by the first profile.
+- The inverse case with a pending job owned by the second profile and the
+  five-minute lease-recovery run remain outstanding.
+
 Manual validation required:
 
 - Run two Chrome profiles with different extension instances and one pending
@@ -426,17 +446,17 @@ Run a pending batch in two Chrome profiles before enabling broadly.
 
 ### Checklist
 
-- [ ] Retain the backend age-based analytics schedule.
-- [ ] Enable an analytics alarm every 15 minutes.
-- [ ] Add deterministic per-instance startup jitter.
-- [ ] Claim only due published jobs with valid permalinks.
-- [ ] Keep scheduled analytics in background tabs.
-- [ ] Disable foreground retry for automatic runs.
-- [ ] Preserve foreground retry only for explicit manual actions if needed.
-- [ ] Preserve previous metrics when detection is partial or fails.
-- [ ] Double failed-attempt delay, capped at 24 hours.
-- [ ] Add schedule and background-tab tests.
-- [ ] Correct scheduler documentation drift.
+- [x] Retain the backend age-based analytics schedule.
+- [x] Enable an analytics alarm every 15 minutes.
+- [x] Add deterministic per-instance startup jitter.
+- [x] Claim only due published jobs with valid permalinks.
+- [x] Keep scheduled analytics in background tabs.
+- [x] Disable foreground retry for automatic runs.
+- [x] Preserve foreground retry only for explicit manual actions if needed.
+- [x] Preserve previous metrics when detection is partial or fails.
+- [x] Double failed-attempt delay, capped at 24 hours.
+- [x] Add schedule and background-tab tests.
+- [x] Correct scheduler documentation drift.
 
 ### Approved Cadence
 
@@ -451,23 +471,69 @@ Older than 7 days: 24 hours
 ### Review Notes
 
 ```text
-Status: NOT STARTED
+Status: COMPLETE — live two-profile background-tab validation passed
 
 Alarm configuration:
 
--
+- Chrome alarm `postflow-engagement-sync` wakes every 15 minutes.
+- Its first wake uses a deterministic 0–2 minute offset derived from the
+  extension instance ID plus an analytics namespace, avoiding alignment with
+  the pending scheduler where possible.
+- The backend still controls actual eligibility using the approved age bands.
 
 Automatic tab behavior:
 
--
+- Scheduled analytics opens an inactive tab and allows only one background
+  render attempt.
+- An empty background surface becomes `CHECK_FAILED`; the tab is never
+  activated and backend backoff is applied.
+- Explicit dashboard/manual runs retain the existing foreground retry.
+- Only due successful published jobs with supported Facebook post permalinks
+  can be claimed. Invalid, feed, and pending-approval URLs are excluded.
 
 Feature flag:
 
--
+- Phase 9 adds the rollout flag and operational counters before production
+  rollout. Phase 8 enables the scheduler implementation for live validation.
 
 Tests:
 
--
+- Engagement schedule tests cover all age-band boundaries, doubled failure
+  delay, and the 24-hour cap.
+- Eligibility tests cover supported permalinks and reject feeds, pending URLs,
+  foreign hosts, and invalid values.
+- Result tests verify partial and failed checks preserve known counters.
+- `engagement-sync-policy.test.cjs` covers automatic background-only behavior;
+  the policy also passed a direct runtime check because this environment's
+  Node test runner is blocked by `spawn EPERM`.
+- API tests and builds plus the extension build pass.
+
+Manual validation received:
+
+- On 2026-10-04, one owner profile armed the analytics alarm for 15 minutes
+  with a 103,002 ms startup offset and `backgroundOnly: true`.
+- Its automatic coordinator ran with `manualOnly: false`, `pending: false`,
+  `analytics: true`, and `analyticsMode: AUTOMATIC`.
+- It opened the owned post in an inactive analytics tab, completed the first
+  background render attempt, persisted the result with `updated: true`, and
+  processed one item in 6.8 seconds. No foreground-retry event occurred.
+- Two-profile logs then confirmed strict routing: Facebook profile
+  `61594593347843` (connection `6ac121377d9ec29f45bd3556`) processed only job
+  `6ac29436664315e2492a665d`, while profile `100038098548578` (connection
+  `6ac2932046e01d0c0d641d11`) processed three different jobs:
+  `6ac2b102faeec9db0499e167`, `6ac2b153faeec9db0499e16a`, and
+  `6ac29436664315e2492a665e`.
+- All four results were persisted with `updated: true`. The three-job batch was
+  sequential and completed in 19.1 seconds. Neither profile logged an ownership
+  rejection, duplicate job, overlapping check, or foreground retry.
+- The user confirmed Chrome did not switch away from the active browser tab
+  during either profile's automatic analytics run. This completes the
+  background-only review gate.
+
+Manual validation required:
+
+- Complete. Both profiles processed only their owned analytics jobs, and the
+  temporary Facebook tabs stayed in the background and closed after results.
 ```
 
 ### Review Gate
@@ -480,32 +546,70 @@ Verify automatic analytics never steals focus from the user.
 
 ### Checklist
 
-- [ ] Add structured claim and result logs.
-- [ ] Mask extension instance IDs in logs.
-- [ ] Do not log tokens, cookies, DOM trees, or full post content.
-- [ ] Track empty claims.
-- [ ] Track lease conflicts and expirations.
-- [ ] Track ownership rejections.
-- [ ] Track success/failure counts by work type.
-- [ ] Add an automatic-analytics feature flag.
-- [ ] Document rollback behavior.
+- [x] Add structured claim and result logs.
+- [x] Mask extension instance IDs in logs.
+- [x] Do not log tokens, cookies, DOM trees, or full post content.
+- [x] Track empty claims.
+- [x] Track lease conflicts and expirations.
+- [x] Track ownership rejections.
+- [x] Track success/failure counts by work type.
+- [x] Add an automatic-analytics feature flag.
+- [x] Document rollback behavior.
 
 ### Review Notes
 
 ```text
-Status: NOT STARTED
+Status: COMPLETE — live diagnostics review passed
 
 Logs/metrics:
 
--
+- API structured events cover claim creation, empty claims, accepted results,
+  ownership rejection, lease conflicts, and expired result leases.
+- Extension structured events and per-profile persisted counters cover claim
+  requests/creation, empty claims, ownership/lease failures, and successful or
+  failed results for pending approval and engagement independently.
+- Counters are stored in `chrome.storage.local` as
+  `maintenanceDiagnosticsV1`. Instance IDs are masked; tokens, cookies, DOM,
+  and post content are excluded.
 
 Feature flag:
 
--
+- Public build-time boolean `AUTOMATIC_ANALYTICS_ENABLED` controls only the
+  scheduled analytics alarm. Development defaults to enabled; production
+  defaults to disabled until rollout approval.
+- When disabled, startup clears the analytics alarm while publishing, pending
+  approval, and manual analytics remain available.
 
 Rollback:
 
--
+- Set the selected environment's flag to `false`, rebuild, and reload. No
+  database rollback is required; metrics and scheduling timestamps remain,
+  and abandoned leases expire after five minutes.
+- The extension README and feature specification document the procedure and
+  the service-worker command for reading local counters.
+
+Checks:
+
+- Relevant API suites pass with 45 tests, including masked structured events,
+  stale-token conflicts, and explicit expired-lease rejection.
+- API build, development extension build, and production extension build pass.
+  The production artifact was verified to emit
+  `AUTOMATIC_ANALYTICS_ENABLED = false`; the development artifact was restored
+  afterward with the flag enabled.
+- Diagnostics masking/counter helpers passed a direct runtime check. The full
+  extension Node test runner remains blocked by the environment's existing
+  `spawn EPERM` limitation.
+
+Manual validation required:
+
+- Complete. On 2026-10-05, the development extension reported automatic
+  analytics `ON`, emitted structured pending and engagement claim events with
+  masked instance ID `pfi_…3966`, and independently incremented claim-request
+  and empty-claim counters for both work types. The empty maintenance run
+  completed in 1.3 seconds.
+- The visible delay before the first events matched the expected identity
+  verification, one-minute manual poll, and deterministic 102–103 second
+  automatic startup jitter; it was not maintenance execution time.
 ```
 
 ### Review Gate
@@ -518,38 +622,66 @@ Confirm rollout can be observed and automatic analytics can be disabled safely.
 
 ### Checklist
 
-- [ ] Run ownership unit tests.
-- [ ] Run simultaneous-claim tests.
-- [ ] Run lease recovery tests.
-- [ ] Run pending schedule tests.
-- [ ] Run analytics schedule tests.
-- [ ] Run manual-refresh safety tests.
-- [ ] Run API typecheck/build.
-- [ ] Run extension typecheck/build.
-- [ ] Run web typecheck/build.
-- [ ] Run relevant lint checks.
-- [ ] Record any unrelated pre-existing failures separately.
+- [x] Run ownership unit tests.
+- [x] Run simultaneous-claim tests.
+- [x] Run lease recovery tests.
+- [x] Run pending schedule tests.
+- [x] Run analytics schedule tests.
+- [x] Run manual-refresh safety tests.
+- [x] Run API typecheck/build.
+- [x] Run extension typecheck/build.
+- [x] Run web typecheck/build.
+- [x] Run relevant lint checks.
+- [x] Record any unrelated pre-existing failures separately.
 
 ### Review Notes
 
 ```text
-Status: NOT STARTED
+Status: COMPLETE — feature-specific automated review gate passed
 
 API checks:
 
--
+- Four focused suites pass with 47/47 tests: ownership and manual-refresh
+  safety, atomic maintenance claims, pending scheduling, analytics scheduling,
+  result preservation, and strict connection routing.
+- Added explicit concurrent-claim coverage. Two simultaneous requests for the
+  same due job result in one claim and one empty response.
+- Added explicit recovery coverage. An expired maintenance lease can be
+  reclaimed with a new token.
+- The API build passes.
+- The isolated scheduling and eligibility files pass ESLint with formatting
+  disabled so repository line-ending noise does not mask semantic lint errors.
 
 Extension checks:
 
--
+- All maintenance-specific direct Node tests pass: deterministic alarm jitter,
+  automatic background-only analytics policy, diagnostics masking/counters,
+  and engagement extraction behavior.
+- Across the extension's direct test files, 70 tests pass and one unrelated
+  GraphQL-spy test fails as recorded below.
+- The development extension build/typecheck passes. The production build also
+  passed during Phase 9 and emitted automatic analytics as disabled by default.
 
 Web checks:
 
--
+- The production web build passes and includes the maintenance-request route.
+- Web lint completes with zero errors and three existing warnings: two
+  `no-img-element` warnings and one unused `props` warning.
 
 Known unrelated failures:
 
--
+- A broader API Posts test run passes 78 tests in eight suites, but
+  `posts.controller.spec.ts` cannot start because the CommonJS Jest setup loads
+  the ESM `@nestjs/mongoose/dist/index.js` package. The focused feature suites
+  do not have this harness failure.
+- The extension GraphQL-spy suite has one existing failure in the encoded
+  composer-video-ID response test (`assert.ok(trusted)`). It is outside the
+  maintenance scheduler, ownership, and analytics flow.
+- A broad API lint invocation reports the repository's existing CRLF/Prettier
+  differences plus legacy unsafe-enum/`any` findings in the large jobs
+  controller/spec. No broad auto-format or unrelated lint rewrite was applied.
+- `git diff --check` reports no whitespace errors; Git only warns that its
+  configured checkout will convert the touched LF files to CRLF.
 ```
 
 ### Review Gate
@@ -562,42 +694,57 @@ All feature-specific automated checks must pass before live validation.
 
 ### Checklist
 
-- [ ] Connect Chrome Profile A and Profile B to the same PostFlow user.
-- [ ] Verify each profile has a different extension instance and connection.
+- [x] Connect Chrome Profile A and Profile B to the same PostFlow user.
+- [x] Verify each profile has a different extension instance and connection.
 - [ ] Create Group jobs assigned to both connections.
 - [ ] Confirm A never publishes B jobs.
 - [ ] Confirm B never publishes A jobs.
-- [ ] Confirm A refreshes only A pending approvals.
+- [x] Confirm A refreshes only A pending approvals.
 - [ ] Confirm B refreshes only B pending approvals.
-- [ ] Confirm A refreshes only A analytics.
-- [ ] Confirm B refreshes only B analytics.
+- [x] Confirm A refreshes only A analytics.
+- [x] Confirm B refreshes only B analytics.
 - [ ] Trigger simultaneous scheduler wakes.
 - [ ] Close Profile A during a leased maintenance job.
 - [ ] Confirm Profile B continues normally.
 - [ ] Restart Profile A and confirm safe lease recovery.
-- [ ] Confirm no duplicate updates or cross-profile navigation.
-- [ ] Confirm scheduled analytics never foregrounds a tab.
+- [x] Confirm no duplicate updates or cross-profile navigation.
+- [x] Confirm scheduled analytics never foregrounds a tab.
 
 ### Review Notes
 
 ```text
-Status: NOT STARTED
+Status: DEFERRED BY USER — partial validation retained, remaining cases not passed
 
 Profiles tested:
 
--
+- Profile A: connection `6ac121377d9ec29f45bd3556`, Facebook
+  `61594593347843`, masked extension instance `pfi_…3966`.
+- Profile B: connection `6ac2932046e01d0c0d641d11`, Facebook
+  `100038098548578`, masked extension instance `pfi_…c173`.
 
 Ownership result:
 
--
+- Profile A claimed and completed its pending job
+  `6ac29436664315e2492a665b` as `STILL_PENDING`, `updated: true`.
+- Profile B had no pending job, received an empty pending claim, and did not
+  open Profile A's group or job. No ownership rejection was needed because the
+  backend connection filter excluded the foreign job before claiming.
+- Earlier automatic analytics evidence confirms both profiles process only
+  their own analytics jobs.
 
 Restart result:
 
--
+- Not tested yet. The five-minute expired-lease recovery scenario remains.
 
 Issues found:
 
--
+- None in this capture. The inverse pending ownership case still needs a
+  pending job assigned to Profile B; simultaneous wake and publishing-priority
+  behavior also remain to be validated.
+- On 2026-10-05, the user directed work to proceed to Phase 12 without running
+  the remaining live lease-recovery and publishing-priority scenarios. Those
+  unchecked items are intentionally retained and must not be represented as
+  passed during rollout.
 ```
 
 ### Review Gate
@@ -617,31 +764,51 @@ Live two-profile ownership and fault isolation must pass before rollout.
 - [ ] Monitor ownership rejections and lease conflicts.
 - [ ] Monitor Facebook navigation failures.
 - [ ] Increase limits only after stable observation.
-- [ ] Remove obsolete queue-read paths.
-- [ ] Remove temporary debug logging.
-- [ ] Update related feature documentation.
+- [x] Remove obsolete queue-read paths.
+- [x] Remove temporary debug logging.
+- [x] Update related feature documentation.
 - [ ] Mark this progress file complete.
 
 ### Review Notes
 
 ```text
-Status: NOT STARTED
+Status: IN PROGRESS — repository rollout preparation complete; not deployed
 
 Rollout date:
 
--
+- Not deployed. Moving to this phase did not authorize a production deployment
+  or enable automatic analytics in the production extension.
 
 Initial limits:
 
--
+- Pending wake: 10 minutes; analytics wake: 15 minutes; deterministic startup
+  jitter: 0–2 minutes; maximum batch: 3 per work type; execution budget: 45
+  seconds; maintenance lease: 5 minutes.
+- Production `AUTOMATIC_ANALYTICS_ENABLED` remains `false`. A production build
+  was verified to emit the disabled value, then the local development artifact
+  was restored with analytics enabled for continued local testing.
 
 Monitoring result:
 
--
+- Structured API events and per-profile extension counters are available, but
+  no production observation has occurred. `rollout.md` defines required
+  signals, halt conditions, deployment order, and rollback.
 
 Cleanup:
 
--
+- Removed the unused webpage event bridge and extension runtime messages for
+  direct current-profile pending/engagement refresh. Dashboard maintenance now
+  has one path: durable web API request followed by an ownership-scoped claim
+  from the correct extension.
+- Removed the obsolete engagement queue `postId` filter that existed only for
+  the deleted direct bridge. Specific dashboard work continues through the
+  authoritative maintenance request/claim path.
+- Removed the unused bulk pending-refresh component.
+- Audited maintenance logging. Structured operational diagnostics were kept;
+  no claim tokens, cookies, DOM trees, or post content are logged.
+- Added `rollout.md` and linked it from the feature specification.
+- After cleanup, the focused API suites pass 47/47 tests and API, web,
+  development extension, and production extension builds pass.
 ```
 
 ---
@@ -657,21 +824,27 @@ Cleanup:
 | 5. Safe manual refresh | Implemented | Pending manual two-profile validation |
 | 6. Maintenance coordinator | Implemented | Pending manual two-profile validation |
 | 7. Pending-approval scheduler | Implemented | Pending manual two-profile validation |
-| 8. Engagement analytics scheduler | Not started | No |
-| 9. Diagnostics and operational safety | Not started | No |
-| 10. Automated verification | Not started | No |
-| 11. Live multi-profile validation | Not started | No |
-| 12. Rollout and cleanup | Not started | No |
+| 8. Engagement analytics scheduler | Complete | Complete |
+| 9. Diagnostics and operational safety | Complete | Complete |
+| 10. Automated verification | Complete | Complete |
+| 11. Live multi-profile validation | Deferred by user | Partial |
+| 12. Rollout and cleanup | In progress | Repository preparation complete |
 
 ---
 
 ## Current Status
 
 ```text
-Status: Phase 7 implementation complete; awaiting manual validation.
-Current phase: Phase 7 review gate.
-Next action: Validate the ten-minute pending scheduler in two Chrome profiles,
-including lease recovery after the owning profile restarts.
+Status: Phase 12 repository rollout preparation is complete. Production has
+not been changed, deployed, or monitored. Automatic analytics remains disabled
+in the production extension environment.
+Current phase: Phase 12 rollout and cleanup. The user chose to defer the
+remaining Phase 11 live lease-recovery, inverse-pending, simultaneous-wake, and
+publishing-priority checks; their review gate remains partial.
+Next action: Obtain explicit production rollout approval, run the ownership
+migration report, then deploy in the staged order documented in `rollout.md`.
+Do not enable production automatic analytics until the pending-only observation
+is reviewed and separately approved.
 ```
 
 ---
@@ -691,4 +864,3 @@ For every implementation session:
    behavior, ask the user before proceeding.
 9. Identify and request any required manual browser/Facebook validation.
 10. Stop for review before starting the next phase.
-
