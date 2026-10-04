@@ -793,6 +793,14 @@ Monitoring result:
 - Structured API events and per-profile extension counters are available, but
   no production observation has occurred. `rollout.md` defines required
   signals, halt conditions, deployment order, and rollback.
+- The pre-production audit found that `apps/api/.env` targets the remote MongoDB
+  Atlas database `cluster0.8xpowik.mongodb.net/postflow`. After explicit user
+  approval, the read-only ownership report ran on 2026-10-05. It found zero
+  assignable legacy jobs, zero skipped jobs, and zero Groups without a Facebook
+  connection. The report performed no writes.
+- No deployment provider configuration or deployment command is stored in this
+  repository. The production API/web deployment mechanism must be supplied by
+  the user before those rollout steps can be executed.
 
 Cleanup:
 
@@ -807,6 +815,10 @@ Cleanup:
 - Audited maintenance logging. Structured operational diagnostics were kept;
   no claim tokens, cookies, DOM trees, or post content are logged.
 - Added `rollout.md` and linked it from the feature specification.
+- Added an explicit read-only ownership report command:
+  `npm run report-connection-ownership`. The migration script now requires
+  exactly one mode (`--report-only` or `--apply`) and refuses an ambiguous
+  invocation before connecting to MongoDB.
 - After cleanup, the focused API suites pass 47/47 tests and API, web,
   development extension, and production extension builds pass.
 ```
@@ -841,10 +853,11 @@ in the production extension environment.
 Current phase: Phase 12 rollout and cleanup. The user chose to defer the
 remaining Phase 11 live lease-recovery, inverse-pending, simultaneous-wake, and
 publishing-priority checks; their review gate remains partial.
-Next action: Obtain explicit production rollout approval, run the ownership
-migration report, then deploy in the staged order documented in `rollout.md`.
-Do not enable production automatic analytics until the pending-only observation
-is reviewed and separately approved.
+Next action: Obtain the API/web deployment provider or commands before any
+deployment. The ownership report is clean, so no apply migration is needed.
+Deploy only in the staged order documented in `rollout.md`, and do not enable
+production automatic analytics until the pending-only observation is reviewed
+and separately approved.
 ```
 
 ---

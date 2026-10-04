@@ -24,9 +24,11 @@ Do not increase these limits during the initial observation period.
 ## Deployment Order
 
 1. Back up the database using the normal production procedure.
-2. Run the idempotent connection-ownership migration in report mode and review
-   every unresolved Group and publishing job.
-3. Run the migration, then rerun its report. Unresolved jobs must remain
+2. From `apps/api`, run `npm run report-connection-ownership` against the
+   production database and review every unresolved Group and publishing job.
+   Report mode is read-only and prints `Mode: REPORT ONLY (no writes)`.
+3. After the report is approved, run `npm run migrate-connection-ownership`,
+   then rerun `npm run report-connection-ownership`. Unresolved jobs must remain
    excluded from worker queues or be explicitly assigned before proceeding.
 4. Deploy the API containing strict worker ownership, atomic maintenance
    leases, result-token validation, indexes, and structured diagnostics.
@@ -107,4 +109,3 @@ Record the following in `progress.md` after an actual rollout:
 - Confirmation that publishing priority and background-only analytics remain
   correct.
 - Any rollback or limit change, including who approved it.
-
