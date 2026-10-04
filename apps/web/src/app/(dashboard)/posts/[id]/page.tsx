@@ -291,7 +291,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
             <OverallStatusBadge jobs={post.jobs} />
             <PostControlButtons postId={post._id} jobs={post.jobs} />
             {publishedEngagementJobs.length > 0 && (
-              <RefreshAllPostEngagementButton postId={post._id} />
+              <RefreshAllPostEngagementButton jobIds={publishedEngagementJobs.map((job) => job._id)} />
             )}
             <RefreshPostStatusControls
               jobs={pendingGroupJobs.map((job) => ({

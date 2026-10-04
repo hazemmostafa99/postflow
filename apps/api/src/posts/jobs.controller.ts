@@ -207,10 +207,12 @@ export class JobsController {
       clerkUserId,
       normalizedInstanceId,
     );
-    if (
-      !connection ||
-      String(job.facebookConnectionId) !== String(connection._id)
-    ) {
+    if (!connection) {
+      throw new UnauthorizedException(
+        'Extension instance is not linked to a verified Facebook connection',
+      );
+    }
+    if (String(job.facebookConnectionId) !== String(connection._id)) {
       throw new UnauthorizedException(
         'Job is assigned to another Facebook connection',
       );
@@ -228,11 +230,32 @@ export class JobsController {
     };
   }
 
-  private releaseMaintenanceClaim(job: PublishingJobDocument) {
+  private releaseMaintenanceClaim(
+    job: PublishingJobDocument,
+    claimType?: MaintenanceClaimType,
+  ) {
     job.maintenanceClaimedByExtensionInstanceId = undefined;
     job.maintenanceClaimType = undefined;
     job.maintenanceClaimToken = undefined;
     job.maintenanceClaimExpiresAt = undefined;
+    if (claimType) this.clearManualMaintenanceRequest(job, claimType);
+  }
+
+  private clearManualMaintenanceRequest(
+    job: PublishingJobDocument,
+    claimType: MaintenanceClaimType,
+  ) {
+    if (claimType === MaintenanceClaimType.PENDING_APPROVAL) {
+      job.manualPendingSyncRequestedAt = undefined;
+    } else {
+      job.manualEngagementSyncRequestedAt = undefined;
+    }
+  }
+
+  private manualMaintenanceRequestFilter(claimType: MaintenanceClaimType) {
+    return claimType === MaintenanceClaimType.PENDING_APPROVAL
+      ? { manualPendingSyncRequestedAt: { $exists: true, $ne: null } }
+      : { manualEngagementSyncRequestedAt: { $exists: true, $ne: null } };
   }
 
   private async assertMaintenanceClaim(
@@ -492,6 +515,7 @@ export class JobsController {
     @Headers('x-clerk-user-id') clerkUserId: string,
     @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Query('limit') limit?: string,
+    @Query('manualOnly') manualOnly?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
@@ -519,19 +543,36 @@ export class JobsController {
 
     if (!postIds.length) return [];
 
+    const manualOnlyRequested = manualOnly === 'true';
     const pendingFilter = {
       status: 'SUCCESS',
-      submissionStatus: FacebookSubmissionStatus.PENDING_APPROVAL,
       facebookConnectionId: connection._id,
       $and: [
         groupOrLegacyTargetFilter,
+        { groupId: { $exists: true, $ne: null } },
         {
           $or: [
-            { nextCheckAt: { $exists: false } },
-            { nextCheckAt: null },
-            { nextCheckAt: { $lte: now } },
+            { submissionStatus: FacebookSubmissionStatus.PENDING_APPROVAL },
+            {
+              submissionStatus: FacebookSubmissionStatus.PUBLISHED,
+              postUrl: { $regex: /\/pending_posts\//i },
+            },
           ],
         },
+        manualOnlyRequested
+          ? this.manualMaintenanceRequestFilter(
+              MaintenanceClaimType.PENDING_APPROVAL,
+            )
+          : {
+              $or: [
+                this.manualMaintenanceRequestFilter(
+                  MaintenanceClaimType.PENDING_APPROVAL,
+                ),
+                { nextCheckAt: { $exists: false } },
+                { nextCheckAt: null },
+                { nextCheckAt: { $lte: now } },
+              ],
+            },
         this.maintenanceClaimAvailableFilter(now),
       ],
     };
@@ -609,6 +650,7 @@ export class JobsController {
     @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Query('limit') limit?: string,
     @Query('postId') postId?: string,
+    @Query('manualOnly') manualOnly?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
@@ -638,11 +680,26 @@ export class JobsController {
     const requestedPostId = postId
       ? postIds.find((id) => id.toString() === postId)
       : undefined;
+    const manualOnlyRequested = manualOnly === 'true';
     const engagementFilter = {
-      ...getEngagementQueueFilter(now),
+      status: 'SUCCESS',
       submissionStatus: FacebookSubmissionStatus.PUBLISHED,
+      postUrl: { $exists: true, $ne: '' },
       facebookConnectionId: connection._id,
-      $and: [publishableTargetFilter, this.maintenanceClaimAvailableFilter(now)],
+      $and: [
+        publishableTargetFilter,
+        manualOnlyRequested
+          ? this.manualMaintenanceRequestFilter(MaintenanceClaimType.ENGAGEMENT)
+          : {
+              $or: [
+                this.manualMaintenanceRequestFilter(
+                  MaintenanceClaimType.ENGAGEMENT,
+                ),
+                ...getEngagementQueueFilter(now).$or,
+              ],
+            },
+        this.maintenanceClaimAvailableFilter(now),
+      ],
       ...(requestedPostId
         ? { postId: requestedPostId }
         : { postId: { $in: postIds } }),
@@ -696,6 +753,71 @@ export class JobsController {
         ? { claimToken: job.maintenanceClaimToken }
         : {}),
     }));
+  }
+
+  /** POST /api/jobs/:id/maintenance-claim — claim one manual maintenance job before opening Facebook. */
+  @Post(':id/maintenance-request')
+  @HttpCode(HttpStatus.ACCEPTED)
+  async requestMaintenance(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('id') id: string,
+    @Body() body: { type?: MaintenanceClaimType },
+  ) {
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (
+      body?.type !== MaintenanceClaimType.PENDING_APPROVAL &&
+      body?.type !== MaintenanceClaimType.ENGAGEMENT
+    ) {
+      throw new BadRequestException('Invalid maintenance request type');
+    }
+
+    const job = await this.jobModel.findById(id).populate('postId').exec();
+    if (!job) throw new NotFoundException('Job not found');
+    const post = job.postId as unknown as PostDocument;
+    if (post.clerkUserId !== clerkUserId) {
+      throw new UnauthorizedException('Not your job');
+    }
+    if (!job.facebookConnectionId) {
+      throw new BadRequestException(
+        'Job is not assigned to a Facebook connection',
+      );
+    }
+    if (job.status !== PublishingJobStatus.SUCCESS) {
+      throw new BadRequestException('Job is not ready for maintenance refresh');
+    }
+
+    const requestedAt = new Date();
+    if (body.type === MaintenanceClaimType.PENDING_APPROVAL) {
+      const pendingEligible =
+        job.targetType !== PublishingTargetType.PROFILE_FEED &&
+        Boolean(job.groupId) &&
+        (job.submissionStatus === FacebookSubmissionStatus.PENDING_APPROVAL ||
+          (job.submissionStatus === FacebookSubmissionStatus.PUBLISHED &&
+            isPendingFacebookPostUrl(job.postUrl)));
+      if (!pendingEligible) {
+        throw new BadRequestException(
+          'Job is not awaiting Facebook approval',
+        );
+      }
+      job.manualPendingSyncRequestedAt = requestedAt;
+    } else {
+      if (
+        job.submissionStatus !== FacebookSubmissionStatus.PUBLISHED ||
+        !job.postUrl
+      ) {
+        throw new BadRequestException('Job is not a published Facebook post');
+      }
+      job.manualEngagementSyncRequestedAt = requestedAt;
+    }
+
+    await job.save();
+    return {
+      id: job._id.toString(),
+      type: body.type,
+      status: 'QUEUED',
+      requestedAt: requestedAt.toISOString(),
+    };
   }
 
   /** POST /api/jobs/:id/maintenance-claim — claim one manual maintenance job before opening Facebook. */
@@ -815,7 +937,7 @@ export class JobsController {
             'One engagement counter was not detected'
           : undefined;
     }
-    this.releaseMaintenanceClaim(job);
+    this.releaseMaintenanceClaim(job, MaintenanceClaimType.ENGAGEMENT);
     await job.save();
     return job;
   }
@@ -873,7 +995,7 @@ export class JobsController {
       body.claimToken,
     );
     if (body.status === 'CONTENT_MATCHED') {
-      this.releaseMaintenanceClaim(job);
+      this.releaseMaintenanceClaim(job, MaintenanceClaimType.PENDING_APPROVAL);
       await job.save();
       return job;
     }
@@ -906,7 +1028,7 @@ export class JobsController {
           job.submittedAt ?? getCreatedAt(job) ?? checkedAt,
           checkedAt,
         );
-        this.releaseMaintenanceClaim(job);
+        this.releaseMaintenanceClaim(job, MaintenanceClaimType.PENDING_APPROVAL);
         await job.save();
         return job;
       }
@@ -924,10 +1046,10 @@ export class JobsController {
         job.syncAttempts = (job.syncAttempts ?? 0) + 1;
         job.lastSyncError = undefined;
         job.nextCheckAt = undefined;
-        this.releaseMaintenanceClaim(job);
+        this.releaseMaintenanceClaim(job, MaintenanceClaimType.PENDING_APPROVAL);
         await job.save();
       } else {
-        this.releaseMaintenanceClaim(job);
+        this.releaseMaintenanceClaim(job, MaintenanceClaimType.PENDING_APPROVAL);
         await job.save();
       }
       return job;
@@ -945,7 +1067,7 @@ export class JobsController {
       job.syncAttempts = (job.syncAttempts ?? 0) + 1;
       job.lastSyncError = undefined;
       job.nextCheckAt = undefined;
-      this.releaseMaintenanceClaim(job);
+      this.releaseMaintenanceClaim(job, MaintenanceClaimType.PENDING_APPROVAL);
       await job.save();
       return job;
     }
@@ -965,7 +1087,7 @@ export class JobsController {
         job.submittedAt ?? getCreatedAt(job) ?? checkedAt,
         checkedAt,
       );
-      this.releaseMaintenanceClaim(job);
+      this.releaseMaintenanceClaim(job, MaintenanceClaimType.PENDING_APPROVAL);
       await job.save();
       return job;
     }
@@ -1000,7 +1122,7 @@ export class JobsController {
       );
     }
 
-    this.releaseMaintenanceClaim(job);
+    this.releaseMaintenanceClaim(job, MaintenanceClaimType.PENDING_APPROVAL);
     await job.save();
     return job;
   }

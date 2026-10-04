@@ -144,6 +144,13 @@ export class PublishingJob {
   @Prop()
   maintenanceClaimExpiresAt?: Date;
 
+  /** Dashboard-triggered maintenance requests waiting for the owning extension. */
+  @Prop()
+  manualPendingSyncRequestedAt?: Date;
+
+  @Prop()
+  manualEngagementSyncRequestedAt?: Date;
+
   @Prop()
   scheduledFor?: Date;
 
@@ -195,5 +202,21 @@ PublishingJobSchema.index({
   submissionStatus: 1,
   nextEngagementSyncAt: 1,
   publishedDetectedAt: 1,
+  createdAt: 1,
+});
+
+PublishingJobSchema.index({
+  facebookConnectionId: 1,
+  status: 1,
+  submissionStatus: 1,
+  manualPendingSyncRequestedAt: 1,
+  createdAt: 1,
+});
+
+PublishingJobSchema.index({
+  facebookConnectionId: 1,
+  status: 1,
+  submissionStatus: 1,
+  manualEngagementSyncRequestedAt: 1,
   createdAt: 1,
 });

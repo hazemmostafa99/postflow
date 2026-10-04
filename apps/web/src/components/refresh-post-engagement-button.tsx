@@ -1,12 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 interface EngagementResult {
-  ok?: boolean;
-  result?: { status?: "SUCCESS" | "PARTIAL" | "CHECK_FAILED"; reason?: string };
+  status?: "QUEUED";
   error?: string;
 }
 
@@ -14,30 +13,26 @@ export function RefreshPostEngagementButton({ postId }: { postId: string }) {
   const [refreshing, setRefreshing] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
-  useEffect(() => {
-    const onFinished = (event: Event) => {
-      const detail = (event as CustomEvent<EngagementResult>).detail;
-      setRefreshing(false);
-      if (!detail?.ok) {
-        setMessage(detail?.error ?? "Connect the PostFlow extension to refresh analytics.");
-        return;
-      }
-      const status = detail.result?.status;
-      setMessage(status === "SUCCESS" ? "Analytics refreshed." : detail.result?.reason ?? "Analytics partially refreshed.");
-      if (status === "SUCCESS" || status === "PARTIAL") {
-        window.setTimeout(() => window.location.reload(), 700);
-      }
-    };
-    window.addEventListener("postflow:engagement-sync-finished", onFinished);
-    return () => window.removeEventListener("postflow:engagement-sync-finished", onFinished);
-  }, []);
-
-  function refresh() {
+  async function refresh() {
     setRefreshing(true);
     setMessage(null);
-    window.dispatchEvent(new CustomEvent("postflow:sync-post-engagement", {
-      detail: { id: postId },
-    }));
+    try {
+      const response = await fetch(`/api/jobs/${encodeURIComponent(postId)}/maintenance-request`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "ENGAGEMENT" }),
+      });
+      const detail = (await response.json().catch(() => ({}))) as EngagementResult;
+      if (!response.ok) {
+        setMessage(detail.error ?? "Could not queue analytics refresh.");
+        return;
+      }
+      setMessage("Refresh requested for the owning extension.");
+    } catch {
+      setMessage("Could not queue analytics refresh.");
+    } finally {
+      setRefreshing(false);
+    }
   }
 
   return (
@@ -51,34 +46,39 @@ export function RefreshPostEngagementButton({ postId }: { postId: string }) {
   );
 }
 
-export function RefreshAllPostEngagementButton({ postId }: { postId: string }) {
+export function RefreshAllPostEngagementButton({ jobIds }: { jobIds: string[] }) {
   const [refreshing, setRefreshing] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
-  useEffect(() => {
-    const onFinished = (event: Event) => {
-      const detail = (event as CustomEvent<{ ok?: boolean; results?: Array<{ result?: { status?: string } }>; error?: string }>).detail;
+  async function refreshAll() {
+    setRefreshing(true);
+    setMessage(null);
+    try {
+      const results = await Promise.all(jobIds.map(async (jobId) => {
+        const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/maintenance-request`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "ENGAGEMENT" }),
+        });
+        const detail = (await response.json().catch(() => ({}))) as EngagementResult;
+        return response.ok ? { ok: true } : { ok: false, error: detail.error };
+      }));
+      const queued = results.filter((result) => result.ok).length;
+      const firstError = results.find((result) => !result.ok)?.error;
+      setMessage(queued
+        ? `${queued} analytics refresh${queued === 1 ? "" : "es"} queued for the owning extension${firstError ? "; some could not be queued" : "."}`
+        : firstError ?? "Could not queue analytics refresh.");
+    } catch {
+      setMessage("Could not queue analytics refresh.");
+    } finally {
       setRefreshing(false);
-      if (!detail?.ok) {
-        setMessage(detail?.error ?? "Connect the PostFlow extension to refresh analytics.");
-        return;
-      }
-      const results = detail.results ?? [];
-      const succeeded = results.filter((item) => item.result?.status === "SUCCESS").length;
-      const failed = results.length - succeeded;
-      setMessage(`${succeeded} refreshed${failed ? `, ${failed} failed` : ""}.`);
-      if (succeeded) window.setTimeout(() => window.location.reload(), 700);
-    };
-    window.addEventListener("postflow:engagement-sync-finished", onFinished);
-    return () => window.removeEventListener("postflow:engagement-sync-finished", onFinished);
-  }, []);
+    }
+  }
 
   return (
     <div className="flex items-center gap-2">
       <Button type="button" variant="outline" size="sm" disabled={refreshing} onClick={() => {
-        setRefreshing(true);
-        setMessage(null);
-        window.dispatchEvent(new CustomEvent("postflow:sync-post-engagement", { detail: { postId } }));
+        void refreshAll();
       }}>
         <RefreshCw className={refreshing ? "animate-spin" : ""} />
         {refreshing ? "Refreshing all..." : "Refresh all analytics"}

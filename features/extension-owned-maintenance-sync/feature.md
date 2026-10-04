@@ -264,9 +264,11 @@ Legacy user-wide fallback behavior must not be used by extension worker APIs.
 
 ## Safe Manual Refresh
 
-The website must send only the requested job ID to the extension.
+The website must send only the requested job ID and maintenance type to the
+authenticated web API. The web API stores a durable maintenance request on the
+job; it must not depend on the browser profile where the dashboard is open.
 
-It must not be the source of truth for:
+The website and clicking extension must not be the source of truth for:
 
 - Facebook post URL.
 - Group URL.
@@ -274,12 +276,17 @@ It must not be the source of truth for:
 - Connection ownership.
 - Eligibility state.
 
-The extension must first request an ownership-scoped claim from the backend.
-Only after a successful claim may it open the authoritative Facebook URL
-returned by the backend.
+The extension assigned to the job's Facebook connection polls a
+connection-scoped maintenance queue. It first claims the requested job from
+the backend, then opens the authoritative Facebook URL returned by the claim.
 
-If the current extension does not own the job, the UI should report that the
-post belongs to another Facebook connection and perform no Facebook navigation.
+The request remains queued if the owning extension is offline. The dashboard
+may report that it is waiting for the owning extension; it must not attempt to
+route through another extension instance.
+
+The profile where the dashboard is open does not need to own the job and must
+not receive the job's Facebook URL or counters. Only the owning extension can
+claim, inspect, and update it.
 
 Manual and automatic refresh must reuse the same check and persistence logic.
 

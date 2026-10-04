@@ -475,6 +475,7 @@ describe('JobsController maintenance claims', () => {
       _id: { toString: () => 'job-1' },
       targetType: PublishingTargetType.GROUP,
       postUrl: 'https://www.facebook.com/groups/group-1/posts/1/',
+      save: jest.fn().mockResolvedValue(undefined),
       maintenanceClaimToken: 'claim-engagement',
     };
     const { controller, findOneAndUpdate } = createController(claimedJob);
@@ -522,6 +523,7 @@ describe('JobsController manual maintenance claims', () => {
       submissionStatus: FacebookSubmissionStatus.PUBLISHED,
       targetType: PublishingTargetType.GROUP,
       postUrl: 'https://www.facebook.com/groups/group-1/posts/1/',
+      save: jest.fn().mockResolvedValue(undefined),
     };
     const claimedJob = {
       ...sourceJob,
@@ -577,8 +579,39 @@ describe('JobsController manual maintenance claims', () => {
     );
   });
 
+  it('queues a dashboard maintenance request without an extension header', async () => {
+    const { controller } = createController({
+      _id: connectionObjectId,
+      extensionInstanceId,
+      status: 'CONNECTED',
+      facebookSessionDetected: true,
+      facebookUserId: 'facebook-user-1',
+      detectedFacebookUserId: 'facebook-user-1',
+    });
+
+    await expect(
+      controller.requestMaintenance(
+        clerkUserId,
+        'job-1',
+        { type: MaintenanceClaimType.ENGAGEMENT },
+      ),
+    ).resolves.toMatchObject({
+      id: 'job-1',
+      type: MaintenanceClaimType.ENGAGEMENT,
+      status: 'QUEUED',
+      requestedAt: expect.any(String),
+    });
+  });
+
   it('rejects a foreign connection before attempting a claim', async () => {
-    const { controller, findOneAndUpdate } = createController(null);
+    const { controller, findOneAndUpdate } = createController({
+      _id: { toString: () => 'connection-2' },
+      extensionInstanceId,
+      status: 'CONNECTED',
+      facebookSessionDetected: true,
+      facebookUserId: 'facebook-user-2',
+      detectedFacebookUserId: 'facebook-user-2',
+    });
 
     await expect(
       controller.claimMaintenanceJob(
@@ -588,6 +621,22 @@ describe('JobsController manual maintenance claims', () => {
         { type: MaintenanceClaimType.ENGAGEMENT },
       ),
     ).rejects.toThrow('Job is assigned to another Facebook connection');
+    expect(findOneAndUpdate).not.toHaveBeenCalled();
+  });
+
+  it('reports an unverified current extension separately', async () => {
+    const { controller, findOneAndUpdate } = createController(null);
+
+    await expect(
+      controller.claimMaintenanceJob(
+        clerkUserId,
+        extensionInstanceId,
+        'job-1',
+        { type: MaintenanceClaimType.ENGAGEMENT },
+      ),
+    ).rejects.toThrow(
+      'Extension instance is not linked to a verified Facebook connection',
+    );
     expect(findOneAndUpdate).not.toHaveBeenCalled();
   });
 });

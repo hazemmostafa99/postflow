@@ -213,9 +213,17 @@ window.addEventListener('postflow:sync-pending-post', (event) => {
 });
 
 window.addEventListener('postflow:sync-post-engagement', (event) => {
-  if (!isExtensionAlive()) return;
+  if (!isExtensionAlive()) {
+    window.dispatchEvent(new CustomEvent('postflow:engagement-sync-finished', {
+      detail: { ok: false, error: 'Extension disconnected; refresh the PostFlow page.' },
+    }));
+    return;
+  }
   try {
     const post = (event as CustomEvent<{ id?: string; postId?: string }>).detail;
+    console.log('[PostFlow] Manual engagement request received', {
+      jobId: post?.id ?? post?.postId ?? null,
+    });
     chrome.runtime.sendMessage(
       post?.id
         ? { type: 'TRIGGER_SINGLE_ENGAGEMENT_SYNC', postId: post.id }
@@ -229,5 +237,8 @@ window.addEventListener('postflow:sync-post-engagement', (event) => {
     );
   } catch {
     isContextValid = false;
+    window.dispatchEvent(new CustomEvent('postflow:engagement-sync-finished', {
+      detail: { ok: false, error: 'Extension disconnected; refresh the PostFlow page.' },
+    }));
   }
 });

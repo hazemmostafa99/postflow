@@ -18,8 +18,12 @@ const REGISTER_RETRY_ALARM = 'postflow-register-retry';
 const REGISTER_RETRY_DELAY_MINUTES = 1;
 const PENDING_POST_SYNC_ALARM = 'postflow-pending-post-sync';
 const PENDING_POST_SYNC_INTERVAL_MINUTES = 10;
+const MANUAL_MAINTENANCE_ALARM = 'postflow-manual-maintenance';
+const MANUAL_MAINTENANCE_INTERVAL_MINUTES = 1;
 const ENGAGEMENT_SYNC_ALARM = 'postflow-engagement-sync';
 const ENGAGEMENT_SYNC_INTERVAL_MINUTES = 30;
+const MAINTENANCE_BATCH_LIMIT = 3;
+const MAINTENANCE_EXECUTION_BUDGET_MS = 45_000;
 const EXTENSION_INSTANCE_ID_KEY = 'extensionInstanceId';
 const EXTENSION_NAME_KEY = 'extensionName';
 const TAB_ACTION_RETRY_COUNT = 6;
@@ -456,6 +460,7 @@ async function reportSession(sessionDetected: boolean, facebookUserId?: string |
     if (facebookIdentityVerified) {
       console.log('[PostFlow] Facebook identity verified:', connection?.facebookUserId);
       void checkPendingJobs();
+      void syncManualMaintenanceRequests();
     } else {
       console.warn('[PostFlow] Facebook identity verification failed', {
         sessionDetected,
@@ -2201,13 +2206,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 let isPendingBatchRunning = false;
 
 /** Fetch and process a small pending-post batch without opening concurrent tabs. */
-async function syncPendingPostsBatch(): Promise<Array<{ postId: string; result: PendingPostSyncResult; updated: boolean }>> {
+async function syncPendingPostsBatch(
+  manualOnly = false,
+  maxItems = MAINTENANCE_BATCH_LIMIT,
+): Promise<Array<{ postId: string; result: PendingPostSyncResult; updated: boolean }>> {
   if (isPendingBatchRunning || isFacebookSyncBusy || isProcessingJob) return [];
   isPendingBatchRunning = true;
   isFacebookSyncBusy = true;
 
   try {
-    const pendingPosts = await apiFetch('/api/jobs/pending?limit=10');
+    const pendingPosts = await apiFetch(
+      `/api/jobs/pending?limit=${Math.min(MAINTENANCE_BATCH_LIMIT, Math.max(1, maxItems))}${manualOnly ? '&manualOnly=true' : ''}`,
+    );
     if (!Array.isArray(pendingPosts)) {
       console.warn('[PendingPostSync] Could not fetch pending posts');
       return [];
@@ -2375,14 +2385,21 @@ async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlread
   }
 }
 
-async function syncPublishedEngagementBatch(postId?: string) {
+async function syncPublishedEngagementBatch(
+  postId?: string,
+  manualOnly = false,
+  maxItems = MAINTENANCE_BATCH_LIMIT,
+) {
   if (isEngagementBatchRunning || isFacebookSyncBusy || isProcessingJob) return [];
   isEngagementBatchRunning = true;
   isFacebookSyncBusy = true;
   try {
-    const query = postId
-      ? `/api/jobs/engagement-pending?limit=50&postId=${encodeURIComponent(postId)}`
-      : '/api/jobs/engagement-pending?limit=10';
+    const queryParams = new URLSearchParams({
+      limit: String(Math.min(MAINTENANCE_BATCH_LIMIT, Math.max(1, maxItems))),
+      ...(postId ? { postId } : {}),
+      ...(manualOnly ? { manualOnly: 'true' } : {}),
+    });
+    const query = `/api/jobs/engagement-pending?${queryParams.toString()}`;
     const posts = await apiFetch(query);
     if (!Array.isArray(posts)) return [];
     const results = [];
@@ -2402,8 +2419,92 @@ async function syncPublishedEngagementBatch(postId?: string) {
   }
 }
 
+type MaintenanceCoordinatorOptions = {
+  manualOnly?: boolean;
+  pending?: boolean;
+  analytics?: boolean;
+  postId?: string;
+};
+
+let isMaintenanceCoordinatorRunning = false;
+
+/** Give new publishing work a chance between maintenance items. */
+async function yieldMaintenanceToPublishing(deadline: number): Promise<boolean> {
+  if (Date.now() >= deadline) return false;
+  const previousBusyState = isFacebookSyncBusy;
+  isFacebookSyncBusy = false;
+  try {
+    await checkPendingJobs();
+    return Date.now() < deadline;
+  } finally {
+    isFacebookSyncBusy = previousBusyState;
+  }
+}
+
+/** Run maintenance in priority order with one navigation at a time. */
+async function runMaintenanceCoordinator(
+  options: MaintenanceCoordinatorOptions = {},
+) {
+  if (
+    isMaintenanceCoordinatorRunning ||
+    isProcessingJob ||
+    isFacebookSyncBusy ||
+    !facebookIdentityVerified
+  ) {
+    return [];
+  }
+
+  const {
+    manualOnly = false,
+    pending = true,
+    analytics = false,
+    postId,
+  } = options;
+  isMaintenanceCoordinatorRunning = true;
+  const startedAt = Date.now();
+  const deadline = startedAt + MAINTENANCE_EXECUTION_BUDGET_MS;
+  const results: unknown[] = [];
+  console.log('[Maintenance] Coordinator started', {
+    manualOnly,
+    pending,
+    analytics,
+    postId: postId ?? null,
+  });
+  try {
+    for (const workType of (pending ? ['pending', ...(analytics ? ['analytics'] : [])] : analytics ? ['analytics'] : [])) {
+      for (let index = 0; index < MAINTENANCE_BATCH_LIMIT; index += 1) {
+        if (!(await yieldMaintenanceToPublishing(deadline))) return results;
+        const batch = workType === 'pending'
+          ? await syncPendingPostsBatch(manualOnly, 1)
+          : await syncPublishedEngagementBatch(postId, manualOnly, 1);
+        if (!batch.length) break;
+        results.push(...batch);
+      }
+    }
+    console.log('[Maintenance] Coordinator completed', {
+      processed: results.length,
+      elapsedMs: Date.now() - startedAt,
+    });
+    return results;
+  } finally {
+    isMaintenanceCoordinatorRunning = false;
+  }
+}
+
+/** Process dashboard requests that belong to this extension's connection. */
+async function syncManualMaintenanceRequests() {
+  return runMaintenanceCoordinator({
+    manualOnly: true,
+    pending: true,
+    analytics: true,
+  });
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === 'TRIGGER_SINGLE_ENGAGEMENT_SYNC' && typeof message.postId === 'string') {
+    console.log('[PostAnalytics] Manual engagement request received', {
+      postId: message.postId,
+    });
     void (async () => {
       const claimedPost = await apiFetch(
         `/api/jobs/${encodeURIComponent(message.postId)}/maintenance-claim`,
@@ -2436,7 +2537,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
   if (message.type !== 'TRIGGER_ENGAGEMENT_SYNC') return;
-  void syncPublishedEngagementBatch(typeof message.postId === 'string' ? message.postId : undefined)
+  void runMaintenanceCoordinator({
+    pending: false,
+    analytics: true,
+    postId: typeof message.postId === 'string' ? message.postId : undefined,
+  })
     .then((results) => sendResponse({ ok: true, results }))
     .catch((err) => sendResponse({ ok: false, error: err?.message ?? 'Engagement sync failed' }));
   return true;
@@ -2444,7 +2549,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type !== 'TRIGGER_PENDING_POST_SYNC') return;
-  void syncPendingPostsBatch()
+  void runMaintenanceCoordinator({ pending: true })
     .then((results) => sendResponse({ ok: true, results }))
     .catch((err) => sendResponse({ ok: false, error: err?.message ?? 'Pending post batch failed' }));
   return true;
@@ -2457,6 +2562,9 @@ chrome.alarms.create(HEARTBEAT_ALARM, {
 });
 chrome.alarms.create(PENDING_POST_SYNC_ALARM, {
   periodInMinutes: PENDING_POST_SYNC_INTERVAL_MINUTES,
+});
+chrome.alarms.create(MANUAL_MAINTENANCE_ALARM, {
+  periodInMinutes: MANUAL_MAINTENANCE_INTERVAL_MINUTES,
 });
 // Remove state left by the retired English-video retry experiment. The
 // finalized flow performs one fresh-tab reconciliation immediately.
@@ -2477,7 +2585,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     checkPendingJobs(); // Also check jobs on heartbeat
   }
   if (alarm.name === PENDING_POST_SYNC_ALARM) {
-    void syncPendingPostsBatch();
+    void runMaintenanceCoordinator({ pending: true });
+  }
+  if (alarm.name === MANUAL_MAINTENANCE_ALARM) {
+    void syncManualMaintenanceRequests();
   }
 });
 

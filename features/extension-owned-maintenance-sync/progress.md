@@ -246,9 +246,10 @@ Demonstrate that concurrent requests cannot claim the same maintenance job.
 
 ### Checklist
 
-- [x] Change the website event payload to contain only the job ID.
+- [x] Change the dashboard request to contain only the job ID and type.
 - [x] Remove trust in website-provided Facebook and Group URLs.
-- [x] Claim the requested job through the ownership-scoped backend API.
+- [x] Queue the request through the authenticated web API and claim it through
+  the ownership-scoped worker API.
 - [x] Navigate only after a successful claim.
 - [x] Return a useful message when another connection owns the job.
 - [x] Perform no Facebook navigation for foreign or invalid job IDs.
@@ -259,7 +260,7 @@ Demonstrate that concurrent requests cannot claim the same maintenance job.
 ### Review Notes
 
 ```text
-Status: IMPLEMENTED — awaiting manual two-profile validation
+Status: IMPLEMENTED — cross-profile queue added; awaiting manual validation
 
 Website payload:
 
@@ -267,18 +268,24 @@ Website payload:
 
 Backend validation:
 
-- `POST /api/jobs/:id/maintenance-claim` verifies the authenticated extension
-  instance, durable connection ownership, eligibility, and active lease state.
+- `POST /api/jobs/:id/maintenance-request` queues a dashboard request using
+  the authenticated web user without exposing job data to the clicking profile.
+- The owning extension polls a connection-scoped queue and then uses
+  `POST /api/jobs/:id/maintenance-claim` to verify ownership, eligibility, and
+  active lease state.
 
 Extension behavior:
 
-- The extension claims authoritative job metadata first and only then opens a
-  Facebook tab. Foreign or invalid jobs are rejected before navigation.
+- The owning extension polls manual requests every minute, claims authoritative
+  job metadata, and only then opens a Facebook tab.
+- Requests remain queued while the owning extension is offline.
 
 Tests:
 
 - API jobs controller tests pass; API, extension, and web builds pass.
-- Manual browser validation is still required and has not been claimed.
+- User validation confirmed a dashboard request was processed by the owning
+  profile: the owner opened the post, completed the engagement check, and
+  persisted it with `updated: true`; the other profile processed zero jobs.
 ```
 
 ### Review Gate
@@ -291,39 +298,50 @@ Verify a foreign job ID cannot cause the extension to open Facebook.
 
 ### Checklist
 
-- [ ] Create a single coordinator for Facebook maintenance work.
-- [ ] Keep the local single-flight navigation guard.
-- [ ] Give new publishing jobs highest priority.
-- [ ] Run pending approval before analytics.
-- [ ] Check for publishing work between maintenance items.
-- [ ] Stop maintenance when publishing work becomes available.
-- [ ] Process maintenance jobs sequentially.
-- [ ] Limit automatic pending work to three items initially.
-- [ ] Limit automatic analytics work to three items initially.
-- [ ] Add an execution-time budget.
-- [ ] Ensure alarms safely skip when another operation is active.
-- [ ] Add priority and overlap tests where practical.
+- [x] Create a single coordinator for Facebook maintenance work.
+- [x] Keep the local single-flight navigation guard.
+- [x] Give new publishing jobs highest priority.
+- [x] Run pending approval before analytics.
+- [x] Check for publishing work between maintenance items.
+- [x] Stop maintenance when publishing work becomes available.
+- [x] Process maintenance jobs sequentially.
+- [x] Limit automatic pending work to three items initially.
+- [x] Limit automatic analytics work to three items initially.
+- [x] Add an execution-time budget.
+- [x] Ensure alarms safely skip when another operation is active.
+- [x] Add priority and overlap tests where practical.
 
 ### Review Notes
 
 ```text
-Status: NOT STARTED
+Status: IMPLEMENTED — awaiting review and live validation
 
 Coordinator entry point:
 
--
+- `runMaintenanceCoordinator()` in the extension service worker.
 
 Priority behavior:
 
--
+- Publishing is checked before every maintenance item. Pending approval is
+  processed before engagement analytics. A new publishing job is run before
+  the next maintenance item.
 
 Batch/time limits:
 
--
+- Three items per maintenance type and a 45-second execution budget. Queue
+  alarms skip when publishing or another maintenance navigation is active.
 
 Tests:
 
--
+- Extension typecheck/build passes. Background coordinator behavior depends on
+  Chrome APIs, so live multi-job priority validation remains required.
+
+Manual validation:
+
+- User logs confirmed the owner coordinator processed one analytics request in
+  7.4 seconds and the foreign profile processed zero requests.
+- Publishing-priority and multi-job sequential behavior still need a dedicated
+  run.
 ```
 
 ### Review Gate
@@ -613,7 +631,7 @@ Cleanup:
 | 3. Strict worker authorization | Complete | Pending manual validation |
 | 4. Atomic maintenance claims | Complete | Pending manual validation |
 | 5. Safe manual refresh | Implemented | Pending manual two-profile validation |
-| 6. Maintenance coordinator | Not started | No |
+| 6. Maintenance coordinator | Implemented | Pending manual two-profile validation |
 | 7. Pending-approval scheduler | Not started | No |
 | 8. Engagement analytics scheduler | Not started | No |
 | 9. Diagnostics and operational safety | Not started | No |
@@ -626,11 +644,10 @@ Cleanup:
 ## Current Status
 
 ```text
-Status: Phase 5 implementation complete; awaiting manual validation.
-Current phase: Phase 5 review gate.
-Next action: Reload the extension in both Chrome profiles and verify a foreign
-single-post refresh is rejected before Facebook navigation, while the owning
-profile can refresh successfully.
+Status: Phase 6 implementation complete; awaiting manual validation.
+Current phase: Phase 6 review gate.
+Next action: Validate that publishing work takes priority and that maintenance
+requests run sequentially in the owning profile without cross-profile access.
 ```
 
 ---
