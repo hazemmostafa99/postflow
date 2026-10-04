@@ -565,9 +565,6 @@ export class JobsController {
             )
           : {
               $or: [
-                this.manualMaintenanceRequestFilter(
-                  MaintenanceClaimType.PENDING_APPROVAL,
-                ),
                 { nextCheckAt: { $exists: false } },
                 { nextCheckAt: null },
                 { nextCheckAt: { $lte: now } },

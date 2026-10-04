@@ -354,15 +354,15 @@ Confirm maintenance cannot monopolize or interrupt publishing.
 
 ### Checklist
 
-- [ ] Retain the backend age-based pending schedule.
-- [ ] Wake the pending scheduler every 10 minutes.
-- [ ] Add deterministic per-instance startup jitter.
-- [ ] Claim only due pending jobs.
-- [ ] Preserve `PENDING_APPROVAL` on not-found and technical failure.
-- [ ] Double failed-attempt delay, capped at 24 hours.
-- [ ] Release claims after every accepted result.
-- [ ] Confirm restart recovery through lease expiry.
-- [ ] Add schedule boundary tests.
+- [x] Retain the backend age-based pending schedule.
+- [x] Wake the pending scheduler every 10 minutes.
+- [x] Add deterministic per-instance startup jitter.
+- [x] Claim only due pending jobs.
+- [x] Preserve `PENDING_APPROVAL` on not-found and technical failure.
+- [x] Double failed-attempt delay, capped at 24 hours.
+- [x] Release claims after every accepted result.
+- [x] Confirm restart recovery through lease expiry.
+- [x] Add schedule boundary tests.
 
 ### Approved Cadence
 
@@ -377,19 +377,43 @@ Older than 7 days: 24 hours
 ### Review Notes
 
 ```text
-Status: NOT STARTED
+Status: IMPLEMENTED — awaiting two-profile manual validation
 
 Alarm configuration:
 
--
+- Pending approval wakes every 10 minutes.
+- The first wake uses a deterministic 0–2 minute offset derived from the
+  persisted extension instance ID. The alarm is not moved on service-worker
+  restarts once initialized.
+- Manual maintenance remains on its one-minute queue wake.
+
+Queue selection:
+
+- Scheduled pending work is selected only when `nextCheckAt` is missing or due.
+- A durable dashboard request is an explicit manual override and is selected
+  by the manual-only queue, even when the normal age schedule is not due.
 
 Jitter strategy:
 
--
+- FNV-1a-style hashing maps the stable extension instance ID into the inclusive
+  0–2 minute window. The ID itself is not logged.
 
 Tests:
 
--
+- `pending-sync-schedule.spec.ts` covers every age-band boundary and failure
+  backoff/cap behavior.
+- `maintenance-schedule.test.cjs` covers deterministic jitter and first-run
+  calculation.
+- API schedule tests and the extension build pass. The extension test runner
+  remains subject to the environment's existing `spawn EPERM` limitation.
+
+Manual validation required:
+
+- Run two Chrome profiles with different extension instances and one pending
+  job assigned to each. Capture the owner profile's pending scheduler wake and
+  confirm the foreign profile does not claim or open the post.
+- Stop the owner profile after a claim, wait for the five-minute lease to
+  expire, restart it, and confirm the job can be claimed and completed once.
 ```
 
 ### Review Gate
@@ -632,7 +656,7 @@ Cleanup:
 | 4. Atomic maintenance claims | Complete | Pending manual validation |
 | 5. Safe manual refresh | Implemented | Pending manual two-profile validation |
 | 6. Maintenance coordinator | Implemented | Pending manual two-profile validation |
-| 7. Pending-approval scheduler | Not started | No |
+| 7. Pending-approval scheduler | Implemented | Pending manual two-profile validation |
 | 8. Engagement analytics scheduler | Not started | No |
 | 9. Diagnostics and operational safety | Not started | No |
 | 10. Automated verification | Not started | No |
@@ -644,10 +668,10 @@ Cleanup:
 ## Current Status
 
 ```text
-Status: Phase 6 implementation complete; awaiting manual validation.
-Current phase: Phase 6 review gate.
-Next action: Validate that publishing work takes priority and that maintenance
-requests run sequentially in the owning profile without cross-profile access.
+Status: Phase 7 implementation complete; awaiting manual validation.
+Current phase: Phase 7 review gate.
+Next action: Validate the ten-minute pending scheduler in two Chrome profiles,
+including lease recovery after the owning profile restarts.
 ```
 
 ---

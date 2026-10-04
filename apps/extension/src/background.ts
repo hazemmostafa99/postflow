@@ -9,6 +9,10 @@ import {
   type ProfileFeedPublishTarget,
   type PublishJob,
 } from './publishing-target.js';
+import {
+  getMaintenanceAlarmFirstRunAt,
+  getMaintenanceStartupJitterMs,
+} from './maintenance-schedule.js';
 
 console.info(`[PostFlow] ${BUILD_ENV === 'production' ? 'PROD' : 'DEV'} environment | API: ${API_BASE_URL}`);
 
@@ -24,6 +28,7 @@ const ENGAGEMENT_SYNC_ALARM = 'postflow-engagement-sync';
 const ENGAGEMENT_SYNC_INTERVAL_MINUTES = 30;
 const MAINTENANCE_BATCH_LIMIT = 3;
 const MAINTENANCE_EXECUTION_BUDGET_MS = 45_000;
+const PENDING_POST_SYNC_ALARM_INITIALIZED_KEY = 'pendingPostSyncAlarmInitialized';
 const EXTENSION_INSTANCE_ID_KEY = 'extensionInstanceId';
 const EXTENSION_NAME_KEY = 'extensionName';
 const TAB_ACTION_RETRY_COUNT = 6;
@@ -2557,15 +2562,55 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 // ── Alarms ──
 
+/**
+ * Keep the ten-minute pending wake persistent across service-worker restarts,
+ * but spread the first wake for each installation by a stable 0–2 minute
+ * offset. The storage marker prevents a service-worker restart from moving an
+ * already scheduled alarm back to "now + jitter".
+ */
+async function ensureMaintenanceAlarms(): Promise<void> {
+  const existingPendingAlarm = await chrome.alarms.get(PENDING_POST_SYNC_ALARM);
+  const stored = await chrome.storage.local.get(
+    PENDING_POST_SYNC_ALARM_INITIALIZED_KEY,
+  );
+  const pendingAlarmInitialized =
+    stored[PENDING_POST_SYNC_ALARM_INITIALIZED_KEY] === true;
+
+  if (
+    !existingPendingAlarm ||
+    existingPendingAlarm.periodInMinutes !== PENDING_POST_SYNC_INTERVAL_MINUTES ||
+    !pendingAlarmInitialized
+  ) {
+    const extensionInstanceId = await getExtensionInstanceId();
+    const jitterMs = getMaintenanceStartupJitterMs(extensionInstanceId);
+    chrome.alarms.create(PENDING_POST_SYNC_ALARM, {
+      when: getMaintenanceAlarmFirstRunAt(extensionInstanceId),
+      periodInMinutes: PENDING_POST_SYNC_INTERVAL_MINUTES,
+    });
+    await chrome.storage.local.set({
+      [PENDING_POST_SYNC_ALARM_INITIALIZED_KEY]: true,
+    });
+    console.log('[Maintenance] Pending scheduler armed', {
+      intervalMinutes: PENDING_POST_SYNC_INTERVAL_MINUTES,
+      jitterMs,
+    });
+  }
+
+  const existingManualAlarm = await chrome.alarms.get(MANUAL_MAINTENANCE_ALARM);
+  if (
+    !existingManualAlarm ||
+    existingManualAlarm.periodInMinutes !== MANUAL_MAINTENANCE_INTERVAL_MINUTES
+  ) {
+    chrome.alarms.create(MANUAL_MAINTENANCE_ALARM, {
+      periodInMinutes: MANUAL_MAINTENANCE_INTERVAL_MINUTES,
+    });
+  }
+}
+
 chrome.alarms.create(HEARTBEAT_ALARM, {
   periodInMinutes: HEARTBEAT_INTERVAL_MINUTES,
 });
-chrome.alarms.create(PENDING_POST_SYNC_ALARM, {
-  periodInMinutes: PENDING_POST_SYNC_INTERVAL_MINUTES,
-});
-chrome.alarms.create(MANUAL_MAINTENANCE_ALARM, {
-  periodInMinutes: MANUAL_MAINTENANCE_INTERVAL_MINUTES,
-});
+void ensureMaintenanceAlarms();
 // Remove state left by the retired English-video retry experiment. The
 // finalized flow performs one fresh-tab reconciliation immediately.
 void chrome.alarms.clear('postflow-english-video-link-sync');
