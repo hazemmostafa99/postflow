@@ -10,7 +10,7 @@ interface EngagementResult {
   error?: string;
 }
 
-export function RefreshPostEngagementButton({ postId, postUrl }: { postId: string; postUrl: string }) {
+export function RefreshPostEngagementButton({ postId }: { postId: string }) {
   const [refreshing, setRefreshing] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
@@ -36,7 +36,7 @@ export function RefreshPostEngagementButton({ postId, postUrl }: { postId: strin
     setRefreshing(true);
     setMessage(null);
     window.dispatchEvent(new CustomEvent("postflow:sync-post-engagement", {
-      detail: { id: postId, postUrl },
+      detail: { id: postId },
     }));
   }
 

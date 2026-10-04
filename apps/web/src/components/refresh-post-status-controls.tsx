@@ -23,7 +23,7 @@ interface RefreshResultEvent {
 }
 
 function refreshJob(job: RefreshJob) {
-  window.dispatchEvent(new CustomEvent("postflow:sync-pending-post", { detail: job }));
+  window.dispatchEvent(new CustomEvent("postflow:sync-pending-post", { detail: { id: job.id } }));
 }
 
 export function RefreshPostStatusControls({

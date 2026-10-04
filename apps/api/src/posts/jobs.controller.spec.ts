@@ -340,13 +340,14 @@ describe('JobsController target-specific sync guards', () => {
   }
 
   it('persists engagement sync for a published profile job', async () => {
-    const { controller, profileJob } = createProfileController();
+    const { controller, profileJob } = createProfileController({ claimed: true });
 
     await expect(
       controller.updateEngagement('clerk-user-1', extensionInstanceId, 'job-1', {
         status: 'SUCCESS',
         reactionCount: 1,
         commentCount: 2,
+        claimToken: 'claim-token',
       }),
     ).resolves.toBe(profileJob);
     expect((profileJob as { engagement?: unknown }).engagement).toMatchObject({
@@ -496,5 +497,97 @@ describe('JobsController maintenance claims', () => {
       maintenanceClaimedByExtensionInstanceId: extensionInstanceId,
       maintenanceClaimType: MaintenanceClaimType.ENGAGEMENT,
     });
+  });
+});
+
+describe('JobsController manual maintenance claims', () => {
+  const clerkUserId = 'clerk-user-1';
+  const extensionInstanceId = 'extension-1';
+  const connectionObjectId = { toString: () => 'connection-1' };
+
+  function chain<T>(result: T) {
+    return {
+      populate: jest.fn().mockReturnThis(),
+      lean: jest.fn().mockReturnThis(),
+      exec: jest.fn().mockResolvedValue(result),
+    };
+  }
+
+  function createController(connection: Record<string, unknown> | null) {
+    const sourceJob = {
+      _id: { toString: () => 'job-1' },
+      postId: { clerkUserId },
+      facebookConnectionId: connectionObjectId,
+      status: PublishingJobStatus.SUCCESS,
+      submissionStatus: FacebookSubmissionStatus.PUBLISHED,
+      targetType: PublishingTargetType.GROUP,
+      postUrl: 'https://www.facebook.com/groups/group-1/posts/1/',
+    };
+    const claimedJob = {
+      ...sourceJob,
+      postId: { content: 'hello', mediaUrls: [] },
+      maintenanceClaimToken: 'claim-token',
+    };
+    const findOneAndUpdate = jest.fn().mockReturnValue(chain(claimedJob));
+    const jobModel = {
+      findById: jest.fn().mockReturnValue(chain(sourceJob)),
+      findOneAndUpdate,
+    };
+    const connectionModel = {
+      findOne: jest.fn().mockReturnValue(chain(connection)),
+    };
+    return {
+      controller: new JobsController(
+        jobModel as never,
+        {} as never,
+        connectionModel as never,
+      ),
+      findOneAndUpdate,
+    };
+  }
+
+  it('returns authoritative engagement data after an owner claim', async () => {
+    const { controller, findOneAndUpdate } = createController({
+      _id: connectionObjectId,
+      extensionInstanceId,
+      status: 'CONNECTED',
+      facebookSessionDetected: true,
+      facebookUserId: 'facebook-user-1',
+      detectedFacebookUserId: 'facebook-user-1',
+    });
+
+    await expect(
+      controller.claimMaintenanceJob(
+        clerkUserId,
+        extensionInstanceId,
+        'job-1',
+        { type: MaintenanceClaimType.ENGAGEMENT },
+      ),
+    ).resolves.toMatchObject({
+      id: 'job-1',
+      postUrl: 'https://www.facebook.com/groups/group-1/posts/1/',
+      claimToken: expect.any(String),
+    });
+    expect(findOneAndUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ _id: expect.anything(), facebookConnectionId: connectionObjectId }),
+      expect.objectContaining({ $set: expect.objectContaining({
+        maintenanceClaimType: MaintenanceClaimType.ENGAGEMENT,
+      }) }),
+      { new: true },
+    );
+  });
+
+  it('rejects a foreign connection before attempting a claim', async () => {
+    const { controller, findOneAndUpdate } = createController(null);
+
+    await expect(
+      controller.claimMaintenanceJob(
+        clerkUserId,
+        extensionInstanceId,
+        'job-1',
+        { type: MaintenanceClaimType.ENGAGEMENT },
+      ),
+    ).rejects.toThrow('Job is assigned to another Facebook connection');
+    expect(findOneAndUpdate).not.toHaveBeenCalled();
   });
 });

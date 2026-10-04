@@ -178,7 +178,7 @@ window.addEventListener('postflow:check-jobs', () => {
   safeSend({ type: 'TRIGGER_JOB_CHECK' });
 });
 
-function triggerPendingPostSync(post?: PendingFacebookPost) {
+function triggerPendingPostSync(postId?: string) {
   if (!isExtensionAlive()) {
     window.dispatchEvent(new CustomEvent('postflow:pending-sync-finished', {
       detail: { ok: false, error: 'Extension disconnected' },
@@ -186,14 +186,14 @@ function triggerPendingPostSync(post?: PendingFacebookPost) {
     return;
   }
 
-  const message = post
-    ? { type: 'TRIGGER_SINGLE_PENDING_SYNC', post }
+  const message = postId
+    ? { type: 'TRIGGER_SINGLE_PENDING_SYNC', postId }
     : { type: 'TRIGGER_PENDING_POST_SYNC' };
   try {
     chrome.runtime.sendMessage(message, (response) => {
       const error = chrome.runtime.lastError?.message;
       window.dispatchEvent(new CustomEvent('postflow:pending-sync-finished', {
-        detail: error ? { ok: false, error, postId: post?.id } : { ...response, postId: post?.id },
+        detail: error ? { ok: false, error, postId } : { ...response, postId },
       }));
     });
   } catch {
@@ -208,17 +208,17 @@ function triggerPendingPostSync(post?: PendingFacebookPost) {
 // sync commands as automatic scheduling and return their result to the page.
 window.addEventListener('postflow:sync-pending-posts', () => triggerPendingPostSync());
 window.addEventListener('postflow:sync-pending-post', (event) => {
-  const post = (event as CustomEvent<PendingFacebookPost>).detail;
-  if (post?.id) triggerPendingPostSync(post);
+  const post = (event as CustomEvent<{ id?: string }>).detail;
+  if (post?.id) triggerPendingPostSync(post.id);
 });
 
 window.addEventListener('postflow:sync-post-engagement', (event) => {
   if (!isExtensionAlive()) return;
   try {
-    const post = (event as CustomEvent<{ id?: string; postUrl?: string; postId?: string }>).detail;
+    const post = (event as CustomEvent<{ id?: string; postId?: string }>).detail;
     chrome.runtime.sendMessage(
-      post?.id && post?.postUrl
-        ? { type: 'TRIGGER_SINGLE_ENGAGEMENT_SYNC', post }
+      post?.id
+        ? { type: 'TRIGGER_SINGLE_ENGAGEMENT_SYNC', postId: post.id }
         : { type: 'TRIGGER_ENGAGEMENT_SYNC', postId: post?.postId },
       (response) => {
         const error = chrome.runtime.lastError?.message;

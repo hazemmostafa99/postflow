@@ -200,7 +200,7 @@ Verify an extension cannot read or update another connection's jobs.
 ### Review Notes
 
 ```text
-Status: COMPLETE — automatic claim path implemented; manual claim integration remains Phase 5.
+Status: COMPLETE
 
 Lease model:
 
@@ -232,10 +232,8 @@ Tests:
 
 Compatibility note:
 
-- An unclaimed, owner-validated manual result remains accepted temporarily so
-  the existing website refresh flow is not broken. Phase 5 will make manual
-  refresh claim authoritative data before Facebook navigation and then make
-  claim tokens mandatory for every maintenance result.
+- Manual refresh now claims authoritative job data before Facebook navigation.
+- Maintenance result writes require a matching claim token.
 ```
 
 ### Review Gate
@@ -248,36 +246,39 @@ Demonstrate that concurrent requests cannot claim the same maintenance job.
 
 ### Checklist
 
-- [ ] Change the website event payload to contain only the job ID.
-- [ ] Remove trust in website-provided Facebook and Group URLs.
-- [ ] Claim the requested job through the ownership-scoped backend API.
-- [ ] Navigate only after a successful claim.
-- [ ] Return a useful message when another connection owns the job.
-- [ ] Perform no Facebook navigation for foreign or invalid job IDs.
-- [ ] Reuse the same pending checker as automatic refresh.
-- [ ] Reuse the same engagement checker as automatic refresh.
-- [ ] Add manual-refresh ownership tests.
+- [x] Change the website event payload to contain only the job ID.
+- [x] Remove trust in website-provided Facebook and Group URLs.
+- [x] Claim the requested job through the ownership-scoped backend API.
+- [x] Navigate only after a successful claim.
+- [x] Return a useful message when another connection owns the job.
+- [x] Perform no Facebook navigation for foreign or invalid job IDs.
+- [x] Reuse the same pending checker as automatic refresh.
+- [x] Reuse the same engagement checker as automatic refresh.
+- [x] Add manual-refresh ownership tests.
 
 ### Review Notes
 
 ```text
-Status: NOT STARTED
+Status: IMPLEMENTED — awaiting manual two-profile validation
 
 Website payload:
 
--
+- Pending and analytics events now send only the job ID.
 
 Backend validation:
 
--
+- `POST /api/jobs/:id/maintenance-claim` verifies the authenticated extension
+  instance, durable connection ownership, eligibility, and active lease state.
 
 Extension behavior:
 
--
+- The extension claims authoritative job metadata first and only then opens a
+  Facebook tab. Foreign or invalid jobs are rejected before navigation.
 
 Tests:
 
--
+- API jobs controller tests pass; API, extension, and web builds pass.
+- Manual browser validation is still required and has not been claimed.
 ```
 
 ### Review Gate
@@ -611,7 +612,7 @@ Cleanup:
 | 2. Ownership migration and indexes | Complete | Pending approval |
 | 3. Strict worker authorization | Complete | Pending manual validation |
 | 4. Atomic maintenance claims | Complete | Pending manual validation |
-| 5. Safe manual refresh | Not started | No |
+| 5. Safe manual refresh | Implemented | Pending manual two-profile validation |
 | 6. Maintenance coordinator | Not started | No |
 | 7. Pending-approval scheduler | Not started | No |
 | 8. Engagement analytics scheduler | Not started | No |
@@ -625,9 +626,11 @@ Cleanup:
 ## Current Status
 
 ```text
-Status: Phase 4 implementation complete; awaiting review and manual validation.
-Current phase: Phase 4 review gate.
-Next action: Manually verify two extension instances cannot access each other's jobs or claim the same maintenance job, then begin Phase 5 safe manual refresh.
+Status: Phase 5 implementation complete; awaiting manual validation.
+Current phase: Phase 5 review gate.
+Next action: Reload the extension in both Chrome profiles and verify a foreign
+single-post refresh is rejected before Facebook navigation, while the owning
+profile can refresh successfully.
 ```
 
 ---

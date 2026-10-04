@@ -172,8 +172,15 @@ async function apiFetch(
           url,
           response: text.slice(0, 300),
         });
+        let message: string | undefined;
+        try {
+          const parsed = JSON.parse(text) as { message?: string };
+          message = typeof parsed.message === 'string' ? parsed.message : undefined;
+        } catch {
+          // Keep the compact status-only error for non-JSON responses.
+        }
         return includeFailureDetails
-          ? { apiFetchError: true, status: response.status }
+          ? { apiFetchError: true, status: response.status, message }
           : null;
       }
 
@@ -2156,16 +2163,36 @@ async function waitForFacebookTabAfterNavigation(tabId: number, targetUrl: strin
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.type !== 'TRIGGER_SINGLE_PENDING_SYNC' || !message.post) return;
-  void checkSinglePendingPost(message.post as PendingFacebookPost)
+  if (message.type !== 'TRIGGER_SINGLE_PENDING_SYNC' || typeof message.postId !== 'string') return;
+  void (async () => {
+    const claimedPost = await apiFetch(
+      `/api/jobs/${encodeURIComponent(message.postId)}/maintenance-claim`,
+      { type: 'PENDING_APPROVAL' },
+      'POST',
+      true,
+    );
+    if (!claimedPost || claimedPost.apiFetchError) {
+      const status = claimedPost?.status;
+      throw new Error(
+        typeof claimedPost?.message === 'string'
+          ? claimedPost.message
+          : status === 401
+            ? 'This post belongs to another Facebook connection.'
+            : 'Could not claim this pending post for the current extension.',
+      );
+    }
+    const post = claimedPost as PendingFacebookPost;
+    const result = await checkSinglePendingPost(post);
+    const updated = await persistPendingSyncResult(post, result);
+    return { post, result, updated };
+  })()
     .then(async (result) => {
-      const updated = await persistPendingSyncResult(message.post as PendingFacebookPost, result);
       console.log('[PendingPostSync] Single check persisted', {
-        postId: message.post.id,
-        status: result.status,
-        updated,
+        postId: result.post.id,
+        status: result.result.status,
+        updated: result.updated,
       });
-      sendResponse({ ok: true, result, updated });
+      sendResponse({ ok: true, result: result.result, updated: result.updated, postId: result.post.id });
     })
     .catch((err) => sendResponse({ ok: false, error: err?.message ?? 'Pending post sync failed' }));
   return true;
@@ -2211,7 +2238,6 @@ async function syncPendingPostsBatch(): Promise<Array<{ postId: string; result: 
 }
 
 async function persistPendingSyncResult(post: PendingFacebookPost, result: PendingPostSyncResult): Promise<boolean> {
-  if (result.status === 'CONTENT_MATCHED') return false;
   const response = await apiFetch(`/api/jobs/${post.id}/pending-sync`, {
     ...result,
     ...(post.claimToken ? { claimToken: post.claimToken } : {}),
@@ -2377,11 +2403,34 @@ async function syncPublishedEngagementBatch(postId?: string) {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.type === 'TRIGGER_SINGLE_ENGAGEMENT_SYNC' && message.post) {
-    void checkSinglePostEngagement(message.post as PublishedFacebookPost)
+  if (message.type === 'TRIGGER_SINGLE_ENGAGEMENT_SYNC' && typeof message.postId === 'string') {
+    void (async () => {
+      const claimedPost = await apiFetch(
+        `/api/jobs/${encodeURIComponent(message.postId)}/maintenance-claim`,
+        { type: 'ENGAGEMENT' },
+        'POST',
+        true,
+      );
+      if (!claimedPost || claimedPost.apiFetchError) {
+        const status = claimedPost?.status;
+        throw new Error(
+          typeof claimedPost?.message === 'string'
+            ? claimedPost.message
+            : status === 401
+              ? 'This post belongs to another Facebook connection.'
+              : 'Could not claim this post for the current extension.',
+        );
+      }
+      const post = claimedPost as PublishedFacebookPost;
+      const result = await checkSinglePostEngagement(post);
+      const updated = Boolean(await apiFetch(`/api/jobs/${post.id}/engagement`, {
+        ...result,
+        ...(post.claimToken ? { claimToken: post.claimToken } : {}),
+      }));
+      return { post, result, updated };
+    })()
       .then(async (result) => {
-        const updated = Boolean(await apiFetch(`/api/jobs/${message.post.id}/engagement`, result));
-        sendResponse({ ok: true, result, updated, postId: message.post.id });
+        sendResponse({ ok: true, result: result.result, updated: result.updated, postId: result.post.id });
       })
       .catch((err) => sendResponse({ ok: false, error: err?.message ?? 'Engagement sync failed' }));
     return true;

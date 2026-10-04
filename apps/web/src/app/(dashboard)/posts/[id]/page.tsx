@@ -419,7 +419,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
 
                   <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
                     {job.submissionStatus === "PUBLISHED" && job.postUrl && (
-                      <RefreshPostEngagementButton postId={job._id} postUrl={job.postUrl} />
+                      <RefreshPostEngagementButton postId={job._id} />
                     )}
                     {groupJob && (job.submissionStatus === "PENDING_APPROVAL" ||
                       (job.submissionStatus === "PUBLISHED" && (!job.postUrl || job.postUrl.includes("/pending_posts/")))) && (
@@ -488,7 +488,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                           </a>
                         )}
                         {job.submissionStatus === "PUBLISHED" && job.postUrl && (
-                          <RefreshPostEngagementButton postId={job._id} postUrl={job.postUrl} />
+                          <RefreshPostEngagementButton postId={job._id} />
                         )}
                         {groupJob && (job.submissionStatus === "PENDING_APPROVAL" ||
                           (job.submissionStatus === "PUBLISHED" && (!job.postUrl || job.postUrl.includes("/pending_posts/")))) && (

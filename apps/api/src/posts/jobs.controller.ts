@@ -256,7 +256,9 @@ export class JobsController {
         job.maintenanceClaimToken ||
         job.maintenanceClaimExpiresAt,
     );
-    if (!hasClaim) return connection;
+    if (!hasClaim) {
+      throw new UnauthorizedException('Maintenance claim required');
+    }
 
     if (
       job.maintenanceClaimType !== claimType ||
@@ -269,6 +271,129 @@ export class JobsController {
       throw new UnauthorizedException('Invalid or expired maintenance claim');
     }
     return connection;
+  }
+
+  private async claimSpecificMaintenanceJob(
+    clerkUserId: string,
+    extensionInstanceId: string | undefined,
+    id: string,
+    claimType: MaintenanceClaimType,
+  ) {
+    const job = await this.jobModel.findById(id).populate('postId').exec();
+    if (!job) throw new NotFoundException('Job not found');
+
+    const post = job.postId as unknown as PostDocument;
+    if (post.clerkUserId !== clerkUserId) {
+      throw new UnauthorizedException('Not your job');
+    }
+    const connection = await this.assertWorkerOwnsJob(
+      clerkUserId,
+      extensionInstanceId,
+      job,
+    );
+    const now = new Date();
+    const eligibility =
+      claimType === MaintenanceClaimType.PENDING_APPROVAL
+        ? {
+            status: PublishingJobStatus.SUCCESS,
+            $or: [
+              {
+                submissionStatus: FacebookSubmissionStatus.PENDING_APPROVAL,
+              },
+              {
+                submissionStatus: FacebookSubmissionStatus.PUBLISHED,
+                postUrl: { $regex: /\/pending_posts\//i },
+              },
+            ],
+            $and: [
+              {
+                $or: [
+                  { targetType: PublishingTargetType.GROUP },
+                  { targetType: { $exists: false } },
+                  { targetType: null },
+                ],
+              },
+              { groupId: { $exists: true, $ne: null } },
+            ],
+          }
+        : {
+            status: PublishingJobStatus.SUCCESS,
+            submissionStatus: FacebookSubmissionStatus.PUBLISHED,
+            postUrl: { $exists: true, $ne: '' },
+          };
+    const maintenanceClaimToken = randomUUID();
+    const claimedJob = await this.jobModel
+      .findOneAndUpdate(
+        {
+          _id: job._id,
+          facebookConnectionId: connection._id,
+          ...eligibility,
+          $and: [
+            ...(Array.isArray(eligibility.$and) ? eligibility.$and : []),
+            this.maintenanceClaimAvailableFilter(now),
+          ],
+        } as any,
+        {
+          $set: {
+            maintenanceClaimedByExtensionInstanceId:
+              this.requireExtensionInstanceId(extensionInstanceId),
+            maintenanceClaimType: claimType,
+            maintenanceClaimToken,
+            maintenanceClaimExpiresAt: new Date(
+              now.getTime() + JobsController.MAINTENANCE_CLAIM_LEASE_MS,
+            ),
+          },
+        },
+        { new: true },
+      )
+      .populate('postId', 'content mediaUrls')
+      .populate('groupId', 'url externalId')
+      .lean()
+      .exec();
+
+    if (!claimedJob) {
+      throw new UnauthorizedException(
+        'Job is unavailable or already claimed by another worker',
+      );
+    }
+
+    if (claimType === MaintenanceClaimType.ENGAGEMENT) {
+      return {
+        id: claimedJob._id.toString(),
+        status: FacebookSubmissionStatus.PUBLISHED,
+        targetType: claimedJob.targetType ?? PublishingTargetType.GROUP,
+        postUrl: claimedJob.postUrl!,
+        claimToken: maintenanceClaimToken,
+      };
+    }
+
+    const claimedPost = claimedJob.postId as {
+      content?: string;
+      mediaUrls?: string[];
+    };
+    const claimedGroup = claimedJob.groupId as {
+      _id: { toString(): string };
+      externalId?: string;
+      url?: string;
+    } | undefined;
+    if (!claimedGroup) {
+      throw new BadRequestException('Pending job has no Facebook group');
+    }
+    const submittedAt = claimedJob.submittedAt ?? getCreatedAt(claimedJob);
+    return {
+      id: claimedJob._id.toString(),
+      groupId: claimedGroup._id.toString(),
+      groupExternalId: claimedGroup.externalId,
+      groupUrl: claimedGroup.url ?? '',
+      status: FacebookSubmissionStatus.PENDING_APPROVAL,
+      ...(claimedJob.postUrl ? { postUrl: claimedJob.postUrl } : {}),
+      content: claimedPost.content,
+      submittedAt: submittedAt?.toISOString() ?? new Date().toISOString(),
+      mediaCount: Array.isArray(claimedPost.mediaUrls)
+        ? claimedPost.mediaUrls.length
+        : 0,
+      claimToken: maintenanceClaimToken,
+    };
   }
 
   /** GET /api/jobs/next — fetch the next pending job for the extension */
@@ -573,6 +698,31 @@ export class JobsController {
     }));
   }
 
+  /** POST /api/jobs/:id/maintenance-claim — claim one manual maintenance job before opening Facebook. */
+  @Post(':id/maintenance-claim')
+  @HttpCode(HttpStatus.OK)
+  async claimMaintenanceJob(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
+    @Param('id') id: string,
+    @Body() body: { type?: MaintenanceClaimType },
+  ) {
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (
+      body?.type !== MaintenanceClaimType.PENDING_APPROVAL &&
+      body?.type !== MaintenanceClaimType.ENGAGEMENT
+    ) {
+      throw new BadRequestException('Invalid maintenance claim type');
+    }
+    return this.claimSpecificMaintenanceJob(
+      clerkUserId,
+      extensionInstanceId,
+      id,
+      body.type,
+    );
+  }
+
   @Get(':id')
   async getJob(
     @Headers('x-clerk-user-id') clerkUserId: string,
@@ -683,7 +833,11 @@ export class JobsController {
     @Param('id') id: string,
     @Body()
     body: {
-      status: 'PUBLISHED' | 'STILL_PENDING' | 'CHECK_FAILED';
+      status:
+        | 'PUBLISHED'
+        | 'STILL_PENDING'
+        | 'CHECK_FAILED'
+        | 'CONTENT_MATCHED';
       postUrl?: string;
       reason?: string;
       claimToken?: string;
@@ -691,7 +845,11 @@ export class JobsController {
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
-    if (!['PUBLISHED', 'STILL_PENDING', 'CHECK_FAILED'].includes(body.status)) {
+    if (
+      !['PUBLISHED', 'STILL_PENDING', 'CHECK_FAILED', 'CONTENT_MATCHED'].includes(
+        body.status,
+      )
+    ) {
       throw new BadRequestException('Invalid pending sync result');
     }
 
@@ -714,6 +872,11 @@ export class JobsController {
       MaintenanceClaimType.PENDING_APPROVAL,
       body.claimToken,
     );
+    if (body.status === 'CONTENT_MATCHED') {
+      this.releaseMaintenanceClaim(job);
+      await job.save();
+      return job;
+    }
     const normalizedBodyPostUrl = normalizeFacebookGroupPostUrl(body.postUrl);
     if (job.postUrl) {
       const normalizedExistingPostUrl = normalizeFacebookGroupPostUrl(
