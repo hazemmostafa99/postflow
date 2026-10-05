@@ -170,3 +170,31 @@ describe('GroupsService.listGroups', () => {
     expect(filter.facebookConnectionId.$in.map(String)).toEqual(connectionIds);
   });
 });
+
+describe('GroupsService.deleteGroup', () => {
+  it('deletes only the signed-in user\'s group and its publishing jobs', async () => {
+    const clerkUserId = 'clerk-user-1';
+    const groupId = new Types.ObjectId('64b000000000000000000001');
+    const findOneAndDelete = jest.fn().mockReturnValue({
+      exec: jest.fn().mockResolvedValue({ _id: groupId }),
+    });
+    const jobExec = jest.fn().mockResolvedValue({ deletedCount: 2 });
+    const jobIn = jest.fn().mockReturnValue({ exec: jobExec });
+    const jobWhere = jest.fn().mockReturnValue({ in: jobIn });
+    const deleteMany = jest.fn().mockReturnValue({ where: jobWhere });
+    const service = new GroupsService(
+      { findOneAndDelete } as never,
+      { deleteMany } as never,
+      {} as never,
+    );
+
+    await service.deleteGroup(clerkUserId, groupId.toString());
+
+    expect(findOneAndDelete).toHaveBeenCalledWith({
+      _id: groupId.toString(),
+      clerkUserId,
+    });
+    expect(jobWhere).toHaveBeenCalledWith('groupId');
+    expect(jobIn).toHaveBeenCalledWith([groupId]);
+  });
+});

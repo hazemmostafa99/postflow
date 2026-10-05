@@ -80,6 +80,9 @@ function TeamCard({ team, users, managers }: { team: Team; users: User[]; manage
   }
 
   async function removeMember(userId: string) {
+    const member = members.find((candidate) => candidate._id === userId);
+    const memberLabel = member?.email ?? "this member";
+    if (!confirm(`Remove ${memberLabel} from ${team.name}?`)) return;
     await runAction(async () => fetch(`/api/admin/teams/${team._id}/members/${userId}`, { method: "DELETE" }), "Member removed.");
   }
 

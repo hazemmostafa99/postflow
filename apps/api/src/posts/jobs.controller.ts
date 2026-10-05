@@ -7,6 +7,7 @@ import {
   Headers,
   HttpCode,
   HttpStatus,
+  Logger,
   UnauthorizedException,
   NotFoundException,
   BadRequestException,
@@ -15,7 +16,11 @@ import {
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import {
+  randomUUID,
+} from 'node:crypto';
+import {
   FacebookSubmissionStatus,
+  MaintenanceClaimType,
   PublishingJob,
   PublishingJobDocument,
   PublishingJobStatus,
@@ -24,7 +29,10 @@ import {
 import { Post as PostSchema, PostDocument } from '../schemas/post.schema';
 import { getNextPendingPostCheckAt } from './pending-sync-schedule';
 import { getNextEngagementSyncAt } from './engagement-sync-schedule';
-import { getEngagementQueueFilter } from './engagement-eligibility';
+import {
+  FACEBOOK_ENGAGEMENT_PERMALINK_PATTERN,
+  getEngagementQueueFilter,
+} from './engagement-eligibility';
 import {
   FacebookConnection,
   FacebookConnectionDocument,
@@ -38,6 +46,7 @@ type PostEngagementSyncResult = {
   reactionCount?: number;
   commentCount?: number;
   reason?: string;
+  claimToken?: string;
 };
 
 type LeanId = {
@@ -67,7 +76,17 @@ type PendingJobLean = {
   nextCheckAt?: Date;
   syncAttempts?: number;
   lastSyncError?: string;
+  maintenanceClaimToken?: string;
   createdAt?: Date;
+};
+
+type EngagementJobLean = {
+  _id: { toString(): string };
+  targetType?: PublishingTargetType;
+  postUrl?: string;
+  lastEngagementSyncAt?: Date;
+  nextEngagementSyncAt?: Date;
+  maintenanceClaimToken?: string;
 };
 
 const groupOrLegacyTargetFilter = {
@@ -136,9 +155,19 @@ function getFacebookPostIdentity(value?: string): string | undefined {
   }
 }
 
+function maskExtensionInstanceId(value?: string): string {
+  const normalized = value?.trim();
+  if (!normalized) return 'missing';
+  if (normalized.length <= 8)
+    return `${normalized.slice(0, 2)}…${normalized.slice(-2)}`;
+  return `${normalized.slice(0, 4)}…${normalized.slice(-4)}`;
+}
+
 @Controller('api/jobs')
 export class JobsController {
   private static readonly JOB_CLAIM_LEASE_MS = 15 * 60 * 1000;
+  private static readonly MAINTENANCE_CLAIM_LEASE_MS = 5 * 60 * 1000;
+  private readonly logger = new Logger(JobsController.name);
 
   constructor(
     @InjectModel(PublishingJob.name)
@@ -148,6 +177,36 @@ export class JobsController {
     @InjectModel(FacebookConnection.name)
     private readonly connectionModel: Model<FacebookConnectionDocument>,
   ) {}
+
+  private logMaintenanceEvent(
+    event: string,
+    details: Record<string, string | number | boolean | null | undefined>,
+    level: 'log' | 'warn' = 'log',
+  ) {
+    const payload = JSON.stringify({ event, ...details });
+    if (level === 'warn') this.logger.warn(payload);
+    else this.logger.log(payload);
+  }
+
+  private logMaintenanceResult(
+    job: PublishingJobDocument,
+    workType: MaintenanceClaimType,
+    resultStatus: string,
+    extensionInstanceId?: string,
+  ) {
+    const retryAt =
+      workType === MaintenanceClaimType.PENDING_APPROVAL
+        ? job.nextCheckAt
+        : job.nextEngagementSyncAt;
+    this.logMaintenanceEvent('maintenance.result.accepted', {
+      jobId: String(job._id ?? 'unknown'),
+      workType,
+      connectionId: String(job.facebookConnectionId),
+      extensionInstanceId: maskExtensionInstanceId(extensionInstanceId),
+      resultStatus,
+      retryAt: retryAt?.toISOString(),
+    });
+  }
 
   private async getVerifiedWorkerConnection(
     clerkUserId: string,
@@ -169,25 +228,313 @@ export class JobsController {
     return verified ? (connection as FacebookConnectionDocument) : null;
   }
 
+  private requireExtensionInstanceId(extensionInstanceId?: string): string {
+    const normalizedInstanceId = extensionInstanceId?.trim();
+    if (!normalizedInstanceId) {
+      throw new UnauthorizedException(
+        'x-extension-instance-id header is required',
+      );
+    }
+    return normalizedInstanceId;
+  }
+
   private async assertWorkerOwnsJob(
     clerkUserId: string,
     extensionInstanceId: string | undefined,
     job: PublishingJobDocument,
-  ) {
-    const normalizedInstanceId = extensionInstanceId?.trim();
-    if (!normalizedInstanceId) return;
+  ): Promise<FacebookConnectionDocument> {
+    const normalizedInstanceId = this.requireExtensionInstanceId(
+      extensionInstanceId,
+    );
     const connection = await this.getVerifiedWorkerConnection(
       clerkUserId,
       normalizedInstanceId,
     );
-    if (
-      !connection ||
-      String(job.facebookConnectionId) !== String(connection._id)
-    ) {
+    if (!connection) {
+      this.logMaintenanceEvent(
+        'maintenance.ownership.rejected',
+        {
+          jobId: String(job._id ?? 'unknown'),
+          extensionInstanceId: maskExtensionInstanceId(normalizedInstanceId),
+          reasonCode: 'UNVERIFIED_CONNECTION',
+        },
+        'warn',
+      );
+      throw new UnauthorizedException(
+        'Extension instance is not linked to a verified Facebook connection',
+      );
+    }
+    if (String(job.facebookConnectionId) !== String(connection._id)) {
+      this.logMaintenanceEvent(
+        'maintenance.ownership.rejected',
+        {
+          jobId: String(job._id ?? 'unknown'),
+          connectionId: String(connection._id),
+          extensionInstanceId: maskExtensionInstanceId(normalizedInstanceId),
+          reasonCode: 'CONNECTION_MISMATCH',
+        },
+        'warn',
+      );
       throw new UnauthorizedException(
         'Job is assigned to another Facebook connection',
       );
     }
+    return connection;
+  }
+
+  private maintenanceClaimAvailableFilter(now: Date) {
+    return {
+      $or: [
+        { maintenanceClaimExpiresAt: { $exists: false } },
+        { maintenanceClaimExpiresAt: null },
+        { maintenanceClaimExpiresAt: { $lte: now } },
+      ],
+    };
+  }
+
+  private releaseMaintenanceClaim(
+    job: PublishingJobDocument,
+    claimType?: MaintenanceClaimType,
+  ) {
+    job.maintenanceClaimedByExtensionInstanceId = undefined;
+    job.maintenanceClaimType = undefined;
+    job.maintenanceClaimToken = undefined;
+    job.maintenanceClaimExpiresAt = undefined;
+    if (claimType) this.clearManualMaintenanceRequest(job, claimType);
+  }
+
+  private clearManualMaintenanceRequest(
+    job: PublishingJobDocument,
+    claimType: MaintenanceClaimType,
+  ) {
+    if (claimType === MaintenanceClaimType.PENDING_APPROVAL) {
+      job.manualPendingSyncRequestedAt = undefined;
+    } else {
+      job.manualEngagementSyncRequestedAt = undefined;
+    }
+  }
+
+  private manualMaintenanceRequestFilter(claimType: MaintenanceClaimType) {
+    return claimType === MaintenanceClaimType.PENDING_APPROVAL
+      ? { manualPendingSyncRequestedAt: { $exists: true, $ne: null } }
+      : { manualEngagementSyncRequestedAt: { $exists: true, $ne: null } };
+  }
+
+  private async assertMaintenanceClaim(
+    clerkUserId: string,
+    extensionInstanceId: string | undefined,
+    job: PublishingJobDocument,
+    claimType: MaintenanceClaimType,
+    claimToken?: string,
+  ) {
+    const normalizedInstanceId = this.requireExtensionInstanceId(
+      extensionInstanceId,
+    );
+    const connection = await this.assertWorkerOwnsJob(
+      clerkUserId,
+      normalizedInstanceId,
+      job,
+    );
+
+    const hasClaim = Boolean(
+      job.maintenanceClaimType ||
+        job.maintenanceClaimToken ||
+        job.maintenanceClaimExpiresAt,
+    );
+    if (!hasClaim) {
+      this.logMaintenanceEvent(
+        'maintenance.lease.conflict',
+        {
+          jobId: String(job._id ?? 'unknown'),
+          workType: claimType,
+          extensionInstanceId: maskExtensionInstanceId(normalizedInstanceId),
+          reasonCode: 'CLAIM_MISSING',
+        },
+        'warn',
+      );
+      throw new UnauthorizedException('Maintenance claim required');
+    }
+
+    const claimExpired = Boolean(
+      job.maintenanceClaimExpiresAt &&
+        job.maintenanceClaimExpiresAt.getTime() <= Date.now(),
+    );
+    if (claimExpired) {
+      this.logMaintenanceEvent(
+        'maintenance.lease.expired',
+        {
+          jobId: String(job._id ?? 'unknown'),
+          workType: claimType,
+          extensionInstanceId: maskExtensionInstanceId(normalizedInstanceId),
+          reasonCode: 'CLAIM_EXPIRED',
+        },
+        'warn',
+      );
+      throw new UnauthorizedException('Invalid or expired maintenance claim');
+    }
+
+    if (
+      job.maintenanceClaimType !== claimType ||
+      job.maintenanceClaimedByExtensionInstanceId !== normalizedInstanceId ||
+      !claimToken ||
+      claimToken !== job.maintenanceClaimToken ||
+      !job.maintenanceClaimExpiresAt
+    ) {
+      this.logMaintenanceEvent(
+        'maintenance.lease.conflict',
+        {
+          jobId: String(job._id ?? 'unknown'),
+          workType: claimType,
+          extensionInstanceId: maskExtensionInstanceId(normalizedInstanceId),
+          reasonCode: 'CLAIM_MISMATCH',
+        },
+        'warn',
+      );
+      throw new UnauthorizedException('Invalid or expired maintenance claim');
+    }
+    return connection;
+  }
+
+  private async claimSpecificMaintenanceJob(
+    clerkUserId: string,
+    extensionInstanceId: string | undefined,
+    id: string,
+    claimType: MaintenanceClaimType,
+  ) {
+    const job = await this.jobModel.findById(id).populate('postId').exec();
+    if (!job) throw new NotFoundException('Job not found');
+
+    const post = job.postId as unknown as PostDocument;
+    if (post.clerkUserId !== clerkUserId) {
+      throw new UnauthorizedException('Not your job');
+    }
+    const connection = await this.assertWorkerOwnsJob(
+      clerkUserId,
+      extensionInstanceId,
+      job,
+    );
+    const now = new Date();
+    const eligibility =
+      claimType === MaintenanceClaimType.PENDING_APPROVAL
+        ? {
+            status: PublishingJobStatus.SUCCESS,
+            $or: [
+              {
+                submissionStatus: FacebookSubmissionStatus.PENDING_APPROVAL,
+              },
+              {
+                submissionStatus: FacebookSubmissionStatus.PUBLISHED,
+                postUrl: { $regex: /\/pending_posts\//i },
+              },
+            ],
+            $and: [
+              {
+                $or: [
+                  { targetType: PublishingTargetType.GROUP },
+                  { targetType: { $exists: false } },
+                  { targetType: null },
+                ],
+              },
+              { groupId: { $exists: true, $ne: null } },
+            ],
+          }
+        : {
+            status: PublishingJobStatus.SUCCESS,
+            submissionStatus: FacebookSubmissionStatus.PUBLISHED,
+            postUrl: { $regex: FACEBOOK_ENGAGEMENT_PERMALINK_PATTERN },
+          };
+    const maintenanceClaimToken = randomUUID();
+    const claimedJob = await this.jobModel
+      .findOneAndUpdate(
+        {
+          _id: job._id,
+          facebookConnectionId: connection._id,
+          ...eligibility,
+          $and: [
+            ...(Array.isArray(eligibility.$and) ? eligibility.$and : []),
+            this.maintenanceClaimAvailableFilter(now),
+          ],
+        } as any,
+        {
+          $set: {
+            maintenanceClaimedByExtensionInstanceId:
+              this.requireExtensionInstanceId(extensionInstanceId),
+            maintenanceClaimType: claimType,
+            maintenanceClaimToken,
+            maintenanceClaimExpiresAt: new Date(
+              now.getTime() + JobsController.MAINTENANCE_CLAIM_LEASE_MS,
+            ),
+          },
+        },
+        { new: true },
+      )
+      .populate('postId', 'content mediaUrls')
+      .populate('groupId', 'url externalId')
+      .lean()
+      .exec();
+
+    if (!claimedJob) {
+      this.logMaintenanceEvent(
+        'maintenance.lease.conflict',
+        {
+          jobId: id,
+          workType: claimType,
+          connectionId: String(connection._id),
+          extensionInstanceId: maskExtensionInstanceId(extensionInstanceId),
+          reasonCode: 'JOB_UNAVAILABLE_OR_CLAIMED',
+        },
+        'warn',
+      );
+      throw new UnauthorizedException(
+        'Job is unavailable or already claimed by another worker',
+      );
+    }
+
+    this.logMaintenanceEvent('maintenance.claim.created', {
+      jobId: claimedJob._id.toString(),
+      workType: claimType,
+      connectionId: String(connection._id),
+      extensionInstanceId: maskExtensionInstanceId(extensionInstanceId),
+      manualOnly: true,
+    });
+
+    if (claimType === MaintenanceClaimType.ENGAGEMENT) {
+      return {
+        id: claimedJob._id.toString(),
+        status: FacebookSubmissionStatus.PUBLISHED,
+        targetType: claimedJob.targetType ?? PublishingTargetType.GROUP,
+        postUrl: claimedJob.postUrl!,
+        claimToken: maintenanceClaimToken,
+      };
+    }
+
+    const claimedPost = claimedJob.postId as {
+      content?: string;
+      mediaUrls?: string[];
+    };
+    const claimedGroup = claimedJob.groupId as {
+      _id: { toString(): string };
+      externalId?: string;
+      url?: string;
+    } | undefined;
+    if (!claimedGroup) {
+      throw new BadRequestException('Pending job has no Facebook group');
+    }
+    const submittedAt = claimedJob.submittedAt ?? getCreatedAt(claimedJob);
+    return {
+      id: claimedJob._id.toString(),
+      groupId: claimedGroup._id.toString(),
+      groupExternalId: claimedGroup.externalId,
+      groupUrl: claimedGroup.url ?? '',
+      status: FacebookSubmissionStatus.PENDING_APPROVAL,
+      ...(claimedJob.postUrl ? { postUrl: claimedJob.postUrl } : {}),
+      content: claimedPost.content,
+      submittedAt: submittedAt?.toISOString() ?? new Date().toISOString(),
+      mediaCount: Array.isArray(claimedPost.mediaUrls)
+        ? claimedPost.mediaUrls.length
+        : 0,
+      claimToken: maintenanceClaimToken,
+    };
   }
 
   /** GET /api/jobs/next — fetch the next pending job for the extension */
@@ -199,12 +546,14 @@ export class JobsController {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
 
-    const normalizedInstanceId = extensionInstanceId?.trim();
+    const normalizedInstanceId = this.requireExtensionInstanceId(
+      extensionInstanceId,
+    );
     const connection = await this.getVerifiedWorkerConnection(
       clerkUserId,
       normalizedInstanceId,
     );
-    if (normalizedInstanceId && !connection) return null;
+    if (!connection) return null;
     const connectionId = connection?._id;
 
     // First find all posts belonging to this user
@@ -216,68 +565,17 @@ export class JobsController {
     const postIds = posts.map((p) => p._id.toString());
 
     const now = new Date();
-    const ownershipFilter = connectionId
-      ? { facebookConnectionId: connectionId }
-      : {};
+    const ownershipFilter = { facebookConnectionId: connectionId };
     const supportedTargetFilter = publishableTargetFilter;
 
-    let job: PublishingJobDocument | null;
-    if (normalizedInstanceId && connectionId) {
-      const leaseExpiresAt = new Date(
-        now.getTime() + JobsController.JOB_CLAIM_LEASE_MS,
-      );
-      job = (await this.jobModel
-        .findOneAndUpdate(
-          {
-            ...ownershipFilter,
-            postId: { $in: postIds },
-            $and: [
-              supportedTargetFilter,
-              {
-                $or: [
-                  { scheduledFor: { $exists: false } },
-                  { scheduledFor: null },
-                  { scheduledFor: { $lte: now } },
-                ],
-              },
-            ],
-            $or: [
-              { status: PublishingJobStatus.PENDING },
-              {
-                status: PublishingJobStatus.RUNNING,
-                claimExpiresAt: { $lte: now },
-              },
-              {
-                status: PublishingJobStatus.RUNNING,
-                claimExpiresAt: { $exists: false },
-              },
-            ],
-          } as any,
-          {
-            $set: {
-              status: PublishingJobStatus.RUNNING,
-              claimedByExtensionInstanceId: normalizedInstanceId,
-              claimExpiresAt: leaseExpiresAt,
-              startedAt: now,
-            },
-          },
-          {
-            new: true,
-            sort: { scheduledFor: 1, flowOrder: 1, createdAt: 1 },
-          },
-        )
-        .populate('postId', 'content mediaUrls')
-        .populate('groupId', 'name url externalId')
-        .populate(
-          'facebookConnectionId',
-          'displayName facebookUserId detectedFacebookUserId',
-        )
-        .exec()) as PublishingJobDocument | null;
-    } else {
-      job = await this.jobModel
-        .findOne({
+    const leaseExpiresAt = new Date(
+      now.getTime() + JobsController.JOB_CLAIM_LEASE_MS,
+    );
+    const job = (await this.jobModel
+      .findOneAndUpdate(
+        {
           ...ownershipFilter,
-          status: PublishingJobStatus.PENDING,
+          postId: { $in: postIds },
           $and: [
             supportedTargetFilter,
             {
@@ -288,18 +586,38 @@ export class JobsController {
               ],
             },
           ],
-        })
-        .where('postId')
-        .in(postIds)
-        .sort({ scheduledFor: 1, flowOrder: 1, createdAt: 1 })
-        .populate('postId', 'content mediaUrls')
-        .populate('groupId', 'name url externalId')
-        .populate(
-          'facebookConnectionId',
-          'displayName facebookUserId detectedFacebookUserId',
-        )
-        .exec();
-    }
+          $or: [
+            { status: PublishingJobStatus.PENDING },
+            {
+              status: PublishingJobStatus.RUNNING,
+              claimExpiresAt: { $lte: now },
+            },
+            {
+              status: PublishingJobStatus.RUNNING,
+              claimExpiresAt: { $exists: false },
+            },
+          ],
+        } as any,
+        {
+          $set: {
+            status: PublishingJobStatus.RUNNING,
+            claimedByExtensionInstanceId: normalizedInstanceId,
+            claimExpiresAt: leaseExpiresAt,
+            startedAt: now,
+          },
+        },
+        {
+          new: true,
+          sort: { scheduledFor: 1, flowOrder: 1, createdAt: 1 },
+        },
+      )
+      .populate('postId', 'content mediaUrls')
+      .populate('groupId', 'name url externalId')
+      .populate(
+        'facebookConnectionId',
+        'displayName facebookUserId detectedFacebookUserId',
+      )
+      .exec()) as PublishingJobDocument | null;
 
     if (!job) return null;
 
@@ -315,14 +633,29 @@ export class JobsController {
     @Headers('x-clerk-user-id') clerkUserId: string,
     @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Query('limit') limit?: string,
+    @Query('manualOnly') manualOnly?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
-    const connection = await this.getVerifiedWorkerConnection(
-      clerkUserId,
+    const normalizedInstanceId = this.requireExtensionInstanceId(
       extensionInstanceId,
     );
-    if (extensionInstanceId?.trim() && !connection) return [];
+    const connection = await this.getVerifiedWorkerConnection(
+      clerkUserId,
+      normalizedInstanceId,
+    );
+    if (!connection) {
+      this.logMaintenanceEvent(
+        'maintenance.ownership.rejected',
+        {
+          workType: MaintenanceClaimType.PENDING_APPROVAL,
+          extensionInstanceId: maskExtensionInstanceId(normalizedInstanceId),
+          reasonCode: 'UNVERIFIED_CONNECTION',
+        },
+        'warn',
+      );
+      return [];
+    }
 
     const parsedLimit = limit ? Number(limit) : 10;
     const batchLimit = Number.isFinite(parsedLimit)
@@ -339,32 +672,85 @@ export class JobsController {
 
     if (!postIds.length) return [];
 
+    const manualOnlyRequested = manualOnly === 'true';
     const pendingFilter = {
       status: 'SUCCESS',
-      submissionStatus: FacebookSubmissionStatus.PENDING_APPROVAL,
-      ...(connection ? { facebookConnectionId: connection._id } : {}),
+      facebookConnectionId: connection._id,
       $and: [
         groupOrLegacyTargetFilter,
+        { groupId: { $exists: true, $ne: null } },
         {
           $or: [
-            { nextCheckAt: { $exists: false } },
-            { nextCheckAt: null },
-            { nextCheckAt: { $lte: now } },
+            { submissionStatus: FacebookSubmissionStatus.PENDING_APPROVAL },
+            {
+              submissionStatus: FacebookSubmissionStatus.PUBLISHED,
+              postUrl: { $regex: /\/pending_posts\//i },
+            },
           ],
         },
+        manualOnlyRequested
+          ? this.manualMaintenanceRequestFilter(
+              MaintenanceClaimType.PENDING_APPROVAL,
+            )
+          : {
+              $or: [
+                { nextCheckAt: { $exists: false } },
+                { nextCheckAt: null },
+                { nextCheckAt: { $lte: now } },
+              ],
+            },
+        this.maintenanceClaimAvailableFilter(now),
       ],
     };
 
-    const jobs = await this.jobModel
-      .find(pendingFilter)
-      .where('postId')
-      .in(postIds)
-      .sort({ submittedAt: 1, createdAt: 1, _id: 1 })
-      .limit(batchLimit)
-      .populate('postId', 'content mediaUrls')
-      .populate('groupId', 'url externalId')
-      .lean<PendingJobLean[]>()
-      .exec();
+    const jobs: PendingJobLean[] = [];
+    for (let index = 0; index < batchLimit; index += 1) {
+      const maintenanceClaimToken = randomUUID();
+      const claimedJob = await this.jobModel
+        .findOneAndUpdate(
+          {
+            ...pendingFilter,
+            postId: { $in: postIds },
+          } as any,
+          {
+            $set: {
+              maintenanceClaimedByExtensionInstanceId:
+                normalizedInstanceId,
+              maintenanceClaimType: MaintenanceClaimType.PENDING_APPROVAL,
+              maintenanceClaimToken,
+              maintenanceClaimExpiresAt: new Date(
+                now.getTime() + JobsController.MAINTENANCE_CLAIM_LEASE_MS,
+              ),
+            },
+          },
+          {
+            new: true,
+            sort: { submittedAt: 1, createdAt: 1, _id: 1 },
+          },
+        )
+        .populate('postId', 'content mediaUrls')
+        .populate('groupId', 'url externalId')
+        .lean<PendingJobLean>()
+        .exec();
+      if (!claimedJob) break;
+      jobs.push(claimedJob);
+      this.logMaintenanceEvent('maintenance.claim.created', {
+        jobId: claimedJob._id.toString(),
+        workType: MaintenanceClaimType.PENDING_APPROVAL,
+        connectionId: String(connection._id),
+        extensionInstanceId: maskExtensionInstanceId(normalizedInstanceId),
+        manualOnly: manualOnlyRequested,
+      });
+    }
+
+    if (jobs.length === 0) {
+      this.logMaintenanceEvent('maintenance.claim.empty', {
+        workType: MaintenanceClaimType.PENDING_APPROVAL,
+        connectionId: String(connection._id),
+        extensionInstanceId: maskExtensionInstanceId(normalizedInstanceId),
+        manualOnly: manualOnlyRequested,
+      });
+    }
 
     return jobs.flatMap((job) => {
       const post = job.postId;
@@ -391,6 +777,9 @@ export class JobsController {
             : {}),
           syncAttempts: job.syncAttempts ?? 0,
           ...(job.lastSyncError ? { lastSyncError: job.lastSyncError } : {}),
+          ...(job.maintenanceClaimToken
+            ? { claimToken: job.maintenanceClaimToken }
+            : {}),
         },
       ];
     });
@@ -402,15 +791,29 @@ export class JobsController {
     @Headers('x-clerk-user-id') clerkUserId: string,
     @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Query('limit') limit?: string,
-    @Query('postId') postId?: string,
+    @Query('manualOnly') manualOnly?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
-    const connection = await this.getVerifiedWorkerConnection(
-      clerkUserId,
+    const normalizedInstanceId = this.requireExtensionInstanceId(
       extensionInstanceId,
     );
-    if (extensionInstanceId?.trim() && !connection) return [];
+    const connection = await this.getVerifiedWorkerConnection(
+      clerkUserId,
+      normalizedInstanceId,
+    );
+    if (!connection) {
+      this.logMaintenanceEvent(
+        'maintenance.ownership.rejected',
+        {
+          workType: MaintenanceClaimType.ENGAGEMENT,
+          extensionInstanceId: maskExtensionInstanceId(normalizedInstanceId),
+          reasonCode: 'UNVERIFIED_CONNECTION',
+        },
+        'warn',
+      );
+      return [];
+    }
     const parsedLimit = limit ? Number(limit) : 10;
     const batchLimit = Number.isFinite(parsedLimit)
       ? Math.min(50, Math.max(1, Math.floor(parsedLimit)))
@@ -424,31 +827,73 @@ export class JobsController {
       .exec();
     const postIds = posts.map((post) => post._id);
     if (!postIds.length) return [];
-    if (postId && !postIds.some((id) => id.toString() === postId)) return [];
-
-    const requestedPostId = postId
-      ? postIds.find((id) => id.toString() === postId)
-      : undefined;
-    const engagementQuery = this.jobModel.find({
-      ...getEngagementQueueFilter(now),
+    const manualOnlyRequested = manualOnly === 'true';
+    const engagementQueueFilter = getEngagementQueueFilter(now);
+    const engagementFilter = {
+      status: 'SUCCESS',
       submissionStatus: FacebookSubmissionStatus.PUBLISHED,
-      ...(connection ? { facebookConnectionId: connection._id } : {}),
-      $and: [publishableTargetFilter],
-    });
-    const jobsQuery = requestedPostId
-      ? engagementQuery.where('postId').equals(requestedPostId)
-      : engagementQuery.where('postId').in(postIds);
+      postUrl: engagementQueueFilter.postUrl,
+      facebookConnectionId: connection._id,
+      $and: [
+        publishableTargetFilter,
+        manualOnlyRequested
+          ? this.manualMaintenanceRequestFilter(MaintenanceClaimType.ENGAGEMENT)
+          : {
+              $or: engagementQueueFilter.$or,
+            },
+        this.maintenanceClaimAvailableFilter(now),
+      ],
+      postId: { $in: postIds },
+    };
 
-    const jobs = await jobsQuery
-      .sort({
-        lastEngagementSyncAt: 1,
-        publishedDetectedAt: 1,
-        createdAt: 1,
-        _id: 1,
-      })
-      .limit(batchLimit)
-      .lean()
-      .exec();
+    const jobs: EngagementJobLean[] = [];
+    for (let index = 0; index < batchLimit; index += 1) {
+      const maintenanceClaimToken = randomUUID();
+      const claimedJob = await this.jobModel
+        .findOneAndUpdate(
+          engagementFilter as any,
+          {
+            $set: {
+              maintenanceClaimedByExtensionInstanceId:
+                normalizedInstanceId,
+              maintenanceClaimType: MaintenanceClaimType.ENGAGEMENT,
+              maintenanceClaimToken,
+              maintenanceClaimExpiresAt: new Date(
+                now.getTime() + JobsController.MAINTENANCE_CLAIM_LEASE_MS,
+              ),
+            },
+          },
+          {
+            new: true,
+            sort: {
+              lastEngagementSyncAt: 1,
+              publishedDetectedAt: 1,
+              createdAt: 1,
+              _id: 1,
+            },
+          },
+        )
+        .lean<EngagementJobLean>()
+        .exec();
+      if (!claimedJob) break;
+      jobs.push(claimedJob);
+      this.logMaintenanceEvent('maintenance.claim.created', {
+        jobId: claimedJob._id.toString(),
+        workType: MaintenanceClaimType.ENGAGEMENT,
+        connectionId: String(connection._id),
+        extensionInstanceId: maskExtensionInstanceId(normalizedInstanceId),
+        manualOnly: manualOnlyRequested,
+      });
+    }
+
+    if (jobs.length === 0) {
+      this.logMaintenanceEvent('maintenance.claim.empty', {
+        workType: MaintenanceClaimType.ENGAGEMENT,
+        connectionId: String(connection._id),
+        extensionInstanceId: maskExtensionInstanceId(normalizedInstanceId),
+        manualOnly: manualOnlyRequested,
+      });
+    }
 
     return jobs.map((job) => ({
       id: job._id.toString(),
@@ -461,7 +906,100 @@ export class JobsController {
       ...(job.nextEngagementSyncAt
         ? { nextEngagementSyncAt: job.nextEngagementSyncAt.toISOString() }
         : {}),
+      ...(job.maintenanceClaimToken
+        ? { claimToken: job.maintenanceClaimToken }
+        : {}),
     }));
+  }
+
+  /** POST /api/jobs/:id/maintenance-request — queue dashboard maintenance for the owning extension. */
+  @Post(':id/maintenance-request')
+  @HttpCode(HttpStatus.ACCEPTED)
+  async requestMaintenance(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('id') id: string,
+    @Body() body: { type?: MaintenanceClaimType },
+  ) {
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (
+      body?.type !== MaintenanceClaimType.PENDING_APPROVAL &&
+      body?.type !== MaintenanceClaimType.ENGAGEMENT
+    ) {
+      throw new BadRequestException('Invalid maintenance request type');
+    }
+
+    const job = await this.jobModel.findById(id).populate('postId').exec();
+    if (!job) throw new NotFoundException('Job not found');
+    const post = job.postId as unknown as PostDocument;
+    if (post.clerkUserId !== clerkUserId) {
+      throw new UnauthorizedException('Not your job');
+    }
+    if (!job.facebookConnectionId) {
+      throw new BadRequestException(
+        'Job is not assigned to a Facebook connection',
+      );
+    }
+    if (job.status !== PublishingJobStatus.SUCCESS) {
+      throw new BadRequestException('Job is not ready for maintenance refresh');
+    }
+
+    const requestedAt = new Date();
+    if (body.type === MaintenanceClaimType.PENDING_APPROVAL) {
+      const pendingEligible =
+        job.targetType !== PublishingTargetType.PROFILE_FEED &&
+        Boolean(job.groupId) &&
+        (job.submissionStatus === FacebookSubmissionStatus.PENDING_APPROVAL ||
+          (job.submissionStatus === FacebookSubmissionStatus.PUBLISHED &&
+            isPendingFacebookPostUrl(job.postUrl)));
+      if (!pendingEligible) {
+        throw new BadRequestException(
+          'Job is not awaiting Facebook approval',
+        );
+      }
+      job.manualPendingSyncRequestedAt = requestedAt;
+    } else {
+      if (
+        job.submissionStatus !== FacebookSubmissionStatus.PUBLISHED ||
+        !job.postUrl
+      ) {
+        throw new BadRequestException('Job is not a published Facebook post');
+      }
+      job.manualEngagementSyncRequestedAt = requestedAt;
+    }
+
+    await job.save();
+    return {
+      id: job._id.toString(),
+      type: body.type,
+      status: 'QUEUED',
+      requestedAt: requestedAt.toISOString(),
+    };
+  }
+
+  /** POST /api/jobs/:id/maintenance-claim — claim one manual maintenance job before opening Facebook. */
+  @Post(':id/maintenance-claim')
+  @HttpCode(HttpStatus.OK)
+  async claimMaintenanceJob(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
+    @Param('id') id: string,
+    @Body() body: { type?: MaintenanceClaimType },
+  ) {
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (
+      body?.type !== MaintenanceClaimType.PENDING_APPROVAL &&
+      body?.type !== MaintenanceClaimType.ENGAGEMENT
+    ) {
+      throw new BadRequestException('Invalid maintenance claim type');
+    }
+    return this.claimSpecificMaintenanceJob(
+      clerkUserId,
+      extensionInstanceId,
+      id,
+      body.type,
+    );
   }
 
   @Get(':id')
@@ -505,7 +1043,13 @@ export class JobsController {
     const post = job.postId as unknown as PostDocument;
     if (post.clerkUserId !== clerkUserId)
       throw new UnauthorizedException('Not your job');
-    await this.assertWorkerOwnsJob(clerkUserId, extensionInstanceId, job);
+    await this.assertMaintenanceClaim(
+      clerkUserId,
+      extensionInstanceId,
+      job,
+      MaintenanceClaimType.ENGAGEMENT,
+      body.claimToken,
+    );
     if (
       job.submissionStatus !== FacebookSubmissionStatus.PUBLISHED ||
       !job.postUrl
@@ -550,7 +1094,14 @@ export class JobsController {
             'One engagement counter was not detected'
           : undefined;
     }
+    this.releaseMaintenanceClaim(job, MaintenanceClaimType.ENGAGEMENT);
     await job.save();
+    this.logMaintenanceResult(
+      job,
+      MaintenanceClaimType.ENGAGEMENT,
+      body.status,
+      extensionInstanceId,
+    );
     return job;
   }
 
@@ -567,14 +1118,23 @@ export class JobsController {
     @Param('id') id: string,
     @Body()
     body: {
-      status: 'PUBLISHED' | 'STILL_PENDING' | 'CHECK_FAILED';
+      status:
+        | 'PUBLISHED'
+        | 'STILL_PENDING'
+        | 'CHECK_FAILED'
+        | 'CONTENT_MATCHED';
       postUrl?: string;
       reason?: string;
+      claimToken?: string;
     },
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
-    if (!['PUBLISHED', 'STILL_PENDING', 'CHECK_FAILED'].includes(body.status)) {
+    if (
+      !['PUBLISHED', 'STILL_PENDING', 'CHECK_FAILED', 'CONTENT_MATCHED'].includes(
+        body.status,
+      )
+    ) {
       throw new BadRequestException('Invalid pending sync result');
     }
 
@@ -590,7 +1150,27 @@ export class JobsController {
         'Pending-approval sync is only supported for Group jobs',
       );
     }
-    await this.assertWorkerOwnsJob(clerkUserId, extensionInstanceId, job);
+    await this.assertMaintenanceClaim(
+      clerkUserId,
+      extensionInstanceId,
+      job,
+      MaintenanceClaimType.PENDING_APPROVAL,
+      body.claimToken,
+    );
+    const persistAcceptedResult = async () => {
+      await job.save();
+      this.logMaintenanceResult(
+        job,
+        MaintenanceClaimType.PENDING_APPROVAL,
+        body.status,
+        extensionInstanceId,
+      );
+      return job;
+    };
+    if (body.status === 'CONTENT_MATCHED') {
+      this.releaseMaintenanceClaim(job, MaintenanceClaimType.PENDING_APPROVAL);
+      return persistAcceptedResult();
+    }
     const normalizedBodyPostUrl = normalizeFacebookGroupPostUrl(body.postUrl);
     if (job.postUrl) {
       const normalizedExistingPostUrl = normalizeFacebookGroupPostUrl(
@@ -620,8 +1200,8 @@ export class JobsController {
           job.submittedAt ?? getCreatedAt(job) ?? checkedAt,
           checkedAt,
         );
-        await job.save();
-        return job;
+        this.releaseMaintenanceClaim(job, MaintenanceClaimType.PENDING_APPROVAL);
+        return persistAcceptedResult();
       }
       if (
         body.status === 'PUBLISHED' &&
@@ -637,9 +1217,11 @@ export class JobsController {
         job.syncAttempts = (job.syncAttempts ?? 0) + 1;
         job.lastSyncError = undefined;
         job.nextCheckAt = undefined;
-        await job.save();
+        this.releaseMaintenanceClaim(job, MaintenanceClaimType.PENDING_APPROVAL);
+      } else {
+        this.releaseMaintenanceClaim(job, MaintenanceClaimType.PENDING_APPROVAL);
       }
-      return job;
+      return persistAcceptedResult();
     }
     if (
       job.submissionStatus === FacebookSubmissionStatus.UNKNOWN &&
@@ -654,8 +1236,8 @@ export class JobsController {
       job.syncAttempts = (job.syncAttempts ?? 0) + 1;
       job.lastSyncError = undefined;
       job.nextCheckAt = undefined;
-      await job.save();
-      return job;
+      this.releaseMaintenanceClaim(job, MaintenanceClaimType.PENDING_APPROVAL);
+      return persistAcceptedResult();
     }
     if (
       job.submissionStatus === FacebookSubmissionStatus.UNKNOWN &&
@@ -673,8 +1255,8 @@ export class JobsController {
         job.submittedAt ?? getCreatedAt(job) ?? checkedAt,
         checkedAt,
       );
-      await job.save();
-      return job;
+      this.releaseMaintenanceClaim(job, MaintenanceClaimType.PENDING_APPROVAL);
+      return persistAcceptedResult();
     }
     if (job.submissionStatus !== FacebookSubmissionStatus.PENDING_APPROVAL) {
       throw new BadRequestException('Job is not awaiting Facebook approval');
@@ -707,8 +1289,8 @@ export class JobsController {
       );
     }
 
-    await job.save();
-    return job;
+    this.releaseMaintenanceClaim(job, MaintenanceClaimType.PENDING_APPROVAL);
+    return persistAcceptedResult();
   }
 
   /** POST /api/jobs/:id/status — update a job's status */
@@ -759,31 +1341,15 @@ export class JobsController {
       throw new UnauthorizedException('Not your job');
     }
 
-    const normalizedInstanceId = extensionInstanceId?.trim();
-    let workerConnectionId: unknown;
-    if (normalizedInstanceId) {
-      const connection = await this.connectionModel
-        .findOne({ clerkUserId, extensionInstanceId: normalizedInstanceId })
-        .lean()
-        .exec();
-      const verified = Boolean(
-        connection?.status === FacebookConnectionStatus.CONNECTED &&
-        connection.facebookSessionDetected &&
-        connection.facebookUserId &&
-        connection.detectedFacebookUserId &&
-        connection.facebookUserId === connection.detectedFacebookUserId,
-      );
-      if (
-        !connection ||
-        !verified ||
-        String(job.facebookConnectionId) !== String(connection._id)
-      ) {
-        throw new UnauthorizedException(
-          'Job is assigned to another Facebook connection',
-        );
-      }
-      workerConnectionId = connection._id;
-    }
+    const normalizedInstanceId = this.requireExtensionInstanceId(
+      extensionInstanceId,
+    );
+    const workerConnection = await this.assertWorkerOwnsJob(
+      clerkUserId,
+      normalizedInstanceId,
+      job,
+    );
+    const workerConnectionId = workerConnection._id;
 
     const previousStatus = job.status;
     if (
@@ -858,11 +1424,16 @@ export class JobsController {
       const normalizedSubmissionPostUrl = normalizeFacebookGroupPostUrl(
         body.submissionResult.postUrl,
       );
+      const effectiveSubmissionStatus =
+        normalizedSubmissionPostUrl &&
+        isPendingFacebookPostUrl(normalizedSubmissionPostUrl)
+          ? FacebookSubmissionStatus.PENDING_APPROVAL
+          : body.submissionResult.status;
       let duplicatePermalink = false;
       if (
         normalizedSubmissionPostUrl &&
-        (body.submissionResult.status === FacebookSubmissionStatus.PUBLISHED ||
-          body.submissionResult.status ===
+        (effectiveSubmissionStatus === FacebookSubmissionStatus.PUBLISHED ||
+          effectiveSubmissionStatus ===
             FacebookSubmissionStatus.PENDING_APPROVAL)
       ) {
         const duplicateTargetFilter =
@@ -889,19 +1460,19 @@ export class JobsController {
 
       job.submissionStatus = duplicatePermalink
         ? FacebookSubmissionStatus.UNKNOWN
-        : body.submissionResult.status;
+        : effectiveSubmissionStatus;
       // A later retry may report the status without repeating the permalink.
       // Never erase a URL that was already captured successfully.
       if (
         !duplicatePermalink &&
-        (body.submissionResult.status === FacebookSubmissionStatus.PUBLISHED ||
-          body.submissionResult.status ===
+        (effectiveSubmissionStatus === FacebookSubmissionStatus.PUBLISHED ||
+          effectiveSubmissionStatus ===
             FacebookSubmissionStatus.PENDING_APPROVAL) &&
         normalizedSubmissionPostUrl
       ) {
         job.postUrl = normalizedSubmissionPostUrl;
       }
-      if (body.submissionResult.status === FacebookSubmissionStatus.UNKNOWN) {
+      if (effectiveSubmissionStatus === FacebookSubmissionStatus.UNKNOWN) {
         job.postUrl = undefined;
       }
       job.submissionReason = duplicatePermalink
@@ -910,14 +1481,13 @@ export class JobsController {
               ? 'profile feed'
               : 'group'
           }`
-        : body.submissionResult.status === FacebookSubmissionStatus.UNKNOWN
+        : effectiveSubmissionStatus === FacebookSubmissionStatus.UNKNOWN
           ? body.submissionResult.reason
           : undefined;
 
       if (
         !duplicatePermalink &&
-        body.submissionResult.status ===
-          FacebookSubmissionStatus.PENDING_APPROVAL &&
+        effectiveSubmissionStatus === FacebookSubmissionStatus.PENDING_APPROVAL &&
         !job.submittedAt
       ) {
         job.submittedAt = new Date();
@@ -929,7 +1499,7 @@ export class JobsController {
 
       if (
         !duplicatePermalink &&
-        body.submissionResult.status === FacebookSubmissionStatus.PUBLISHED
+        effectiveSubmissionStatus === FacebookSubmissionStatus.PUBLISHED
       ) {
         job.publishedDetectedAt ??= new Date();
       }

@@ -22,11 +22,15 @@ export class Post {
   @Prop()
   startTime?: Date;
 
-  @Prop({ default: false })
-  spacePostsApart: boolean;
+  /** Random delay bounds used between consecutive publishing destinations. */
+  @Prop({ default: 30 })
+  spacingMinSeconds: number;
 
-  @Prop()
-  spacingMinutes?: number;
+  @Prop({ default: 120 })
+  spacingMaxSeconds: number;
 }
 
 export const PostSchema = SchemaFactory.createForClass(Post);
+
+PostSchema.index({ createdAt: -1 });
+PostSchema.index({ clerkUserId: 1, createdAt: -1 });

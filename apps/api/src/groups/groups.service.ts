@@ -2,6 +2,7 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  NotFoundException,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
@@ -289,5 +290,22 @@ export class GroupsService {
       await this.jobModel.deleteMany().where('groupId').in(groupIds).exec();
     }
     await this.groupModel.deleteMany({ clerkUserId }).exec();
+  }
+
+  async deleteGroup(clerkUserId: string, groupId: string) {
+    if (!Types.ObjectId.isValid(groupId)) {
+      throw new NotFoundException('Group not found');
+    }
+
+    const group = await this.groupModel
+      .findOneAndDelete({ _id: groupId, clerkUserId })
+      .exec();
+    if (!group) throw new NotFoundException('Group not found');
+
+    await this.jobModel
+      .deleteMany()
+      .where('groupId')
+      .in([group._id])
+      .exec();
   }
 }

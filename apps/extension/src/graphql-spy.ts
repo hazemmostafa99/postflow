@@ -1,4 +1,12 @@
 (function () {
+  const PENDING_RESPONSE_REPLAY_EVENT = 'postflow:request-facebook-response-replay';
+  const spyWindow = window as Window & { __postflowGraphqlSpyInstalled?: boolean };
+  if (spyWindow.__postflowGraphqlSpyInstalled) {
+    window.dispatchEvent(new CustomEvent(PENDING_RESPONSE_REPLAY_EVENT));
+    return;
+  }
+  spyWindow.__postflowGraphqlSpyInstalled = true;
+
   const EXCLUDED_SLUGS = new Set([
     "feed", "discover", "create", "joins",
     "requests", "questions", "members",
@@ -123,6 +131,101 @@
     return { videoIds, uploadSessionIds };
   }
 
+  interface PendingPostNetworkCandidate {
+    postUrls: string[];
+    postIds: string[];
+    texts: string[];
+    videoIds: string[];
+  }
+
+  interface FacebookResponseCandidateDetail {
+    requestUrl?: string;
+    requestStartedAt?: number;
+    isStoryCreateResponse?: boolean;
+    postUrls?: string[];
+    storyFbids?: string[];
+    videoIds?: string[];
+    uploadSessionIds?: string[];
+    pendingPostCandidates?: PendingPostNetworkCandidate[];
+  }
+
+  const pendingResponseReplayBuffer: FacebookResponseCandidateDetail[] = [];
+
+  function extractPendingPostCandidates(text: string): PendingPostNetworkCandidate[] {
+    if (!location.pathname.match(/^\/groups\/[^/]+\/pending_posts\/?$/i)) return [];
+
+    const candidates: PendingPostNetworkCandidate[] = [];
+    const seen = new Set<string>();
+    const visit = (value: unknown, depth = 0): void => {
+      if (depth > 24 || value === null || typeof value !== 'object' || candidates.length >= 60) return;
+      if (Array.isArray(value)) {
+        for (const item of value) visit(item, depth + 1);
+        return;
+      }
+
+      const record = value as Record<string, unknown>;
+      for (const child of Object.values(record)) visit(child, depth + 1);
+
+      const serialized = JSON.stringify(record);
+      if (serialized.length > 250_000) return;
+      const postUrls = extractPostUrls(serialized);
+      const texts = Array.from(new Set(
+        Object.entries(record)
+          .filter(([key, item]) => /^(?:text|message|body|story_message)$/i.test(key) && typeof item === 'string')
+          .map(([, item]) => (item as string).normalize('NFKC').replace(/\s+/g, ' ').trim())
+          .filter((item) => item.length > 0 && item.length <= 2_000),
+      ));
+      if (!texts.length) {
+        const nestedTexts = Array.from(serialized.matchAll(/"(?:text|message|body|story_message)"\s*:\s*"((?:\\.|[^"\\])*)"/gi))
+          .map((match) => {
+            try {
+              return JSON.parse(`"${match[1]}"`) as string;
+            } catch {
+              return '';
+            }
+          })
+          .map((item) => item.normalize('NFKC').replace(/\s+/g, ' ').trim())
+          .filter((item) => item.length > 0 && item.length <= 2_000);
+        texts.push(...Array.from(new Set(nestedTexts)).slice(0, 20));
+      }
+      if (!texts.length) return;
+
+      const typename = typeof record.__typename === 'string' ? record.__typename : '';
+      const postIds = Array.from(new Set(
+        Object.entries(record)
+          .filter(([key, item]) => {
+            if (typeof item !== 'string' || !/^\d+$/.test(item)) return false;
+            if (/^(?:post_id|story_fbid|legacy_fbid|story_id)$/i.test(key)) return true;
+            return key === 'id' && /(?:story|post|feedunit)/i.test(typename);
+          })
+          .map(([, item]) => item as string),
+      ));
+      const videoIds = extractNetworkMetadata(serialized).videoIds;
+      if (!postUrls.length && !postIds.length) return;
+
+      const key = `${postUrls.join(',')}|${postIds.join(',')}|${texts.join('|')}|${videoIds.join(',')}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      candidates.push({
+        postUrls: postUrls.slice(0, 5),
+        postIds: postIds.slice(0, 5),
+        texts: texts.slice(0, 20),
+        videoIds: videoIds.slice(0, 10),
+      });
+    };
+
+    for (const line of text.split('\n')) {
+      const trimmed = line.trim().replace(/^for\s*\(\s*;\s*;\s*\)\s*;\s*/, '');
+      if (!trimmed.startsWith('{')) continue;
+      try {
+        visit(JSON.parse(trimmed));
+      } catch {
+        // Ignore malformed streaming-response lines.
+      }
+    }
+    return candidates;
+  }
+
   function getBodyText(body: unknown): string {
     if (typeof body === "string") return body;
     if (body instanceof URLSearchParams) return body.toString();
@@ -147,22 +250,7 @@
     return /(?:Comet)?ComposerStoryCreateMutation|story_create/i.test(decoded);
   }
 
-  function publishCandidates(detail: {
-    requestUrl?: string;
-    requestStartedAt?: number;
-    isStoryCreateResponse?: boolean;
-    postUrls?: string[];
-    storyFbids?: string[];
-    videoIds?: string[];
-    uploadSessionIds?: string[];
-  }): void {
-    const hasCandidates = Boolean(
-      detail.postUrls?.length ||
-      detail.storyFbids?.length ||
-      detail.videoIds?.length ||
-      detail.uploadSessionIds?.length
-    );
-    if (!hasCandidates) return;
+  function dispatchCandidates(detail: FacebookResponseCandidateDetail): void {
     window.dispatchEvent(new CustomEvent("postflow:facebook-response", { detail }));
     window.postMessage({
       source: "postflow-graphql-spy",
@@ -170,6 +258,26 @@
       ...detail,
     }, "*");
   }
+
+  function publishCandidates(detail: FacebookResponseCandidateDetail): void {
+    const hasCandidates = Boolean(
+      detail.postUrls?.length ||
+      detail.storyFbids?.length ||
+      detail.videoIds?.length ||
+      detail.uploadSessionIds?.length ||
+      detail.pendingPostCandidates?.length
+    );
+    if (!hasCandidates) return;
+    if (detail.pendingPostCandidates?.length) {
+      pendingResponseReplayBuffer.push(detail);
+      if (pendingResponseReplayBuffer.length > 100) pendingResponseReplayBuffer.shift();
+    }
+    dispatchCandidates(detail);
+  }
+
+  window.addEventListener(PENDING_RESPONSE_REPLAY_EVENT, () => {
+    for (const detail of pendingResponseReplayBuffer) dispatchCandidates(detail);
+  });
 
   function processText(
     text: string,
@@ -194,6 +302,7 @@
       ))
       : [];
     const responseMetadata = extractNetworkMetadata(text);
+    const pendingPostCandidates = extractPendingPostCandidates(text);
     const metadata = isStoryCreateResponse
       ? {
           videoIds: Array.from(new Set([...requestMetadata.videoIds, ...responseMetadata.videoIds])),
@@ -210,6 +319,7 @@
       postUrls,
       storyFbids,
       ...metadata,
+      pendingPostCandidates,
     });
     if (requestUrl && !requestUrl.includes("/api/graphql")) return;
 

@@ -66,8 +66,6 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
   const [mediaUrls, setMediaUrls] = useState<string[]>([]);
   const [publishMode, setPublishMode] = useState<"NOW" | "SCHEDULED">("NOW");
   const [startTime, setStartTime] = useState("");
-  const [spacePostsApart, setSpacePostsApart] = useState(false);
-  const [spacingMinutes, setSpacingMinutes] = useState(3);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isReadingMedia, setIsReadingMedia] = useState(false);
   const [isLoadingGroups, setIsLoadingGroups] = useState(false);
@@ -277,11 +275,6 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
       setError("Choose a date and time for the scheduled post.");
       return;
     }
-    if (spacePostsApart && !startTime) {
-      setError("Choose a start time before spacing posts apart.");
-      return;
-    }
-
     setIsSubmitting(true);
     try {
       const res = await fetch("/api/posts", {
@@ -294,8 +287,6 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
             ? { type: "GROUP", groupId: destination.group._id }
             : { type: "PROFILE_FEED", facebookConnectionId: destination.connection._id }),
           ...(publishMode === "SCHEDULED" && startTime ? { startTime: new Date(startTime).toISOString() } : {}),
-          spacePostsApart,
-          ...(spacePostsApart ? { spacingMinutes } : {}),
         }),
       });
 
@@ -782,7 +773,6 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
                 onClick={() => {
                   setPublishMode("NOW");
                   setStartTime("");
-                  setSpacePostsApart(false);
                 }}
                 className={"inline-flex h-8 items-center justify-center gap-1.5 rounded text-xs font-medium transition-colors " + (publishMode === "NOW" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground")}
                 aria-pressed={publishMode === "NOW"}
@@ -801,6 +791,10 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
               </button>
             </div>
 
+            <p className="text-xs leading-5 text-muted-foreground">
+              Destinations publish in order with a random 30–120 second gap between each one.
+            </p>
+
             {publishMode === "SCHEDULED" && (
               <div className="space-y-3">
                 <div className="space-y-1.5">
@@ -813,30 +807,6 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
                     className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm shadow-sm focus:outline-none focus:ring-3 focus:ring-ring/20"
                   />
                 </div>
-                <label className="flex cursor-pointer items-center justify-between gap-3 rounded-md border border-border bg-background px-3 py-2.5">
-                  <span className="text-xs font-medium text-foreground">Space destinations apart</span>
-                  <input
-                    type="checkbox"
-                    checked={spacePostsApart}
-                    onChange={(event) => setSpacePostsApart(event.target.checked)}
-                    className="h-4 w-4 accent-primary"
-                  />
-                </label>
-                {spacePostsApart && (
-                  <div className="space-y-1.5">
-                    <label htmlFor="spacing-minutes" className="text-xs font-medium text-muted-foreground">Time between posts</label>
-                    <select
-                      id="spacing-minutes"
-                      value={spacingMinutes}
-                      onChange={(event) => setSpacingMinutes(Number(event.target.value))}
-                      className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm shadow-sm focus:outline-none focus:ring-3 focus:ring-ring/20"
-                    >
-                      {[1, 2, 3, 5, 10, 15, 30].map((minutes) => (
-                        <option key={minutes} value={minutes}>{minutes} minute{minutes === 1 ? "" : "s"}</option>
-                      ))}
-                    </select>
-                  </div>
-                )}
                 {startTime && selectedDestinations.length > 1 && (
                   <div className="max-h-24 space-y-1 overflow-y-auto border-l-2 border-primary/30 pl-3 text-[11px] text-muted-foreground">
                     {selectedDestinations.map((destination, index) => (
@@ -845,7 +815,9 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
                           {destination.type === "GROUP" ? destination.group.name : connectionName(destination.connection) + " - Profile"}
                         </span>
                         <span className="shrink-0 tabular-nums">
-                          {new Date(new Date(startTime).getTime() + index * (spacePostsApart ? spacingMinutes : 0) * 60_000).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}
+                          {index === 0
+                            ? new Date(startTime).toLocaleString([], { dateStyle: "short", timeStyle: "short" })
+                            : "30–120 sec after previous"}
                         </span>
                       </div>
                     ))}

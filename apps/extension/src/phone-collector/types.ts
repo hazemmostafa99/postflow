@@ -73,6 +73,7 @@ interface PhoneCollectorState {
   summary: PhoneCollectionSummary;
   collectionError?: string;
   syncStatus: PhoneSyncStatus;
+  syncCategory?: string;
   syncError?: string;
   syncResult?: PhoneSyncResult;
 }

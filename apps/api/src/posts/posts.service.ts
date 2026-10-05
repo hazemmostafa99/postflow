@@ -23,7 +23,11 @@ import {
   UserRole,
 } from '../schemas/user.schema';
 import { AuthorizationService } from '../auth/authorization.service';
-import { calculatePostSchedule } from './post-flow-time-spacing';
+import {
+  calculatePostSchedule,
+  MAX_RANDOM_POST_SPACING_SECONDS,
+  MIN_RANDOM_POST_SPACING_SECONDS,
+} from './post-flow-time-spacing';
 import {
   CreatePostTarget,
   isVerifiedProfileConnection,
@@ -36,14 +40,10 @@ export class CreatePostDto {
   targets?: CreatePostTarget[];
   targetGroupIds?: string[];
   startTime?: string;
-  spacePostsApart?: boolean;
-  spacingMinutes?: number | null;
 }
 
 export class UpdatePostScheduleDto {
   startTime?: string | null;
-  spacePostsApart?: boolean;
-  spacingMinutes?: number | null;
 }
 
 export interface ListPostsOptions {
@@ -138,15 +138,9 @@ export class PostsService {
       );
     }
 
-    const spacePostsApart = dto.spacePostsApart === true;
     const startTime = dto.startTime ? new Date(dto.startTime) : undefined;
     if (dto.startTime && (!startTime || Number.isNaN(startTime.getTime()))) {
       throw new BadRequestException('Start time must be a valid date');
-    }
-    if (spacePostsApart && !startTime) {
-      throw new BadRequestException(
-        'Start time is required when spacing posts apart',
-      );
     }
 
     const groupIds = targets.flatMap((target) =>
@@ -226,23 +220,17 @@ export class PostsService {
       mediaUrls,
       status: 'PUBLISHING',
       ...(startTime ? { startTime } : {}),
-      spacePostsApart,
-      ...(spacePostsApart && dto.spacingMinutes !== null
-        ? { spacingMinutes: dto.spacingMinutes }
-        : {}),
+      spacingMinSeconds: MIN_RANDOM_POST_SPACING_SECONDS,
+      spacingMaxSeconds: MAX_RANDOM_POST_SPACING_SECONDS,
     });
 
-    const schedule = startTime
-      ? calculatePostSchedule({
-          startTime,
-          posts: orderedTargets.map((target) => ({
-            post: target,
-            order: target.order,
-          })),
-          spacePostsApart,
-          spacingMinutes: spacePostsApart ? (dto.spacingMinutes ?? null) : null,
-        })
-      : [];
+    const schedule = calculatePostSchedule({
+      startTime: startTime ?? new Date(),
+      posts: orderedTargets.map((target) => ({
+        post: target,
+        order: target.order,
+      })),
+    });
 
     const scheduledByOrder = new Map(
       schedule.map((item) => [item.order, item.scheduledAt]),
@@ -306,15 +294,9 @@ export class PostsService {
       .exec();
     if (!post) throw new NotFoundException('Post not found');
 
-    const spacePostsApart = dto.spacePostsApart === true;
     const startTime = dto.startTime ? new Date(dto.startTime) : undefined;
     if (dto.startTime && (!startTime || Number.isNaN(startTime.getTime()))) {
       throw new BadRequestException('Start time must be a valid date');
-    }
-    if (spacePostsApart && !startTime) {
-      throw new BadRequestException(
-        'Start time is required when spacing posts apart',
-      );
     }
 
     const pendingJobs = await this.jobModel
@@ -324,17 +306,13 @@ export class PostsService {
       .sort({ flowOrder: 1, createdAt: 1, _id: 1 })
       .exec();
 
-    const schedule = startTime
-      ? calculatePostSchedule({
-          startTime,
-          posts: pendingJobs.map((job, index) => ({
-            post: job,
-            order: Number.isFinite(job.flowOrder) ? job.flowOrder : index,
-          })),
-          spacePostsApart,
-          spacingMinutes: spacePostsApart ? (dto.spacingMinutes ?? null) : null,
-        })
-      : [];
+    const schedule = calculatePostSchedule({
+      startTime: startTime ?? new Date(),
+      posts: pendingJobs.map((job, index) => ({
+        post: job,
+        order: Number.isFinite(job.flowOrder) ? job.flowOrder : index,
+      })),
+    });
 
     const scheduledByJobId = new Map(
       schedule.map((item) => [item.post._id.toString(), item.scheduledAt]),
@@ -345,10 +323,8 @@ export class PostsService {
     }
 
     post.startTime = startTime;
-    post.spacePostsApart = spacePostsApart;
-    post.spacingMinutes = spacePostsApart
-      ? (dto.spacingMinutes ?? undefined)
-      : undefined;
+    post.spacingMinSeconds = MIN_RANDOM_POST_SPACING_SECONDS;
+    post.spacingMaxSeconds = MAX_RANDOM_POST_SPACING_SECONDS;
     await post.save();
 
     return {
@@ -640,6 +616,25 @@ export class PostsService {
       await this.jobModel.deleteMany().where('postId').in(postIds).exec();
     }
     await this.postModel.deleteMany(postVisibilityFilter).exec();
+  }
+
+  async deletePost(clerkUserId: string, postId: string) {
+    if (!Types.ObjectId.isValid(postId)) {
+      throw new NotFoundException('Post not found');
+    }
+
+    const postVisibilityFilter =
+      await this.getPostVisibilityFilter(clerkUserId);
+    const post = await this.postModel
+      .findOneAndDelete({ _id: postId, ...postVisibilityFilter })
+      .exec();
+    if (!post) throw new NotFoundException('Post not found');
+
+    await this.jobModel
+      .deleteMany()
+      .where('postId')
+      .in([post._id])
+      .exec();
   }
 
   private async getPostVisibilityFilter(

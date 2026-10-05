@@ -1,6 +1,7 @@
 import {
   calculatePostSchedule,
-  MAX_POST_SPACING_MINUTES,
+  MAX_RANDOM_POST_SPACING_SECONDS,
+  MIN_RANDOM_POST_SPACING_SECONDS,
 } from './post-flow-time-spacing';
 
 describe('calculatePostSchedule', () => {
@@ -11,12 +12,12 @@ describe('calculatePostSchedule', () => {
     { post: { id: 'post-2' }, order: 1 },
   ];
 
-  it('spaces posts in Post Flow order', () => {
+  it('spaces posts cumulatively in Post Flow order', () => {
+    const randomValues = [0, 0.5];
     const result = calculatePostSchedule({
       startTime,
       posts,
-      spacePostsApart: true,
-      spacingMinutes: 2,
+      random: () => randomValues.shift() ?? 0,
     });
 
     expect(result.map((item) => item.post.id)).toEqual([
@@ -26,73 +27,53 @@ describe('calculatePostSchedule', () => {
     ]);
     expect(result.map((item) => item.scheduledAt.toISOString())).toEqual([
       '2026-09-20T10:00:00.000Z',
-      '2026-09-20T10:02:00.000Z',
-      '2026-09-20T10:04:00.000Z',
+      '2026-09-20T10:00:30.000Z',
+      '2026-09-20T10:01:45.000Z',
     ]);
   });
 
-  it('supports three-minute spacing', () => {
-    const result = calculatePostSchedule({
+  it('includes both the 30 and 120 second bounds', () => {
+    const minimum = calculatePostSchedule({
       startTime,
       posts: posts.slice(0, 2),
-      spacePostsApart: true,
-      spacingMinutes: 3,
+      random: () => 0,
     });
-
-    expect(result[1].scheduledAt.toISOString()).toBe(
-      '2026-09-20T10:03:00.000Z',
-    );
-  });
-
-  it('uses the same start time when spacing is disabled', () => {
-    const result = calculatePostSchedule({
+    const maximum = calculatePostSchedule({
       startTime,
-      posts,
-      spacePostsApart: false,
-      spacingMinutes: null,
+      posts: posts.slice(0, 2),
+      random: () => 0.999999,
     });
 
     expect(
-      result.every(
-        (item) => item.scheduledAt.getTime() === startTime.getTime(),
-      ),
-    ).toBe(true);
+      (minimum[1].scheduledAt.getTime() - minimum[0].scheduledAt.getTime()) /
+        1000,
+    ).toBe(MIN_RANDOM_POST_SPACING_SECONDS);
+    expect(
+      (maximum[1].scheduledAt.getTime() - maximum[0].scheduledAt.getTime()) /
+        1000,
+    ).toBe(MAX_RANDOM_POST_SPACING_SECONDS);
   });
 
-  it('handles a single post', () => {
+  it('does not consume randomness for a single post', () => {
+    const random = jest.fn(() => 0.5);
     const result = calculatePostSchedule({
       startTime,
       posts: [posts[1]],
-      spacePostsApart: true,
-      spacingMinutes: 3,
+      random,
     });
 
     expect(result[0].scheduledAt.toISOString()).toBe(startTime.toISOString());
+    expect(random).not.toHaveBeenCalled();
   });
 
-  it.each([0, -1, 1.5, null])(
-    'rejects invalid enabled spacing: %s',
-    (spacingMinutes) => {
-      expect(() =>
-        calculatePostSchedule({
-          startTime,
-          posts,
-          spacePostsApart: true,
-          spacingMinutes,
-        }),
-      ).toThrow('Spacing must be an integer');
-    },
-  );
-
-  it('rejects spacing over the configured maximum', () => {
+  it('rejects an invalid random source value', () => {
     expect(() =>
       calculatePostSchedule({
         startTime,
-        posts,
-        spacePostsApart: true,
-        spacingMinutes: MAX_POST_SPACING_MINUTES + 1,
+        posts: posts.slice(0, 2),
+        random: () => 1,
       }),
-    ).toThrow('Spacing cannot exceed');
+    ).toThrow('Random source must return');
   });
 
   it('rejects an invalid start time', () => {
@@ -100,8 +81,6 @@ describe('calculatePostSchedule', () => {
       calculatePostSchedule({
         startTime: new Date('invalid'),
         posts,
-        spacePostsApart: false,
-        spacingMinutes: null,
       }),
     ).toThrow('Start time must be a valid date');
   });

@@ -5,6 +5,7 @@ import {
   Delete,
   Body,
   Headers,
+  Param,
   Query,
   HttpCode,
   HttpStatus,
@@ -80,6 +81,18 @@ export class GroupsController {
       );
     }
     return this.groupsService.getGroups(clerkUserId, groupConnectionIds);
+  }
+
+  /** DELETE /api/groups/:id - delete one synced group and its jobs */
+  @Delete(':id')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async removeOne(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('id') id: string,
+  ) {
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    await this.groupsService.deleteGroup(clerkUserId, id);
   }
 
   /** DELETE /api/groups - delete all synced groups and their jobs */

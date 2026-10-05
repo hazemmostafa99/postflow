@@ -41,6 +41,7 @@ const phoneSyncDialog = document.getElementById("phone-sync-confirmation") as HT
 const confirmSelectedCount = document.getElementById("confirm-selected-count")!;
 const confirmPhoneSyncButton = document.getElementById("confirm-phone-sync") as HTMLButtonElement;
 const cancelPhoneSyncButton = document.getElementById("cancel-phone-sync") as HTMLButtonElement;
+const phoneSyncCategoryInput = document.getElementById("phone-sync-category") as HTMLInputElement;
 
 let currentExtensionName = "";
 let phoneCollectorState = createEmptyPhoneCollectorState();
@@ -158,6 +159,8 @@ function renderPhoneCollector() {
   const selectedCount = getSelectedPhoneNumbers().length;
   selectedPhoneCount.textContent = String(selectedCount);
   const syncLocked = phoneCollectorState.syncStatus === "confirming" || phoneCollectorState.syncStatus === "syncing";
+  selectAllPhonesButton.disabled = syncLocked || numbers.length === 0;
+  clearPhoneSelectionButton.disabled = syncLocked || (numbers.length === 0 && summary.found === 0);
   collectNumbersButton.disabled = collectionStatus === "collecting" || syncLocked;
   collectNumbersButton.textContent = collectionStatus === "collecting" ? "Collecting..." : "Collect Numbers";
   sendPhoneNumbersButton.disabled = selectedCount === 0 ||
@@ -278,9 +281,20 @@ function selectAllValidPhoneNumbers() {
   void persistPhoneCollectorState();
 }
 
-// Clears selection from all review rows without removing collected values.
-function clearPhoneNumberSelection() {
-  phoneCollectorState.numbers = phoneCollectorState.numbers.map((number) => ({ ...number, selected: false }));
+// Clears the complete collection and returns the collector to its initial state.
+function clearCollectedPhoneNumbers() {
+  if (phoneCollectorState.syncStatus === "confirming" || phoneCollectorState.syncStatus === "syncing") return;
+  phoneCollectorState.collectionStatus = "idle";
+  phoneCollectorState.source = null;
+  phoneCollectorState.candidates = [];
+  phoneCollectorState.numbers = [];
+  phoneCollectorState.summary = { found: 0, valid: 0, duplicates: 0, invalid: 0 };
+  phoneCollectorState.collectionError = undefined;
+  phoneCollectorState.syncStatus = "idle";
+  phoneCollectorState.syncError = undefined;
+  phoneCollectorState.syncResult = undefined;
+  phoneCollectorState.syncCategory = undefined;
+  phoneEditErrors.clear();
   renderPhoneCollector();
   void persistPhoneCollectorState();
 }
@@ -308,9 +322,7 @@ function updatePhoneReviewNumber(id: string, value: string) {
   phoneEditErrors.delete(id);
   phoneCollectorState.numbers = phoneCollectorState.numbers.map((number) => {
     if (number.id !== id) return number;
-    if (!result.valid) {
-      return { ...number, value, normalized: undefined, status: "invalid", selected: false, reason: result.reason };
-    }
+    if (!result.valid) return number;
     return {
       ...number,
       value: result.normalized,
@@ -320,6 +332,9 @@ function updatePhoneReviewNumber(id: string, value: string) {
       reason: undefined,
     };
   });
+  if (!result.valid) {
+    phoneCollectorState.numbers = phoneCollectorState.numbers.filter((number) => number.id !== id);
+  }
   renderPhoneCollector();
   void persistPhoneCollectorState();
 }
@@ -372,10 +387,14 @@ async function openPhoneSyncConfirmation() {
   logPhoneCollector("info", "Sync confirmation opened.", { selected: selectedNumbers.length });
   phoneCollectorState.syncStatus = "confirming";
   phoneCollectorState.syncError = undefined;
+  phoneSyncCategoryInput.value = phoneCollectorState.syncCategory ?? "";
   confirmSelectedCount.textContent = String(selectedNumbers.length);
   renderPhoneCollector();
   await persistPhoneCollectorState();
-  if (!phoneSyncDialog.open) phoneSyncDialog.showModal();
+  if (!phoneSyncDialog.open) {
+    phoneSyncDialog.showModal();
+    phoneSyncCategoryInput.focus();
+  }
 }
 
 // Closes confirmation without sending and restores the review controls.
@@ -427,6 +446,9 @@ async function confirmAndSyncPhoneNumbers() {
     return;
   }
 
+  const category = phoneSyncCategoryInput.value.trim().replace(/\s+/g, " ");
+  phoneCollectorState.syncCategory = category || undefined;
+
   logPhoneCollector("info", "Sync confirmed.", { selected: selectedNumbers.length });
   if (phoneSyncDialog.open) phoneSyncDialog.close();
   phoneCollectorState.syncStatus = "syncing";
@@ -446,6 +468,7 @@ async function confirmAndSyncPhoneNumbers() {
       phoneCollectorState.candidates = [];
       phoneCollectorState.numbers = [];
       phoneCollectorState.summary = { found: 0, valid: 0, duplicates: 0, invalid: 0 };
+      phoneCollectorState.syncCategory = undefined;
       phoneEditErrors.clear();
       logPhoneCollector("info", "Sync completed.", {
         added: response.result.added,
@@ -476,10 +499,16 @@ dashboardTab.addEventListener("keydown", handlePopupTabKeydown);
 phoneCollectorTab.addEventListener("keydown", handlePopupTabKeydown);
 collectNumbersButton.addEventListener("click", () => void collectPhoneNumbers());
 selectAllPhonesButton.addEventListener("click", selectAllValidPhoneNumbers);
-clearPhoneSelectionButton.addEventListener("click", clearPhoneNumberSelection);
+clearPhoneSelectionButton.addEventListener("click", clearCollectedPhoneNumbers);
 sendPhoneNumbersButton.addEventListener("click", () => void openPhoneSyncConfirmation());
 cancelPhoneSyncButton.addEventListener("click", closePhoneSyncConfirmation);
 confirmPhoneSyncButton.addEventListener("click", () => void confirmAndSyncPhoneNumbers());
+phoneSyncCategoryInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    void confirmAndSyncPhoneNumbers();
+  }
+});
 phoneSyncDialog.addEventListener("close", handlePhoneSyncDialogClose);
 
 // Requests a page scan through the service worker and converts transport failures to UI state.

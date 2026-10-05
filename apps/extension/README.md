@@ -16,17 +16,27 @@ Build-time public API configuration is committed in:
 - `.env.development`: `API_BASE_URL=http://localhost:8000`
 - `.env.production`: `API_BASE_URL=https://api.fitcure.online`
 
+Both files also define the public rollout switch
+`AUTOMATIC_ANALYTICS_ENABLED`. It is `true` for local development and defaults
+to `false` for production until the analytics scheduler is deliberately
+enabled.
+
 The build reads the selected file using Node's `parseEnv` and generates
 `dist/env.js`. `src/background.ts` reads it with:
 
 ```ts
-import { API_BASE_URL, BUILD_ENV } from './env.js';
+import {
+  API_BASE_URL,
+  AUTOMATIC_ANALYTICS_ENABLED,
+  BUILD_ENV,
+} from './env.js';
 ```
 
-API requests use `${API_BASE_URL}${path}`. The build also emits `BUILD_ENV`
-from the selected build mode. Only `API_BASE_URL` is read from the env file;
-shell environment variables and other `.env` files are not loaded. These URLs
-are public. Never put secrets in extension environment files or bundled code.
+API requests use `${API_BASE_URL}${path}`. The build also emits `BUILD_ENV` and
+the validated boolean analytics flag from the selected build mode. Only these
+two public values are read from the env file; shell environment variables and
+other `.env` files are not loaded. Never put secrets in extension environment
+files or bundled code.
 
 The manifest permits both API hosts and the production frontend. The dashboard
 content script runs on localhost and `https://fitcure.online/*` to read the
@@ -88,7 +98,30 @@ link on `chrome://extensions` and open **Console**. Each service worker start lo
 [PostFlow] PROD environment | API: https://api.fitcure.online
 ```
 
-This identifies the loaded build configuration; it does not confirm API connectivity.
+The same line reports `Automatic analytics: ON` or `OFF`. This identifies the
+loaded build configuration; it does not confirm API connectivity.
+
+## Automatic Analytics Rollback
+
+To stop scheduled analytics without disabling publishing, pending approval, or
+manual analytics:
+
+1. Set `AUTOMATIC_ANALYTICS_ENABLED=false` in the selected public environment
+   file.
+2. Rebuild and reload the extension.
+3. Confirm the startup line reports `Automatic analytics: OFF` and the
+   `postflow-engagement-sync` alarm is cleared.
+
+No database rollback is required. Existing metrics and scheduling timestamps
+are preserved, dashboard/manual refresh remains available, and any abandoned
+maintenance lease expires after five minutes.
+
+Per-profile maintenance counters can be inspected from the extension service
+worker console without exposing claim tokens:
+
+```js
+chrome.storage.local.get('maintenanceDiagnosticsV1').then(console.log)
+```
 
 ## Important Files
 

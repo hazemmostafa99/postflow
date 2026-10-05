@@ -5,6 +5,7 @@ import { AlertCircle, ArrowRight, Clock, FileText, Image as ImageIcon, UserRound
 import { NewPostDialog } from "@/components/new-post-dialog";
 import { ScheduledTime } from "@/components/scheduled-time";
 import { PostControlButtons } from "@/components/post-control-buttons";
+import { DeleteButton } from "@/components/delete-button";
 
 const API_BASE = process.env.API_URL || "http://localhost:8000";
 const POSTS_PER_PAGE = 10;
@@ -316,13 +317,20 @@ export default async function PostsPage({
                       <td className="px-4 py-4 text-right">
                         <div className="flex flex-col items-end gap-2">
                           <PostControlButtons postId={post._id} jobs={post.jobs} compact />
-                          <Link
-                            href={`/posts/${post._id}`}
-                            className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-medium transition-colors hover:bg-accent"
-                          >
-                            View
-                            <ArrowRight className="h-3 w-3" />
-                          </Link>
+                          <div className="flex items-center gap-2">
+                            <Link
+                              href={`/posts/${post._id}`}
+                              className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-xs font-medium transition-colors hover:bg-accent"
+                            >
+                              View
+                              <ArrowRight className="h-3 w-3" />
+                            </Link>
+                            <DeleteButton
+                              endpoint={`/api/posts/${encodeURIComponent(post._id)}`}
+                              label={`\"${post.content.trim().slice(0, 60) || "media post"}\"`}
+                              compact
+                            />
+                          </div>
                         </div>
                       </td>
                     </tr>

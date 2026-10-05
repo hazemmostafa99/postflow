@@ -63,14 +63,22 @@ interface PendingFacebookPost {
   content?: string;
   submittedAt: string;
   mediaCount?: number;
+  videoIds?: string[];
   textFingerprint?: string;
   lastCheckedAt?: string;
   nextCheckAt?: string;
   syncAttempts?: number;
   lastSyncError?: string;
+  claimToken?: string;
+  englishGroupVideo?: boolean;
+  englishPendingApprovalLookup?: boolean;
 }
 
 type PendingPostSyncResult =
+  | {
+      status: "CONTENT_MATCHED";
+      copiedShareUrl?: string;
+    }
   | {
       status: "PUBLISHED";
       postUrl?: string;
@@ -90,6 +98,7 @@ interface PublishedFacebookPost {
   targetType?: "GROUP" | "PROFILE_FEED";
   postUrl: string;
   lastEngagementSyncAt?: string;
+  claimToken?: string;
 }
 
 interface FacebookPostEngagement {

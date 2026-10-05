@@ -108,6 +108,18 @@ export class PostsController {
     return this.postsService.cancelPost(clerkUserId, id);
   }
 
+  /** DELETE /api/posts/:id - delete one visible post and its publishing jobs */
+  @Delete(':id')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async removeOne(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('id') id: string,
+  ) {
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    await this.postsService.deletePost(clerkUserId, id);
+  }
+
   /** DELETE /api/posts - delete all posts and their publishing jobs */
   @Delete()
   @HttpCode(HttpStatus.NO_CONTENT)

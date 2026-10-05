@@ -2,24 +2,59 @@
 
 import './posting-config.js';
 
-import { API_BASE_URL, BUILD_ENV } from './env.js';
+import {
+  API_BASE_URL,
+  AUTOMATIC_ANALYTICS_ENABLED,
+  BUILD_ENV,
+} from './env.js';
 import {
   getSafeFacebookProfileUrl,
   normalizePublishJob,
   type ProfileFeedPublishTarget,
   type PublishJob,
 } from './publishing-target.js';
+import {
+  ENGAGEMENT_MAINTENANCE_WAKE_INTERVAL_MINUTES,
+  PENDING_MAINTENANCE_WAKE_INTERVAL_MINUTES,
+  getMaintenanceAlarmFirstRunAt,
+  getMaintenanceStartupJitterMs,
+} from './maintenance-schedule.js';
+import {
+  getEngagementTabBehavior,
+  normalizeFacebookEngagementPermalink,
+  type EngagementSyncMode,
+} from './engagement-sync-policy.js';
+import {
+  createMaintenanceDiagnosticsSnapshot,
+  incrementMaintenanceMetric,
+  isMaintenanceDiagnosticsSnapshot,
+  maskExtensionInstanceId,
+  type MaintenanceDiagnosticsSnapshot,
+  type MaintenanceMetricName,
+  type MaintenanceWorkType,
+} from './maintenance-diagnostics.js';
 
-console.info(`[PostFlow] ${BUILD_ENV === 'production' ? 'PROD' : 'DEV'} environment | API: ${API_BASE_URL}`);
+console.info(
+  `[PostFlow] ${BUILD_ENV === 'production' ? 'PROD' : 'DEV'} environment | API: ${API_BASE_URL} | Automatic analytics: ${AUTOMATIC_ANALYTICS_ENABLED ? 'ON' : 'OFF'}`,
+);
 
 const HEARTBEAT_ALARM = 'postflow-heartbeat';
 const HEARTBEAT_INTERVAL_MINUTES = 1;
 const REGISTER_RETRY_ALARM = 'postflow-register-retry';
 const REGISTER_RETRY_DELAY_MINUTES = 1;
 const PENDING_POST_SYNC_ALARM = 'postflow-pending-post-sync';
-const PENDING_POST_SYNC_INTERVAL_MINUTES = 10;
+const PENDING_POST_SYNC_INTERVAL_MINUTES =
+  PENDING_MAINTENANCE_WAKE_INTERVAL_MINUTES;
+const MANUAL_MAINTENANCE_ALARM = 'postflow-manual-maintenance';
+const MANUAL_MAINTENANCE_INTERVAL_MINUTES = 1;
 const ENGAGEMENT_SYNC_ALARM = 'postflow-engagement-sync';
-const ENGAGEMENT_SYNC_INTERVAL_MINUTES = 30;
+const ENGAGEMENT_SYNC_INTERVAL_MINUTES =
+  ENGAGEMENT_MAINTENANCE_WAKE_INTERVAL_MINUTES;
+const MAINTENANCE_BATCH_LIMIT = 3;
+const MAINTENANCE_EXECUTION_BUDGET_MS = 45_000;
+const PENDING_POST_SYNC_ALARM_INITIALIZED_KEY = 'pendingPostSyncAlarmInitialized';
+const ENGAGEMENT_SYNC_ALARM_INITIALIZED_KEY = 'engagementSyncAlarmInitialized';
+const MAINTENANCE_DIAGNOSTICS_KEY = 'maintenanceDiagnosticsV1';
 const EXTENSION_INSTANCE_ID_KEY = 'extensionInstanceId';
 const EXTENSION_NAME_KEY = 'extensionName';
 const TAB_ACTION_RETRY_COUNT = 6;
@@ -95,12 +130,101 @@ async function getExtensionInstanceId(): Promise<string> {
 
       const extensionInstanceId = createExtensionInstanceId();
       await chrome.storage.local.set({ [EXTENSION_INSTANCE_ID_KEY]: extensionInstanceId });
-      console.log('[PostFlow] Created extension instance ID:', extensionInstanceId);
+      console.log(
+        '[PostFlow] Created extension instance ID:',
+        maskExtensionInstanceId(extensionInstanceId),
+      );
       return extensionInstanceId;
     })();
   }
 
   return extensionInstanceIdPromise;
+}
+
+type MaintenanceDiagnosticDetails = {
+  jobId?: string;
+  status?: string;
+  outcome?: string;
+  reasonCode?: string;
+  retryAt?: string;
+  manualOnly?: boolean;
+  itemCount?: number;
+};
+
+let maintenanceDiagnosticsSnapshotPromise:
+  | Promise<MaintenanceDiagnosticsSnapshot>
+  | null = null;
+let maintenanceDiagnosticsWriteQueue: Promise<void> = Promise.resolve();
+
+async function getMaintenanceDiagnosticsSnapshot(): Promise<MaintenanceDiagnosticsSnapshot> {
+  if (!maintenanceDiagnosticsSnapshotPromise) {
+    maintenanceDiagnosticsSnapshotPromise = (async () => {
+      const stored = await chrome.storage.local.get(MAINTENANCE_DIAGNOSTICS_KEY);
+      const snapshot = stored[MAINTENANCE_DIAGNOSTICS_KEY];
+      return isMaintenanceDiagnosticsSnapshot(snapshot)
+        ? snapshot
+        : createMaintenanceDiagnosticsSnapshot();
+    })();
+  }
+  return maintenanceDiagnosticsSnapshotPromise;
+}
+
+/** Persist small operational counters and emit a sanitized structured event. */
+function recordMaintenanceDiagnostic(
+  event: string,
+  workType: MaintenanceWorkType,
+  metric?: MaintenanceMetricName,
+  details: MaintenanceDiagnosticDetails = {},
+): Promise<void> {
+  const operation = maintenanceDiagnosticsWriteQueue.then(async () => {
+    const [snapshot, extensionInstanceId] = await Promise.all([
+      getMaintenanceDiagnosticsSnapshot(),
+      getExtensionInstanceId(),
+    ]);
+    const metricValue = metric
+      ? incrementMaintenanceMetric(snapshot, workType, metric)
+      : undefined;
+    if (metric) {
+      await chrome.storage.local.set({
+        [MAINTENANCE_DIAGNOSTICS_KEY]: snapshot,
+      });
+    }
+    console.info('[MaintenanceDiagnostic]', {
+      event,
+      workType,
+      extensionInstanceId: maskExtensionInstanceId(extensionInstanceId),
+      ...(metric ? { metric, metricValue } : {}),
+      ...details,
+    });
+  });
+  maintenanceDiagnosticsWriteQueue = operation.catch((error) => {
+    console.warn('[MaintenanceDiagnostic] Could not persist diagnostic event', {
+      event,
+      workType,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });
+  return operation;
+}
+
+function getMaintenanceWorkTypeForRequest(
+  path: string,
+  body?: Record<string, unknown>,
+): MaintenanceWorkType | null {
+  if (
+    path.includes('/pending-sync') ||
+    path.startsWith('/api/jobs/pending') ||
+    body?.type === 'PENDING_APPROVAL'
+  ) {
+    return 'PENDING_APPROVAL';
+  }
+  if (
+    path.includes('/engagement') ||
+    body?.type === 'ENGAGEMENT'
+  ) {
+    return 'ENGAGEMENT';
+  }
+  return null;
 }
 
 async function getClerkUserId(): Promise<string | null> {
@@ -172,8 +296,50 @@ async function apiFetch(
           url,
           response: text.slice(0, 300),
         });
+        let message: string | undefined;
+        try {
+          const parsed = JSON.parse(text) as { message?: string };
+          message = typeof parsed.message === 'string' ? parsed.message : undefined;
+        } catch {
+          // Keep the compact status-only error for non-JSON responses.
+        }
+        const maintenanceWorkType = getMaintenanceWorkTypeForRequest(
+          path,
+          body,
+        );
+        if (response.status === 401 && maintenanceWorkType && message) {
+          if (
+            message.includes('another Facebook connection') ||
+            message.includes('not linked to a verified Facebook connection')
+          ) {
+            void recordMaintenanceDiagnostic(
+              'ownership.rejected',
+              maintenanceWorkType,
+              'ownershipRejections',
+              { reasonCode: 'OWNERSHIP_REJECTED' },
+            );
+          } else if (message.toLowerCase().includes('expired')) {
+            void recordMaintenanceDiagnostic(
+              'lease.expired',
+              maintenanceWorkType,
+              'leaseExpirations',
+              { reasonCode: 'CLAIM_EXPIRED' },
+            );
+          } else if (
+            message.includes('already claimed') ||
+            message.includes('Maintenance claim required') ||
+            message.includes('Invalid')
+          ) {
+            void recordMaintenanceDiagnostic(
+              'lease.conflict',
+              maintenanceWorkType,
+              'leaseConflicts',
+              { reasonCode: 'CLAIM_CONFLICT' },
+            );
+          }
+        }
         return includeFailureDetails
-          ? { apiFetchError: true, status: response.status }
+          ? { apiFetchError: true, status: response.status, message }
           : null;
       }
 
@@ -220,11 +386,20 @@ async function syncPhoneNumbersToBackend(): Promise<PhoneSyncResponse> {
       error: 'The collection source is missing. Collect the numbers again before syncing.',
     };
   }
+  const category = state.syncCategory?.trim().replace(/\s+/g, ' ');
+  if (category && category.length > 80) {
+    logPhoneSync('warn', 'Sync stopped: category is too long.', { code: 'INVALID_RESPONSE' });
+    return {
+      ok: false,
+      code: 'INVALID_RESPONSE',
+      error: 'Category may contain at most 80 characters.',
+    };
+  }
 
   logPhoneSync('info', 'Sending selected numbers to PostFlow.', { selected: selectedNumbers.length });
   const response = await apiFetch(
     '/api/phone-contacts/sync',
-    { numbers: selectedNumbers, source: state.source },
+    { numbers: selectedNumbers, source: state.source, ...(category ? { category } : {}) },
     'POST',
     true,
   );
@@ -440,6 +615,7 @@ async function reportSession(sessionDetected: boolean, facebookUserId?: string |
     if (facebookIdentityVerified) {
       console.log('[PostFlow] Facebook identity verified:', connection?.facebookUserId);
       void checkPendingJobs();
+      void syncManualMaintenanceRequests();
     } else {
       console.warn('[PostFlow] Facebook identity verification failed', {
         sessionDetected,
@@ -1511,6 +1687,11 @@ chrome.runtime.onMessage.addListener((message, sender) => {
           (
             message.submissionResult?.status === 'UNKNOWN' &&
             completedPostHasVideo
+          ) ||
+          (
+            message.submissionResult?.status === 'PENDING_APPROVAL' &&
+            !message.submissionResult.postUrl &&
+            message.englishGroupFlow === true
           )
         ),
       );
@@ -1527,6 +1708,17 @@ chrome.runtime.onMessage.addListener((message, sender) => {
           mediaCount: Array.isArray(completedExecution.post.mediaUrls)
             ? completedExecution.post.mediaUrls.length
             : 0,
+          videoIds: Array.isArray(message.videoIds)
+            ? message.videoIds.filter((value: unknown): value is string =>
+                typeof value === 'string' && /^\d+$/.test(value)
+              )
+            : [],
+          ...(message.englishGroupFlow === true && completedPostHasVideo && message.submissionResult?.status !== 'PENDING_APPROVAL'
+            ? { englishGroupVideo: true }
+            : {}),
+          ...(message.englishGroupFlow === true && message.submissionResult?.status === 'PENDING_APPROVAL' && !message.submissionResult.postUrl
+            ? { englishPendingApprovalLookup: true }
+            : {}),
         };
         console.log('[PostFlow] Starting automatic post-link check after publish result', {
           jobId: message.jobId,
@@ -1548,9 +1740,19 @@ chrome.runtime.onMessage.addListener((message, sender) => {
         console.log('[PostFlow] Automatic post-link check finished', {
           jobId: message.jobId,
           status: syncResult.status,
+          postUrl: 'postUrl' in syncResult ? syncResult.postUrl : undefined,
           updated,
           persisted: shouldPersistAutomaticPostLinkCheck,
         });
+        if (syncPost.englishGroupVideo === true) {
+          await saveBackgroundPostingStep(message.jobId, 'english_video_post_url_persist_result', {
+            status: syncResult.status,
+            hasPostUrl: syncResult.status === 'PUBLISHED' && Boolean(syncResult.postUrl),
+            postUrl: syncResult.status === 'PUBLISHED' ? syncResult.postUrl : undefined,
+            updated,
+            persisted: shouldPersistAutomaticPostLinkCheck,
+          });
+        }
       }
 
       checkPendingJobs();
@@ -1596,9 +1798,112 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   }
 });
 
-/** Navigate to one pending post's group and ask the Facebook content script to
- * perform the DOM match. This function intentionally does not update the API;
- * persistence belongs to the next feature phase. */
+const ENGLISH_VIDEO_COPY_CAPTURE_SCRIPT_ID = 'postflow-english-video-copy-capture';
+const ENGLISH_PENDING_NETWORK_CAPTURE_SCRIPT_ID = 'postflow-english-pending-network-capture';
+
+function getBackgroundSiblingScriptFile(fileName: string): string {
+  const background = chrome.runtime.getManifest().background;
+  const serviceWorkerPath = background && 'service_worker' in background
+    ? background.service_worker
+    : '';
+  const scriptDirectory = serviceWorkerPath.includes('/')
+    ? serviceWorkerPath.slice(0, serviceWorkerPath.lastIndexOf('/') + 1)
+    : '';
+  return `${scriptDirectory}${fileName}`;
+}
+
+function getEnglishVideoCopyCaptureScriptFile(): string {
+  return getBackgroundSiblingScriptFile('facebook-copy-link-capture.js');
+}
+
+async function registerEnglishVideoCopyLinkCapture(): Promise<boolean> {
+  try {
+    await chrome.scripting.unregisterContentScripts({
+      ids: [ENGLISH_VIDEO_COPY_CAPTURE_SCRIPT_ID],
+    }).catch(() => undefined);
+    await chrome.scripting.registerContentScripts([{
+      id: ENGLISH_VIDEO_COPY_CAPTURE_SCRIPT_ID,
+      matches: ['https://www.facebook.com/groups/*'],
+      js: [getEnglishVideoCopyCaptureScriptFile()],
+      runAt: 'document_start',
+      world: 'MAIN',
+      persistAcrossSessions: false,
+    }]);
+    return true;
+  } catch (error) {
+    console.warn('[PendingPostSync] Could not register early English video Copy link capture', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+async function unregisterEnglishVideoCopyLinkCapture(): Promise<void> {
+  await chrome.scripting.unregisterContentScripts({
+    ids: [ENGLISH_VIDEO_COPY_CAPTURE_SCRIPT_ID],
+  }).catch(() => undefined);
+}
+
+async function isEnglishVideoCopyLinkCaptureInstalled(tabId: number): Promise<boolean> {
+  try {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: () => Boolean((window as Window & {
+        __postflowFacebookCopyLinkCaptureInstalled?: boolean;
+      }).__postflowFacebookCopyLinkCaptureInstalled),
+    });
+    return result?.result === true;
+  } catch {
+    return false;
+  }
+}
+
+async function registerEnglishPendingNetworkCapture(): Promise<boolean> {
+  try {
+    await chrome.scripting.unregisterContentScripts({
+      ids: [ENGLISH_PENDING_NETWORK_CAPTURE_SCRIPT_ID],
+    }).catch(() => undefined);
+    await chrome.scripting.registerContentScripts([{
+      id: ENGLISH_PENDING_NETWORK_CAPTURE_SCRIPT_ID,
+      matches: ['https://www.facebook.com/groups/*'],
+      js: [getBackgroundSiblingScriptFile('graphql-spy.js')],
+      runAt: 'document_start',
+      world: 'MAIN',
+      persistAcrossSessions: false,
+    }]);
+    return true;
+  } catch (error) {
+    console.warn('[PendingPostSync] Could not register early English pending-page network capture', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+async function unregisterEnglishPendingNetworkCapture(): Promise<void> {
+  await chrome.scripting.unregisterContentScripts({
+    ids: [ENGLISH_PENDING_NETWORK_CAPTURE_SCRIPT_ID],
+  }).catch(() => undefined);
+}
+
+async function isEnglishPendingNetworkCaptureInstalled(tabId: number): Promise<boolean> {
+  try {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: () => Boolean((window as Window & {
+        __postflowGraphqlSpyInstalled?: boolean;
+      }).__postflowGraphqlSpyInstalled),
+    });
+    return result?.result === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Navigate to one post's Group page and return the content script's match.
+ * The caller owns API persistence. */
 async function checkSinglePendingPost(post: PendingFacebookPost, lockAlreadyHeld = false): Promise<PendingPostSyncResult> {
   if (isProcessingJob) {
     return { status: 'CHECK_FAILED', reason: 'A new Facebook post is currently being published' };
@@ -1613,7 +1918,14 @@ async function checkSinglePendingPost(post: PendingFacebookPost, lockAlreadyHeld
 
   isCheckingPendingPost = true;
   const requestId = `pending-${++pendingCheckSequence}`;
+  const isEnglishVideoCheck = post.englishGroupVideo === true;
+  const isEnglishPendingApprovalLookup = post.englishPendingApprovalLookup === true;
+  const needsEnglishCopyCapture = isEnglishVideoCheck && !isEnglishPendingApprovalLookup;
   let syncTabId: number | undefined;
+  let previousActiveTabId: number | undefined;
+  let registeredEnglishCopyCapture = false;
+  let registeredEnglishPendingNetworkCapture = false;
+  let pendingLookupRefreshTimer: ReturnType<typeof setInterval> | undefined;
   try {
     const groupUrl = getSafeFacebookGroupUrl(post, post.groupUrl);
     if (!groupUrl) {
@@ -1624,6 +1936,12 @@ async function checkSinglePendingPost(post: PendingFacebookPost, lockAlreadyHeld
       groupUrl,
       requestId,
     });
+    if (isEnglishVideoCheck) {
+      await saveBackgroundPostingStep(post.id, 'english_video_fresh_tab_check_started', {
+        requestId,
+        groupUrl,
+      });
+    }
     // Status checks must never reuse or foreground the tab used for a new
     // publish. Reusing tabs here was the source of old posts appearing during
     // a different group's publish flow.
@@ -1638,49 +1956,333 @@ async function checkSinglePendingPost(post: PendingFacebookPost, lockAlreadyHeld
         // Fall back to the group feed when the saved pending URL is invalid.
       }
     }
-    const fbTab = await chrome.tabs.create({ url: checkUrl, active: false });
+    if (isEnglishPendingApprovalLookup && !post.postUrl) {
+      const parsedGroupUrl = new URL(groupUrl);
+      const groupPath = parsedGroupUrl.pathname.match(/^\/groups\/[^/]+/i)?.[0];
+      if (!groupPath) {
+        return { status: 'CHECK_FAILED', reason: 'Invalid Facebook group URL for pending-post lookup' };
+      }
+      checkUrl = `${parsedGroupUrl.origin}${groupPath}/pending_posts/`;
+      await saveBackgroundPostingStep(post.id, 'english_pending_fresh_tab_check_started', {
+        requestId,
+        checkUrl,
+      });
+    }
+    if (needsEnglishCopyCapture) {
+      const [previousActiveTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      previousActiveTabId = previousActiveTab?.id;
+      await saveBackgroundPostingStep(post.id, isEnglishPendingApprovalLookup
+        ? 'english_pending_copy_capture_install_started'
+        : 'english_video_copy_capture_install_started', {
+        mode: 'document_start',
+      });
+      registeredEnglishCopyCapture = await registerEnglishVideoCopyLinkCapture();
+      await saveBackgroundPostingStep(post.id, isEnglishPendingApprovalLookup
+        ? 'english_pending_copy_capture_install_finished'
+        : 'english_video_copy_capture_install_finished', {
+        installed: registeredEnglishCopyCapture,
+        mode: 'document_start',
+      });
+    }
+    if (isEnglishPendingApprovalLookup) {
+      await saveBackgroundPostingStep(post.id, 'english_pending_network_capture_install_started', {
+        mode: 'document_start',
+      });
+      registeredEnglishPendingNetworkCapture = await registerEnglishPendingNetworkCapture();
+      await saveBackgroundPostingStep(post.id, 'english_pending_network_capture_install_finished', {
+        installed: registeredEnglishPendingNetworkCapture,
+        mode: 'document_start',
+      });
+    }
+    const fbTab = await chrome.tabs.create({
+      url: checkUrl,
+      active: needsEnglishCopyCapture,
+    });
     syncTabId = fbTab.id;
+    if (isEnglishVideoCheck) {
+      await saveBackgroundPostingStep(post.id, 'english_video_fresh_tab_created', {
+        tabId: fbTab.id ?? null,
+        active: fbTab.active,
+      });
+    }
 
     if (!fbTab.id || !(await waitForFacebookTabAfterNavigation(fbTab.id, checkUrl, POSTING_TIMING.facebookTabReadyTimeoutMs))) {
       console.warn('[PendingPostSync] Facebook pending-post navigation failed', { postId: post.id, checkUrl });
+      if (isEnglishVideoCheck) {
+        await saveBackgroundPostingStep(post.id, 'english_video_fresh_tab_not_ready', {
+          tabId: fbTab.id ?? null,
+        });
+      }
       return { status: 'CHECK_FAILED', reason: 'Target Facebook group page did not finish loading' };
+    }
+    if (isEnglishPendingApprovalLookup && fbTab.id) {
+      await saveBackgroundPostingStep(post.id, 'english_pending_network_capture_document_ready', {
+        tabId: fbTab.id,
+        installed: await isEnglishPendingNetworkCaptureInstalled(fbTab.id),
+        mode: 'document_start',
+      });
+      const refreshIntervalMs = 15_000;
+      await saveBackgroundPostingStep(post.id, 'english_pending_page_refresh_scheduled', {
+        tabId: fbTab.id,
+        refreshIntervalMs,
+      });
+      pendingLookupRefreshTimer = setInterval(() => {
+        void chrome.tabs.reload(fbTab.id!).then(() => {
+          void saveBackgroundPostingStep(post.id, 'english_pending_page_refreshed', {
+            tabId: fbTab.id,
+          });
+        }).catch(() => undefined);
+      }, refreshIntervalMs);
+    }
+    if (isEnglishVideoCheck) {
+      await saveBackgroundPostingStep(post.id, 'english_video_fresh_tab_ready', {
+        tabId: fbTab.id,
+      });
+      await saveBackgroundPostingStep(post.id, 'english_video_copy_capture_document_ready', {
+        tabId: fbTab.id,
+        installed: await isEnglishVideoCopyLinkCaptureInstalled(fbTab.id),
+        mode: 'document_start',
+      });
     }
 
     const startedAt = Date.now();
-    while (Date.now() - startedAt < POSTING_TIMING.facebookTabReadyTimeoutMs) {
+    let deliveryAttempts = 0;
+    const pendingLookupTimeoutMs = isEnglishPendingApprovalLookup
+      ? POSTING_TIMING.profileVideoPermalinkTimeoutMs
+      : POSTING_TIMING.facebookTabReadyTimeoutMs;
+    while (Date.now() - startedAt < pendingLookupTimeoutMs) {
       try {
+        deliveryAttempts += 1;
         console.log('[PendingPostSync] Asking Facebook content script to check post', {
           postId: post.id,
           tabId: fbTab.id,
           requestId,
         });
+        if (isEnglishVideoCheck && deliveryAttempts === 1) {
+          await saveBackgroundPostingStep(post.id, 'english_video_content_check_sent', {
+            tabId: fbTab.id,
+            requestId,
+          });
+        }
         const response = await chrome.tabs.sendMessage(fbTab.id, {
           type: 'CHECK_PENDING_POST',
           requestId,
           post,
         });
         if (response?.ok && response.result) {
+          const result = response.result as PendingPostSyncResult;
           console.log('[PendingPostSync] Facebook content script returned result', {
             postId: post.id,
-            result: response.result,
+            result,
           });
-          return response.result as PendingPostSyncResult;
+          if (isEnglishVideoCheck) {
+            await saveBackgroundPostingStep(post.id, 'english_video_content_check_result', {
+              status: result.status,
+              deliveryAttempts,
+              hasCopiedShareUrl: result.status === 'CONTENT_MATCHED' && Boolean(result.copiedShareUrl),
+            });
+          }
+          if (isEnglishPendingApprovalLookup) {
+            await saveBackgroundPostingStep(post.id, 'english_pending_lookup_result', {
+              status: result.status,
+              postUrl: 'postUrl' in result ? result.postUrl : undefined,
+              reason: 'reason' in result ? result.reason : undefined,
+              deliveryAttempts,
+            });
+          }
+          if (result.status === 'CONTENT_MATCHED') {
+            console.log('[PendingPostSync] English Group video content match succeeded', {
+              postId: post.id,
+              tabId: fbTab.id,
+            });
+            if (result.copiedShareUrl) {
+              const canonicalPostUrl = await resolveEnglishGroupShareRedirect(
+                fbTab.id,
+                result.copiedShareUrl,
+                post,
+              );
+              if (canonicalPostUrl) {
+                console.log('[PendingPostSync] English video share link resolved to canonical Group post', {
+                  postId: post.id,
+                  canonicalPostUrl,
+                });
+                if (isEnglishPendingApprovalLookup) {
+                  await saveBackgroundPostingStep(post.id, 'english_pending_post_url_resolved', {
+                    status: /\/pending_posts\//i.test(canonicalPostUrl)
+                      ? 'STILL_PENDING'
+                      : 'PUBLISHED',
+                    postUrl: canonicalPostUrl,
+                  });
+                }
+                return {
+                  status: /\/pending_posts\//i.test(canonicalPostUrl)
+                    ? 'STILL_PENDING'
+                    : 'PUBLISHED',
+                  postUrl: canonicalPostUrl,
+                };
+              }
+              console.warn('[PendingPostSync] Copied English video share link did not resolve to the expected Group', {
+                postId: post.id,
+              });
+            }
+          }
+          return result;
         }
       } catch {
-        // Content scripts can be replaced during navigation; retry until timeout.
+        // The content script can be replaced during initial navigation. Keep
+        // retrying delivery, but perform only one DOM/render evaluation.
       }
       await new Promise((resolve) => setTimeout(resolve, POSTING_TIMING.facebookMessageRetryIntervalMs));
+    }
+    if (isEnglishPendingApprovalLookup) {
+      await saveBackgroundPostingStep(post.id, 'english_pending_lookup_deadline_reached', {
+        timeoutMs: pendingLookupTimeoutMs,
+        deliveryAttempts,
+      });
     }
     return { status: 'CHECK_FAILED', reason: 'Timed out waiting for pending post matcher' };
   } catch (err: any) {
     return { status: 'CHECK_FAILED', reason: err?.message ?? 'Pending post check failed' };
   } finally {
+    if (pendingLookupRefreshTimer !== undefined) {
+      clearInterval(pendingLookupRefreshTimer);
+      pendingLookupRefreshTimer = undefined;
+    }
     if (syncTabId !== undefined) {
       await chrome.tabs.remove(syncTabId).catch(() => undefined);
+      if (isEnglishVideoCheck) {
+        await saveBackgroundPostingStep(post.id, 'english_video_fresh_tab_closed', {
+          tabId: syncTabId,
+        }).catch(() => undefined);
+      } else if (isEnglishPendingApprovalLookup) {
+        await saveBackgroundPostingStep(post.id, 'english_pending_fresh_tab_closed', {
+          tabId: syncTabId,
+        }).catch(() => undefined);
+      }
+    }
+    if (needsEnglishCopyCapture && previousActiveTabId !== undefined && previousActiveTabId !== syncTabId) {
+      await chrome.tabs.update(previousActiveTabId, { active: true }).catch(() => undefined);
+      await saveBackgroundPostingStep(post.id, isEnglishPendingApprovalLookup
+        ? 'english_pending_previous_tab_restored'
+        : 'english_video_previous_tab_restored', {
+        tabId: previousActiveTabId,
+      }).catch(() => undefined);
+    }
+    if (registeredEnglishCopyCapture) {
+      await unregisterEnglishVideoCopyLinkCapture();
+      await saveBackgroundPostingStep(post.id, isEnglishPendingApprovalLookup
+        ? 'english_pending_copy_capture_unregistered'
+        : 'english_video_copy_capture_unregistered', {
+        mode: 'document_start',
+      }).catch(() => undefined);
+    }
+    if (registeredEnglishPendingNetworkCapture) {
+      await unregisterEnglishPendingNetworkCapture();
+      await saveBackgroundPostingStep(post.id, 'english_pending_network_capture_unregistered', {
+        mode: 'document_start',
+      }).catch(() => undefined);
     }
     isCheckingPendingPost = false;
     if (!lockAlreadyHeld) isFacebookSyncBusy = false;
   }
+}
+
+function normalizeResolvedEnglishGroupPostUrl(
+  value: string,
+  post: PendingFacebookPost,
+): string | null {
+  try {
+    const url = new URL(value);
+    if (url.hostname !== 'facebook.com' && !url.hostname.endsWith('.facebook.com')) return null;
+    const match = url.pathname.match(
+      /^\/groups\/([^/]+)\/(posts|permalink|pending_posts)\/([A-Za-z0-9_-]+)/i,
+    );
+    if (!match) return null;
+
+    const expectedGroups = new Set(
+      [post.groupId, post.groupExternalId]
+        .filter((groupId): groupId is string => typeof groupId === 'string' && Boolean(groupId))
+        .map((groupId) => groupId.toLowerCase()),
+    );
+    try {
+      const groupUrlId = new URL(post.groupUrl).pathname.match(/^\/groups\/([^/]+)/i)?.[1];
+      if (groupUrlId) expectedGroups.add(groupUrlId.toLowerCase());
+    } catch {
+      // The validated job target aliases above remain sufficient.
+    }
+    if (expectedGroups.size && !expectedGroups.has(match[1].toLowerCase())) return null;
+    const canonicalRoute = match[2].toLowerCase() === 'pending_posts'
+      ? 'pending_posts'
+      : 'posts';
+    return `https://www.facebook.com/groups/${match[1]}/${canonicalRoute}/${match[3]}/`;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveEnglishGroupShareRedirect(
+  tabId: number,
+  shareUrl: string,
+  post: PendingFacebookPost,
+): Promise<string | null> {
+  const directPostUrl = normalizeResolvedEnglishGroupPostUrl(shareUrl, post);
+  if (directPostUrl) return directPostUrl;
+
+  let parsedShareUrl: URL;
+  try {
+    parsedShareUrl = new URL(shareUrl);
+  } catch {
+    return null;
+  }
+  if (
+    (parsedShareUrl.hostname !== 'facebook.com' && !parsedShareUrl.hostname.endsWith('.facebook.com')) ||
+    !/^\/share\/v\/[A-Za-z0-9_-]+\/?$/i.test(parsedShareUrl.pathname)
+  ) return null;
+
+  await saveBackgroundPostingStep(post.id, 'english_video_share_redirect_started', {
+    tabId,
+    shareUrl: parsedShareUrl.href,
+  });
+  await chrome.tabs.update(tabId, { url: parsedShareUrl.href, active: true });
+  const startedAt = Date.now();
+  let lastObservedPath = '';
+  while (Date.now() - startedAt < POSTING_TIMING.facebookTabReadyTimeoutMs) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.url) {
+        try {
+          const observedUrl = new URL(tab.url);
+          const observedPath = `${observedUrl.pathname}${observedUrl.search}`;
+          if (observedPath !== lastObservedPath) {
+            lastObservedPath = observedPath;
+            await saveBackgroundPostingStep(post.id, 'english_video_share_redirect_location_changed', {
+              observedPath,
+              tabStatus: tab.status ?? null,
+            });
+          }
+        } catch {
+          // Continue polling until Facebook exposes a valid URL.
+        }
+      }
+      const canonicalPostUrl = tab.url
+        ? normalizeResolvedEnglishGroupPostUrl(tab.url, post)
+        : null;
+      if (canonicalPostUrl) {
+        await saveBackgroundPostingStep(post.id, 'english_video_canonical_post_url_resolved', {
+          canonicalPostUrl,
+        });
+        return canonicalPostUrl;
+      }
+    } catch {
+      await saveBackgroundPostingStep(post.id, 'english_video_share_redirect_tab_unavailable');
+      return null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  await saveBackgroundPostingStep(post.id, 'english_video_share_redirect_timed_out', {
+    lastObservedPath: lastObservedPath || null,
+  });
+  return null;
 }
 
 /**
@@ -1720,39 +2322,48 @@ async function waitForFacebookTabAfterNavigation(tabId: number, targetUrl: strin
   return false;
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.type !== 'TRIGGER_SINGLE_PENDING_SYNC' || !message.post) return;
-  void checkSinglePendingPost(message.post as PendingFacebookPost)
-    .then(async (result) => {
-      const updated = await persistPendingSyncResult(message.post as PendingFacebookPost, result);
-      console.log('[PendingPostSync] Single check persisted', {
-        postId: message.post.id,
-        status: result.status,
-        updated,
-      });
-      sendResponse({ ok: true, result, updated });
-    })
-    .catch((err) => sendResponse({ ok: false, error: err?.message ?? 'Pending post sync failed' }));
-  return true;
-});
-
 let isPendingBatchRunning = false;
 
 /** Fetch and process a small pending-post batch without opening concurrent tabs. */
-async function syncPendingPostsBatch(): Promise<Array<{ postId: string; result: PendingPostSyncResult; updated: boolean }>> {
+async function syncPendingPostsBatch(
+  manualOnly = false,
+  maxItems = MAINTENANCE_BATCH_LIMIT,
+): Promise<Array<{ postId: string; result: PendingPostSyncResult; updated: boolean }>> {
   if (isPendingBatchRunning || isFacebookSyncBusy || isProcessingJob) return [];
   isPendingBatchRunning = true;
   isFacebookSyncBusy = true;
 
   try {
-    const pendingPosts = await apiFetch('/api/jobs/pending?limit=10');
+    await recordMaintenanceDiagnostic(
+      'claim.requested',
+      'PENDING_APPROVAL',
+      'claimRequests',
+      { manualOnly },
+    );
+    const pendingPosts = await apiFetch(
+      `/api/jobs/pending?limit=${Math.min(MAINTENANCE_BATCH_LIMIT, Math.max(1, maxItems))}${manualOnly ? '&manualOnly=true' : ''}`,
+    );
     if (!Array.isArray(pendingPosts)) {
       console.warn('[PendingPostSync] Could not fetch pending posts');
       return [];
     }
+    if (pendingPosts.length === 0) {
+      await recordMaintenanceDiagnostic(
+        'claim.empty',
+        'PENDING_APPROVAL',
+        'emptyClaims',
+        { manualOnly },
+      );
+    }
 
     const results: Array<{ postId: string; result: PendingPostSyncResult; updated: boolean }> = [];
     for (const post of pendingPosts as PendingFacebookPost[]) {
+      await recordMaintenanceDiagnostic(
+        'claim.created',
+        'PENDING_APPROVAL',
+        'claimsCreated',
+        { jobId: post.id, manualOnly },
+      );
       let result: PendingPostSyncResult;
       try {
         result = await checkSinglePendingPost(post, true);
@@ -1761,6 +2372,18 @@ async function syncPendingPostsBatch(): Promise<Array<{ postId: string; result: 
       }
 
       const updated = await persistPendingSyncResult(post, result);
+      await recordMaintenanceDiagnostic(
+        'result.completed',
+        'PENDING_APPROVAL',
+        updated && result.status !== 'CHECK_FAILED'
+          ? 'resultSuccesses'
+          : 'resultFailures',
+        {
+          jobId: post.id,
+          status: result.status,
+          outcome: updated ? 'UPDATED' : 'NOT_UPDATED',
+        },
+      );
       results.push({ postId: post.id, result, updated });
       console.log('[PendingPostSync] Completed pending post check', {
         postId: post.id,
@@ -1776,7 +2399,10 @@ async function syncPendingPostsBatch(): Promise<Array<{ postId: string; result: 
 }
 
 async function persistPendingSyncResult(post: PendingFacebookPost, result: PendingPostSyncResult): Promise<boolean> {
-  const response = await apiFetch(`/api/jobs/${post.id}/pending-sync`, result);
+  const response = await apiFetch(`/api/jobs/${post.id}/pending-sync`, {
+    ...result,
+    ...(post.claimToken ? { claimToken: post.claimToken } : {}),
+  });
   return Boolean(response);
 }
 
@@ -1784,19 +2410,11 @@ let isEngagementBatchRunning = false;
 let engagementCheckSequence = 0;
 let isCheckingEngagement = false;
 
-function normalizeStoredFacebookPostUrl(value: string): string | null {
-  const markdownMatch = value.trim().match(/^\[[^\]]+\]\((https?:\/\/[^)]+)\)$/i);
-  const candidate = markdownMatch?.[1] ?? value.trim();
-  try {
-    const url = new URL(candidate);
-    if (!/facebook\.com$/i.test(url.hostname) && !/\.facebook\.com$/i.test(url.hostname)) return null;
-    return url.href;
-  } catch {
-    return null;
-  }
-}
-
-async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlreadyHeld = false): Promise<PostEngagementSyncResult> {
+async function checkSinglePostEngagement(
+  post: PublishedFacebookPost,
+  lockAlreadyHeld = false,
+  mode: EngagementSyncMode = 'MANUAL',
+): Promise<PostEngagementSyncResult> {
   if (isProcessingJob) {
     return { status: 'CHECK_FAILED', reason: 'A new Facebook post is currently being published' };
   }
@@ -1809,7 +2427,8 @@ async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlread
   let syncTabId: number | undefined;
   let previousActiveTabId: number | undefined;
   let foregroundRetryUsed = false;
-  const postUrl = normalizeStoredFacebookPostUrl(post.postUrl);
+  const tabBehavior = getEngagementTabBehavior(mode);
+  const postUrl = normalizeFacebookEngagementPermalink(post.postUrl);
   if (!postUrl) {
     console.error('[PostAnalytics] Invalid stored Facebook post URL', { postId: post.id, postUrl: post.postUrl });
     isCheckingEngagement = false;
@@ -1823,10 +2442,14 @@ async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlread
       postId: post.id,
       postUrl,
       requestId,
+      mode,
     });
     // Analytics runs in an isolated background tab. It must not navigate the
     // active publishing tab to a previously stored post URL.
-    const fbTab = await chrome.tabs.create({ url: postUrl, active: false });
+    const fbTab = await chrome.tabs.create({
+      url: postUrl,
+      active: tabBehavior.initiallyActive,
+    });
     syncTabId = fbTab.id;
     console.log('[PostAnalytics] Facebook tab opened', { tabId: fbTab.id, postId: post.id });
     const ready = Boolean(fbTab.id && await waitForFacebookTabAfterNavigation(fbTab.id, postUrl, POSTING_TIMING.facebookTabReadyTimeoutMs));
@@ -1836,7 +2459,8 @@ async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlread
       return { status: 'CHECK_FAILED', reason: 'Target Facebook post did not finish loading' };
     }
 
-    for (let renderAttempt = 0; renderAttempt < 2; renderAttempt += 1) {
+    const renderAttemptLimit = tabBehavior.allowForegroundRetry ? 2 : 1;
+    for (let renderAttempt = 0; renderAttempt < renderAttemptLimit; renderAttempt += 1) {
       if (renderAttempt === 1) {
         foregroundRetryUsed = true;
         console.warn('[PostAnalytics] Empty background Facebook surface; retrying in foreground', {
@@ -1872,6 +2496,17 @@ async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlread
           console.log('[PostAnalytics] Facebook tab response received', { postId: post.id, tabId: fbTab.id, response });
           if (response?.ok && response.result) {
             if (renderAttempt === 0 && response.emptySurface === true) {
+              if (!tabBehavior.allowForegroundRetry) {
+                console.warn('[PostAnalytics] Empty background Facebook surface; automatic foreground retry disabled', {
+                  postId: post.id,
+                  targetType: post.targetType ?? 'GROUP',
+                  tabId: fbTab.id,
+                });
+                return {
+                  status: 'CHECK_FAILED',
+                  reason: 'Facebook engagement did not render in the background tab',
+                };
+              }
               retryInForeground = true;
               break;
             }
@@ -1910,20 +2545,61 @@ async function checkSinglePostEngagement(post: PublishedFacebookPost, lockAlread
   }
 }
 
-async function syncPublishedEngagementBatch(postId?: string) {
+async function syncPublishedEngagementBatch(
+  manualOnly = false,
+  maxItems = MAINTENANCE_BATCH_LIMIT,
+  mode: EngagementSyncMode = 'AUTOMATIC',
+) {
   if (isEngagementBatchRunning || isFacebookSyncBusy || isProcessingJob) return [];
   isEngagementBatchRunning = true;
   isFacebookSyncBusy = true;
   try {
-    const query = postId
-      ? `/api/jobs/engagement-pending?limit=50&postId=${encodeURIComponent(postId)}`
-      : '/api/jobs/engagement-pending?limit=10';
+    await recordMaintenanceDiagnostic(
+      'claim.requested',
+      'ENGAGEMENT',
+      'claimRequests',
+      { manualOnly },
+    );
+    const queryParams = new URLSearchParams({
+      limit: String(Math.min(MAINTENANCE_BATCH_LIMIT, Math.max(1, maxItems))),
+      ...(manualOnly ? { manualOnly: 'true' } : {}),
+    });
+    const query = `/api/jobs/engagement-pending?${queryParams.toString()}`;
     const posts = await apiFetch(query);
     if (!Array.isArray(posts)) return [];
+    if (posts.length === 0) {
+      await recordMaintenanceDiagnostic(
+        'claim.empty',
+        'ENGAGEMENT',
+        'emptyClaims',
+        { manualOnly },
+      );
+    }
     const results = [];
     for (const post of posts as PublishedFacebookPost[]) {
-      const result = await checkSinglePostEngagement(post, true);
-      const updated = Boolean(await apiFetch(`/api/jobs/${post.id}/engagement`, result));
+      await recordMaintenanceDiagnostic(
+        'claim.created',
+        'ENGAGEMENT',
+        'claimsCreated',
+        { jobId: post.id, manualOnly },
+      );
+      const result = await checkSinglePostEngagement(post, true, mode);
+      const updated = Boolean(await apiFetch(`/api/jobs/${post.id}/engagement`, {
+        ...result,
+        ...(post.claimToken ? { claimToken: post.claimToken } : {}),
+      }));
+      await recordMaintenanceDiagnostic(
+        'result.completed',
+        'ENGAGEMENT',
+        updated && result.status !== 'CHECK_FAILED'
+          ? 'resultSuccesses'
+          : 'resultFailures',
+        {
+          jobId: post.id,
+          status: result.status,
+          outcome: updated ? 'UPDATED' : 'NOT_UPDATED',
+        },
+      );
       results.push({ postId: post.id, result, updated });
       console.log('[PostAnalytics] Engagement sync completed', { postId: post.id, result, updated });
     }
@@ -1934,43 +2610,186 @@ async function syncPublishedEngagementBatch(postId?: string) {
   }
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.type === 'TRIGGER_SINGLE_ENGAGEMENT_SYNC' && message.post) {
-    void checkSinglePostEngagement(message.post as PublishedFacebookPost)
-      .then(async (result) => {
-        const updated = Boolean(await apiFetch(`/api/jobs/${message.post.id}/engagement`, result));
-        sendResponse({ ok: true, result, updated, postId: message.post.id });
-      })
-      .catch((err) => sendResponse({ ok: false, error: err?.message ?? 'Engagement sync failed' }));
-    return true;
-  }
-  if (message.type !== 'TRIGGER_ENGAGEMENT_SYNC') return;
-  void syncPublishedEngagementBatch(typeof message.postId === 'string' ? message.postId : undefined)
-    .then((results) => sendResponse({ ok: true, results }))
-    .catch((err) => sendResponse({ ok: false, error: err?.message ?? 'Engagement sync failed' }));
-  return true;
-});
+type MaintenanceCoordinatorOptions = {
+  manualOnly?: boolean;
+  pending?: boolean;
+  analytics?: boolean;
+  analyticsMode?: EngagementSyncMode;
+};
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.type !== 'TRIGGER_PENDING_POST_SYNC') return;
-  void syncPendingPostsBatch()
-    .then((results) => sendResponse({ ok: true, results }))
-    .catch((err) => sendResponse({ ok: false, error: err?.message ?? 'Pending post batch failed' }));
-  return true;
-});
+let isMaintenanceCoordinatorRunning = false;
+
+/** Give new publishing work a chance between maintenance items. */
+async function yieldMaintenanceToPublishing(deadline: number): Promise<boolean> {
+  if (Date.now() >= deadline) return false;
+  const previousBusyState = isFacebookSyncBusy;
+  isFacebookSyncBusy = false;
+  try {
+    await checkPendingJobs();
+    return Date.now() < deadline;
+  } finally {
+    isFacebookSyncBusy = previousBusyState;
+  }
+}
+
+/** Run maintenance in priority order with one navigation at a time. */
+async function runMaintenanceCoordinator(
+  options: MaintenanceCoordinatorOptions = {},
+) {
+  if (
+    isMaintenanceCoordinatorRunning ||
+    isProcessingJob ||
+    isFacebookSyncBusy ||
+    !facebookIdentityVerified
+  ) {
+    return [];
+  }
+
+  const {
+    manualOnly = false,
+    pending = true,
+    analytics = false,
+    analyticsMode = 'AUTOMATIC',
+  } = options;
+  isMaintenanceCoordinatorRunning = true;
+  const startedAt = Date.now();
+  const deadline = startedAt + MAINTENANCE_EXECUTION_BUDGET_MS;
+  const results: unknown[] = [];
+  console.log('[Maintenance] Coordinator started', {
+    manualOnly,
+    pending,
+    analytics,
+    analyticsMode,
+  });
+  try {
+    for (const workType of (pending ? ['pending', ...(analytics ? ['analytics'] : [])] : analytics ? ['analytics'] : [])) {
+      for (let index = 0; index < MAINTENANCE_BATCH_LIMIT; index += 1) {
+        if (!(await yieldMaintenanceToPublishing(deadline))) return results;
+        const batch = workType === 'pending'
+          ? await syncPendingPostsBatch(manualOnly, 1)
+          : await syncPublishedEngagementBatch(
+              manualOnly,
+              1,
+              analyticsMode,
+            );
+        if (!batch.length) break;
+        results.push(...batch);
+      }
+    }
+    console.log('[Maintenance] Coordinator completed', {
+      processed: results.length,
+      elapsedMs: Date.now() - startedAt,
+    });
+    return results;
+  } finally {
+    isMaintenanceCoordinatorRunning = false;
+  }
+}
+
+/** Process dashboard requests that belong to this extension's connection. */
+async function syncManualMaintenanceRequests() {
+  return runMaintenanceCoordinator({
+    manualOnly: true,
+    pending: true,
+    analytics: true,
+    analyticsMode: 'MANUAL',
+  });
+}
 
 // ── Alarms ──
+
+/**
+ * Keep automatic maintenance wakes persistent across service-worker restarts,
+ * but spread each first wake by a stable 0–2 minute offset. Storage markers
+ * prevent a service-worker restart from moving an already scheduled alarm
+ * back to "now + jitter".
+ */
+async function ensureMaintenanceAlarms(): Promise<void> {
+  const [existingPendingAlarm, existingEngagementAlarm, stored] =
+    await Promise.all([
+      chrome.alarms.get(PENDING_POST_SYNC_ALARM),
+      chrome.alarms.get(ENGAGEMENT_SYNC_ALARM),
+      chrome.storage.local.get([
+        PENDING_POST_SYNC_ALARM_INITIALIZED_KEY,
+        ENGAGEMENT_SYNC_ALARM_INITIALIZED_KEY,
+      ]),
+    ]);
+  const pendingAlarmInitialized =
+    stored[PENDING_POST_SYNC_ALARM_INITIALIZED_KEY] === true;
+  const engagementAlarmInitialized =
+    stored[ENGAGEMENT_SYNC_ALARM_INITIALIZED_KEY] === true;
+
+  if (
+    !existingPendingAlarm ||
+    existingPendingAlarm.periodInMinutes !== PENDING_POST_SYNC_INTERVAL_MINUTES ||
+    !pendingAlarmInitialized
+  ) {
+    const extensionInstanceId = await getExtensionInstanceId();
+    const jitterMs = getMaintenanceStartupJitterMs(extensionInstanceId);
+    chrome.alarms.create(PENDING_POST_SYNC_ALARM, {
+      when: getMaintenanceAlarmFirstRunAt(extensionInstanceId),
+      periodInMinutes: PENDING_POST_SYNC_INTERVAL_MINUTES,
+    });
+    await chrome.storage.local.set({
+      [PENDING_POST_SYNC_ALARM_INITIALIZED_KEY]: true,
+    });
+    console.log('[Maintenance] Pending scheduler armed', {
+      intervalMinutes: PENDING_POST_SYNC_INTERVAL_MINUTES,
+      jitterMs,
+    });
+  }
+
+  if (!AUTOMATIC_ANALYTICS_ENABLED) {
+    if (existingEngagementAlarm) {
+      await chrome.alarms.clear(ENGAGEMENT_SYNC_ALARM);
+    }
+    await chrome.storage.local.remove(ENGAGEMENT_SYNC_ALARM_INITIALIZED_KEY);
+    console.info('[MaintenanceDiagnostic]', {
+      event: 'scheduler.disabled',
+      workType: 'ENGAGEMENT',
+      reasonCode: 'FEATURE_FLAG_OFF',
+    });
+  } else if (
+    !existingEngagementAlarm ||
+    existingEngagementAlarm.periodInMinutes !== ENGAGEMENT_SYNC_INTERVAL_MINUTES ||
+    !engagementAlarmInitialized
+  ) {
+    const extensionInstanceId = await getExtensionInstanceId();
+    const analyticsJitterKey = `${extensionInstanceId}:analytics`;
+    const jitterMs = getMaintenanceStartupJitterMs(analyticsJitterKey);
+    chrome.alarms.create(ENGAGEMENT_SYNC_ALARM, {
+      when: getMaintenanceAlarmFirstRunAt(analyticsJitterKey),
+      periodInMinutes: ENGAGEMENT_SYNC_INTERVAL_MINUTES,
+    });
+    await chrome.storage.local.set({
+      [ENGAGEMENT_SYNC_ALARM_INITIALIZED_KEY]: true,
+    });
+    console.log('[Maintenance] Analytics scheduler armed', {
+      intervalMinutes: ENGAGEMENT_SYNC_INTERVAL_MINUTES,
+      jitterMs,
+      backgroundOnly: true,
+    });
+  }
+
+  const existingManualAlarm = await chrome.alarms.get(MANUAL_MAINTENANCE_ALARM);
+  if (
+    !existingManualAlarm ||
+    existingManualAlarm.periodInMinutes !== MANUAL_MAINTENANCE_INTERVAL_MINUTES
+  ) {
+    chrome.alarms.create(MANUAL_MAINTENANCE_ALARM, {
+      periodInMinutes: MANUAL_MAINTENANCE_INTERVAL_MINUTES,
+    });
+  }
+}
 
 chrome.alarms.create(HEARTBEAT_ALARM, {
   periodInMinutes: HEARTBEAT_INTERVAL_MINUTES,
 });
-chrome.alarms.create(PENDING_POST_SYNC_ALARM, {
-  periodInMinutes: PENDING_POST_SYNC_INTERVAL_MINUTES,
-});
-// Engagement checks are explicitly user-triggered from the dashboard. An
-// automatic alarm can open a previously stored post URL while a new post is
-// being published, so do not schedule background navigation for analytics.
-void chrome.alarms.clear(ENGAGEMENT_SYNC_ALARM);
+void ensureMaintenanceAlarms();
+// Remove state left by the retired English-video retry experiment. The
+// finalized flow performs one fresh-tab reconciliation immediately.
+void chrome.alarms.clear('postflow-english-video-link-sync');
+void chrome.storage.local.remove('englishGroupVideoLinkRetries');
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === REGISTER_RETRY_ALARM) {
@@ -1982,7 +2801,21 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     checkPendingJobs(); // Also check jobs on heartbeat
   }
   if (alarm.name === PENDING_POST_SYNC_ALARM) {
-    void syncPendingPostsBatch();
+    void runMaintenanceCoordinator({ pending: true });
+  }
+  if (alarm.name === ENGAGEMENT_SYNC_ALARM) {
+    if (AUTOMATIC_ANALYTICS_ENABLED) {
+      void runMaintenanceCoordinator({
+        pending: false,
+        analytics: true,
+        analyticsMode: 'AUTOMATIC',
+      });
+    } else {
+      void chrome.alarms.clear(ENGAGEMENT_SYNC_ALARM);
+    }
+  }
+  if (alarm.name === MANUAL_MAINTENANCE_ALARM) {
+    void syncManualMaintenanceRequests();
   }
 });
 

@@ -180,6 +180,40 @@ function findVideoIdentityElement(root: ParentNode, id: string): HTMLElement | n
     .find((element) => element.getAttribute('data-video-id') === id) ?? null;
 }
 
+function hasEnglishIconOnlyReelZeroComments(post: Element, targetUrl?: string): boolean {
+  if (!targetUrl) return false;
+  const targetIdentity = extractFacebookEngagementIdentity(targetUrl);
+  if (!targetIdentity || !['REEL', 'VIDEO'].includes(targetIdentity.kind)) return false;
+  if (!sameFacebookEngagementIdentity(
+    extractFacebookEngagementIdentity(window.location.href),
+    targetIdentity,
+  )) return false;
+  if (!findVideoIdentityElement(post, targetIdentity.id) || !hasLoadedEngagementActions(post)) return false;
+
+  const commentAction = findEngagementAction(post, 'comment_button');
+  if (!commentAction) return false;
+  const label = (commentAction.getAttribute('aria-label') ?? '').trim();
+  if (!/^comment$/i.test(label)) return false;
+  return extractNumericCount(commentAction.textContent ?? '') === null;
+}
+
+function findVideoEngagementControlScope(videoIdentity: HTMLElement): Element | null {
+  let current = videoIdentity.parentElement;
+  while (current && current !== document.body && current !== document.documentElement) {
+    const likeActions = findVisibleEngagementActions(current, 'like_button');
+    const commentActions = findVisibleEngagementActions(current, 'comment_button');
+    // The supplied Profile Reel viewer renders Like plus a separate React
+    // control alongside one Comment control. Choose the smallest ancestor that
+    // joins that action pane to the exact data-video-id pane. Refuse broader
+    // ancestors containing controls for multiple reels.
+    if (likeActions.length >= 1 && likeActions.length <= 2 && commentActions.length === 1) {
+      return current;
+    }
+    current = current.parentElement;
+  }
+  return null;
+}
+
 interface EngagementTargetMatch {
   element: Element | null;
   identityFound: boolean;
@@ -208,6 +242,15 @@ function findEngagementTargetInRoot(
     identityFound ||= Boolean(videoIdentity);
     const article = videoIdentity?.closest(ENGAGEMENT_POST_SELECTOR);
     if (article) return { element: article.closest('[role="dialog"]') ?? article, identityFound: true };
+    const videoControlScope = videoIdentity && findVideoEngagementControlScope(videoIdentity);
+    if (videoControlScope) {
+      console.log('[PostAnalytics] Matched target video with its sibling engagement pane', {
+        targetId: targetIdentity.id,
+        likeActions: findVisibleEngagementActions(videoControlScope, 'like_button').length,
+        commentActions: findVisibleEngagementActions(videoControlScope, 'comment_button').length,
+      });
+      return { element: videoControlScope, identityFound: true };
+    }
     const viewer = videoIdentity?.closest('[role="dialog"], [role="main"]');
     if (viewer) return { element: viewer, identityFound: true };
   }
@@ -328,7 +371,7 @@ function isEngagementVisible(element: Element): boolean {
 
 function getEngagementRenderDiagnostics(targetUrl: string, scope: Element | null) {
   return {
-    extractor: 'v10',
+    extractor: 'v12',
     targetFound: Boolean(scope),
     targetActionsLoaded: Boolean(scope && hasLoadedEngagementActions(scope)),
     currentTarget: sameFacebookEngagementIdentity(
@@ -360,7 +403,7 @@ function createEngagementRenderFailure(
     emptySurface,
     reason: [
       'Target post engagement controls did not finish rendering',
-      `(extractor=v10, targetFound=${diagnostics.targetFound}`,
+      `(extractor=v12, targetFound=${diagnostics.targetFound}`,
       `currentTarget=${diagnostics.currentTarget}`,
       `articles=${diagnostics.articles}`,
       `dialogs=${diagnostics.visibleDialogs}`,
@@ -412,7 +455,7 @@ function extractFacebookEngagement(root: ParentNode = document, targetUrl?: stri
   const post = findEngagementRoot(root, targetUrl);
   if (!post) {
     const diagnostics = [
-      'extractor=v10',
+      'extractor=v12',
       'targetArticle=false',
       `articles=${root.querySelectorAll(ENGAGEMENT_POST_SELECTOR).length}`,
       `permalinkLinks=${root.querySelectorAll('a[href*="multi_permalinks"]').length}`,
@@ -438,13 +481,24 @@ function extractFacebookEngagement(root: ParentNode = document, targetUrl?: stri
     // evidence. The post-age permalink is deliberately excluded above.
     reactionCount = 0;
   }
+  const englishIconOnlyReelZeroComments = commentCount === null &&
+    hasEnglishIconOnlyReelZeroComments(post, targetUrl);
+  if (englishIconOnlyReelZeroComments) commentCount = 0;
+  const targetIdentity = targetUrl ? extractFacebookEngagementIdentity(targetUrl) : null;
+  const scopeKind = post.matches('[role="dialog"]')
+    ? 'dialog'
+    : targetIdentity && ['REEL', 'VIDEO'].includes(targetIdentity.kind) &&
+      Boolean(findVideoIdentityElement(post, targetIdentity.id))
+      ? 'video-viewer'
+      : 'article';
   const diagnostics = [
-    'extractor=v10',
-    `scope=${post.matches('[role="dialog"]') ? 'dialog' : 'article'}`,
+    'extractor=v12',
+    `scope=${scopeKind}`,
     'targetArticle=true',
     `permalinkLinks=${post.querySelectorAll('a[href*="multi_permalinks"]').length}`,
     `labels=${candidates.filter(Boolean).length}`,
     `explicitNoComments=${explicitNoComments}`,
+    `englishIconOnlyReelZeroComments=${englishIconOnlyReelZeroComments}`,
     `actionsLoaded=${hasLoadedEngagementActions(post)}`,
   ].join(', ');
   console.log('[PostAnalytics] Extracted engagement counters', { reactionCount, commentCount, diagnostics });

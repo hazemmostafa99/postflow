@@ -9,7 +9,7 @@ if (!["development", "production"].includes(mode)) {
 
 // Read only the selected file and emit only this public value, never all env vars.
 const envFile = `.env.${mode}`;
-const { API_BASE_URL } = parseEnv(readFileSync(envFile, "utf8"));
+const { API_BASE_URL, AUTOMATIC_ANALYTICS_ENABLED } = parseEnv(readFileSync(envFile, "utf8"));
 if (!API_BASE_URL) {
   throw new Error(`API_BASE_URL is required in ${envFile}`);
 }
@@ -17,6 +17,10 @@ const apiUrl = new URL(API_BASE_URL);
 if (!["http:", "https:"].includes(apiUrl.protocol) || apiUrl.username || apiUrl.password || apiUrl.search || apiUrl.hash) {
   throw new Error(`API_BASE_URL in ${envFile} must be an HTTP(S) URL without credentials, query, or fragment`);
 }
+if (!["true", "false"].includes(AUTOMATIC_ANALYTICS_ENABLED ?? "")) {
+  throw new Error(`AUTOMATIC_ANALYTICS_ENABLED in ${envFile} must be true or false`);
+}
+const automaticAnalyticsEnabled = AUTOMATIC_ANALYTICS_ENABLED === "true";
 
 const files = [
   "popup/popup.html",
@@ -37,7 +41,7 @@ copyFileSync(
 );
 
 writeFileSync(resolve("dist/env.js"),
-  `// Generated from ${envFile}; public extension configuration.\nexport const BUILD_ENV = ${JSON.stringify(mode)};\nexport const API_BASE_URL = ${JSON.stringify(API_BASE_URL.replace(/\/+$/, ""))};\n`);
+  `// Generated from ${envFile}; public extension configuration.\nexport const BUILD_ENV = ${JSON.stringify(mode)};\nexport const API_BASE_URL = ${JSON.stringify(API_BASE_URL.replace(/\/+$/, ""))};\nexport const AUTOMATIC_ANALYTICS_ENABLED = ${JSON.stringify(automaticAnalyticsEnabled)};\n`);
 
 // The source manifest supports loading the project folder; the packaged manifest
 // uses paths relative to dist so that dist itself can be loaded in Chrome.
@@ -52,4 +56,4 @@ for (const resource of manifest.web_accessible_resources) {
   resource.resources = resource.resources.map(distPath);
 }
 writeFileSync(resolve("dist/manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
-console.log(`Built ${mode} extension in dist (API: ${API_BASE_URL})`);
+console.log(`Built ${mode} extension in dist (API: ${API_BASE_URL}, automatic analytics: ${automaticAnalyticsEnabled ? "enabled" : "disabled"})`);

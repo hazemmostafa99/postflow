@@ -133,7 +133,7 @@
           <span><strong id="selected-phone-count">0</strong> selected</span>
           <div>
             <button class="text-button" id="select-all-phones" type="button">Select all</button>
-            <button class="text-button" id="clear-phone-selection" type="button">Clear</button>
+            <button class="text-button" id="clear-phone-selection" type="button">Clear all</button>
           </div>
         </div>
         <p class="review-empty" id="phone-review-empty">Numbers you collect will appear here.</p>
@@ -156,6 +156,10 @@
       <p class="eyebrow">Confirm sync</p>
       <h2 id="phone-sync-confirmation-title">Send numbers to PostFlow?</h2>
       <p class="sync-confirmation-copy">You are about to send <strong id="confirm-selected-count">0</strong> selected phone numbers.</p>
+      <label class="sync-category-field" for="phone-sync-category">
+        <span>Category <small>(optional)</small></span>
+        <input id="phone-sync-category" type="text" maxlength="80" autocomplete="off" placeholder="e.g. Interested buyers" />
+      </label>
       <div class="sync-dialog-actions">
         <button class="secondary-button" id="cancel-phone-sync" type="button">Cancel</button>
         <button class="primary-button" id="confirm-phone-sync" type="button">Confirm &amp; Sync</button>

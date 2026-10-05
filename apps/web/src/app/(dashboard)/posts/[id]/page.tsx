@@ -64,8 +64,6 @@ interface Post {
     teamId?: string | null;
   };
   startTime?: string;
-  spacePostsApart?: boolean;
-  spacingMinutes?: number;
   jobs: Job[];
 }
 
@@ -293,7 +291,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
             <OverallStatusBadge jobs={post.jobs} />
             <PostControlButtons postId={post._id} jobs={post.jobs} />
             {publishedEngagementJobs.length > 0 && (
-              <RefreshAllPostEngagementButton postId={post._id} />
+              <RefreshAllPostEngagementButton jobIds={publishedEngagementJobs.map((job) => job._id)} />
             )}
             <RefreshPostStatusControls
               jobs={pendingGroupJobs.map((job) => ({
@@ -421,7 +419,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
 
                   <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
                     {job.submissionStatus === "PUBLISHED" && job.postUrl && (
-                      <RefreshPostEngagementButton postId={job._id} postUrl={job.postUrl} />
+                      <RefreshPostEngagementButton postId={job._id} />
                     )}
                     {groupJob && (job.submissionStatus === "PENDING_APPROVAL" ||
                       (job.submissionStatus === "PUBLISHED" && (!job.postUrl || job.postUrl.includes("/pending_posts/")))) && (
@@ -490,7 +488,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                           </a>
                         )}
                         {job.submissionStatus === "PUBLISHED" && job.postUrl && (
-                          <RefreshPostEngagementButton postId={job._id} postUrl={job.postUrl} />
+                          <RefreshPostEngagementButton postId={job._id} />
                         )}
                         {groupJob && (job.submissionStatus === "PENDING_APPROVAL" ||
                           (job.submissionStatus === "PUBLISHED" && (!job.postUrl || job.postUrl.includes("/pending_posts/")))) && (
@@ -546,8 +544,6 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
       <PostScheduleEditor
         postId={post._id}
         startTime={post.startTime}
-        spacePostsApart={post.spacePostsApart}
-        spacingMinutes={post.spacingMinutes}
         readOnly={post.jobs.length > 0 && !post.jobs.some((job) => job.status === "PENDING")}
         jobs={post.jobs
           .map((job) => ({
