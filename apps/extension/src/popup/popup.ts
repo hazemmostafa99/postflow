@@ -686,8 +686,8 @@ refreshButton.addEventListener("click", () => {
 openDashboardButton.addEventListener("click", async () => {
   const existingTabs = await chrome.tabs.query({
     url: [
-      "http://localhost:3000/*",
-      "http://127.0.0.1:3000/*",
+      "http://localhost:3001/*",
+      "http://127.0.0.1:3001/*",
       "https://fitcure.online/*",
     ],
   });
@@ -705,7 +705,7 @@ openDashboardButton.addEventListener("click", async () => {
     ? result.webAppLastDashboardUrl.trim()
     : typeof result.webAppLastUrl === "string" && result.webAppLastUrl.trim()
       ? result.webAppLastUrl.trim()
-      : "http://localhost:3000";
+      : "http://localhost:3001";
   await chrome.tabs.create({ url: dashboardUrl });
 });
 

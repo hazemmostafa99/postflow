@@ -9,8 +9,12 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "PostFlow",
-  description: "Create, publish, and monitor Facebook group posts.",
+  title: {
+    default: "PostFlow Sales",
+    template: "%s | PostFlow",
+  },
+  description: "PostFlow sales publishing dashboard.",
+  robots: { index: false, follow: false },
 };
 
 export default function RootLayout({

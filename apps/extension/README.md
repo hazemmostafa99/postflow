@@ -43,7 +43,7 @@ content script runs on localhost and `https://fitcure.online/*` to read the
 signed-in user ID and handle dashboard sync actions.
 
 ```text
-Web: http://localhost:3000
+Web: http://localhost:3001
 Production web: https://fitcure.online
 Facebook: https://www.facebook.com/*
 ```

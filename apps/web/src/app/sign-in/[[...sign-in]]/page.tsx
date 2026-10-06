@@ -5,7 +5,7 @@ import { redirect } from "next/navigation";
 
 export default async function SignInPage() {
   const { userId } = await auth();
-  if (userId) redirect("/");
+  if (userId) redirect("/dashboard");
 
   return (
     <main className="min-h-screen bg-background text-foreground">
@@ -83,7 +83,7 @@ export default async function SignInPage() {
                   formFieldAction: "text-primary hover:text-primary/80",
                 },
               }}
-              fallbackRedirectUrl="/"
+              fallbackRedirectUrl="/dashboard"
             />
           </div>
         </section>

@@ -2,9 +2,10 @@
 
 PostFlow is a local-first publishing workspace for creating posts in a web app and publishing them to Facebook Groups through a Chrome extension.
 
-The project is split into three apps:
+The project is split into four apps:
 
-- `apps/web` - Next.js dashboard for authentication, post creation, group selection, and publishing status.
+- `apps/marketing` - Public Next.js landing page running locally on port 3000.
+- `apps/web` - Authenticated Next.js dashboard running locally on port 3001.
 - `apps/api` - NestJS API backed by MongoDB for users, groups, posts, jobs, and extension status.
 - `apps/extension` - Chrome extension that detects Facebook Groups, syncs them to the API, and executes pending publishing jobs in Facebook.
 
@@ -28,6 +29,7 @@ The project is split into three apps:
 
 ```text
 apps/
+  marketing/  Public landing page
   api/        NestJS backend API
   extension/ Chrome extension
   web/        Next.js web dashboard
@@ -58,9 +60,20 @@ PORT=8000
 NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=your_publishable_key
 CLERK_SECRET_KEY=your_secret_key
 API_URL=http://localhost:8000
+NEXT_PUBLIC_MARKETING_URL=http://localhost:3000
+```
+
+`apps/marketing/.env.local`
+
+```env
+NEXT_PUBLIC_MARKETING_URL=http://localhost:3000
+NEXT_PUBLIC_SALES_APP_URL=http://localhost:3001
+NEXT_PUBLIC_WHATSAPP_NUMBER=201234567890
 ```
 
 Do not commit real `.env` files or production secrets.
+
+For production builds, the two Next.js apps automatically load their local `.env.production` files. Commit-safe deployment templates are available at `apps/marketing/.env.production.example` and `apps/web/.env.production.example`. Store Clerk and other private credentials in the hosting provider rather than in Git.
 
 ## Local Development
 
@@ -68,6 +81,9 @@ Install dependencies per app:
 
 ```bash
 cd apps/api
+npm install
+
+cd ../marketing
 npm install
 
 cd ../web
@@ -84,7 +100,14 @@ cd apps/api
 npm run start:dev
 ```
 
-Start the web app:
+Start all three applications from the repository root:
+
+```bash
+npm install
+npm run dev
+```
+
+Or start the dashboard separately:
 
 ```bash
 cd apps/web
@@ -104,7 +127,7 @@ Load the extension in Chrome:
 2. Enable Developer mode.
 3. Click Load unpacked.
 4. Select `apps/extension`.
-5. Keep the web app running at `http://localhost:3000` and the API running at `http://localhost:8000`.
+5. Keep the dashboard running at `http://localhost:3001` and the API running at `http://localhost:8000`.
 
 ## How The Flow Works
 

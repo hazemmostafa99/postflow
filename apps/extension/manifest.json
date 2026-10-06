@@ -17,7 +17,7 @@
     "http://127.0.0.1:8000/*",
     "https://api.fitcure.online/*",
     "https://fitcure.online/*",
-    "http://localhost:3000/*"
+    "http://localhost:3001/*"
   ],
   "background": {
     "service_worker": "dist/background.js",
@@ -53,7 +53,7 @@
       "run_at": "document_idle"
     },
     {
-      "matches": ["http://localhost:3000/*", "http://127.0.0.1:3000/*", "https://fitcure.online/*"],
+      "matches": ["http://localhost:3001/*", "http://127.0.0.1:3001/*", "https://fitcure.online/*"],
       "js": ["dist/postflow-content.js"],
       "run_at": "document_idle"
     }

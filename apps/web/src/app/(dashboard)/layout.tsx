@@ -13,7 +13,7 @@ export default async function DashboardLayout({
 }) {
   const { userId, redirectToSignIn } = await auth();
   if (!userId) {
-    redirectToSignIn({ returnBackUrl: "/" });
+    redirectToSignIn({ returnBackUrl: "/dashboard" });
     throw new Error("Expected Clerk redirectToSignIn to interrupt rendering.");
   }
   const clerkUserId = userId;

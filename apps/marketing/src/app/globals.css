@@ -1,0 +1,51 @@
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: var(--font-inter);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-foreground: var(--foreground);
+}
+
+:root {
+  --primary: oklch(0.43 0.095 178.95);
+  --primary-foreground: oklch(0.985 0.008 91.48);
+  --foreground: oklch(0.205 0.021 167.18);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  color: var(--foreground);
+  background: #faf9f4;
+}
+
+.landing-arabic {
+  font-family: Tahoma, Arial, sans-serif;
+}
+
+.landing-arabic h1,
+.landing-arabic h2,
+.landing-arabic h3 {
+  letter-spacing: 0;
+}
+
+.landing-hero::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.12;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.08) 1px, transparent 1px);
+  background-size: 56px 56px;
+  mask-image: linear-gradient(to bottom, black, transparent 78%);
+}

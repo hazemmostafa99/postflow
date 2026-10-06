@@ -7,7 +7,7 @@ import { DeleteButton } from "@/components/delete-button";
 import { NewPostDialog } from "@/components/new-post-dialog";
 
 const PAGE_TITLES: Array<{ match: (path: string) => boolean; title: string }> = [
-  { match: (path) => path === "/", title: "Overview" },
+  { match: (path) => path === "/dashboard", title: "Overview" },
   { match: (path) => path === "/posts", title: "Posts" },
   { match: (path) => path.startsWith("/posts/"), title: "Post Details" },
   { match: (path) => path === "/reports", title: "Reports" },
@@ -48,7 +48,7 @@ export function DashboardTopbar({ role }: { role?: string }) {
             Invite user
           </button>
         )}
-        {pathname === "/" && (
+        {pathname === "/dashboard" && (
           <Link href="/posts" prefetch={false} className="inline-flex h-9 items-center justify-center rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90">
             View posts
           </Link>

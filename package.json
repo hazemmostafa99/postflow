@@ -1,0 +1,16 @@
+{
+  "name": "postflow",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently --kill-others-on-fail --names marketing,web,api --prefix-colors cyan,green,yellow \"npm --prefix apps/marketing run dev\" \"npm --prefix apps/web run dev\" \"npm --prefix apps/api run start:dev\"",
+    "dev:marketing": "npm --prefix apps/marketing run dev",
+    "dev:web": "npm --prefix apps/web run dev",
+    "dev:api": "npm --prefix apps/api run start:dev",
+    "build:marketing": "npm --prefix apps/marketing run build",
+    "build:web": "npm --prefix apps/web run build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

@@ -1,6 +1,6 @@
 # PostFlow Web
 
-The web app is the PostFlow dashboard. It handles authentication, post creation, group selection, post lists, and publishing status views.
+The web app is the authenticated PostFlow Sales dashboard. It handles authentication, post creation, group selection, post lists, and publishing status views. The public website lives in `apps/marketing`.
 
 ## Stack
 
@@ -28,9 +28,14 @@ Create `apps/web/.env`:
 NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=your_publishable_key
 CLERK_SECRET_KEY=your_secret_key
 API_URL=http://localhost:8000
+NEXT_PUBLIC_MARKETING_URL=http://localhost:3000
 ```
 
 `API_URL` points to the NestJS API.
+
+`NEXT_PUBLIC_MARKETING_URL` points back to the public Marketing application.
+
+For production, Next.js automatically loads `.env.production`. Use `.env.production.example` as the deployment template and set the production Clerk keys in the hosting provider's secret environment variables. The production template keeps the current API endpoint unchanged until the separate PostFlow API and database are ready.
 
 ## Development
 
@@ -42,7 +47,7 @@ npm run dev
 Open:
 
 ```text
-http://localhost:3000
+http://localhost:3001
 ```
 
 ## Build
@@ -55,7 +60,8 @@ npm run start
 ## Important Paths
 
 ```text
-src/app/(dashboard)/page.tsx          Dashboard overview
+src/app/page.tsx                      Redirects to the dashboard
+src/app/(dashboard)/dashboard/page.tsx Dashboard overview
 src/app/(dashboard)/posts/page.tsx    Posts list
 src/app/(dashboard)/posts/[id]/page.tsx
 src/components/create-post-form.tsx   New post form

@@ -16,7 +16,7 @@ import { UserButton } from "@clerk/nextjs"
 import Link from "next/link"
 
 const items = [
-  { title: "Overview", url: "/", icon: LayoutDashboard },
+  { title: "Overview", url: "/dashboard", icon: LayoutDashboard },
   { title: "Posts", url: "/posts", icon: FileText },
   { title: "Reports", url: "/reports", icon: BarChart3 },
   { title: "Leads", url: "/leads", icon: Phone },
@@ -26,18 +26,20 @@ const items = [
   { title: "Teams", url: "/teams", icon: Users },
 ]
 
+const MARKETING_URL = process.env.NEXT_PUBLIC_MARKETING_URL ?? "http://localhost:3000"
+
 export function AppSidebar({ role, ...props }: React.ComponentProps<typeof Sidebar> & { role?: string }) {
   const visibleItems = items.filter((item) => item.title !== "Users" || role === "ADMIN" || role === "MANAGER");
 
   return (
     <Sidebar variant="sidebar" {...props}>
       <SidebarHeader className="flex h-16 justify-center border-b border-sidebar-border px-4">
-        <div className="flex items-center gap-2 text-xl font-bold tracking-tight text-sidebar-foreground">
+        <Link href={MARKETING_URL} className="flex items-center gap-2 text-xl font-bold tracking-tight text-sidebar-foreground" aria-label="PostFlow website">
           <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground shadow-sm">
             <Send className="h-5 w-5" />
           </span>
           <span>PostFlow</span>
-        </div>
+        </Link>
       </SidebarHeader>
       <SidebarContent>
         <SidebarGroup>
