@@ -61,6 +61,7 @@ NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=your_publishable_key
 CLERK_SECRET_KEY=your_secret_key
 API_URL=http://localhost:8000
 NEXT_PUBLIC_MARKETING_URL=http://localhost:3000
+NEXT_PUBLIC_WHATSAPP_NUMBER=201044280822
 ```
 
 `apps/marketing/.env.local`

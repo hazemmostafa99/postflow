@@ -29,11 +29,14 @@ NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=your_publishable_key
 CLERK_SECRET_KEY=your_secret_key
 API_URL=http://localhost:8000
 NEXT_PUBLIC_MARKETING_URL=http://localhost:3000
+NEXT_PUBLIC_WHATSAPP_NUMBER=201044280822
 ```
 
 `API_URL` points to the NestJS API.
 
 `NEXT_PUBLIC_MARKETING_URL` points back to the public Marketing application.
+
+`NEXT_PUBLIC_WHATSAPP_NUMBER` is the international-format WhatsApp contact used by the expired-trial page.
 
 For production, Next.js automatically loads `.env.production`. Use `.env.production.example` as the deployment template and set the production Clerk keys in the hosting provider's secret environment variables. The production template keeps the current API endpoint unchanged until the separate PostFlow API and database are ready.
 

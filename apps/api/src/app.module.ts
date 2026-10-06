@@ -32,6 +32,9 @@ import {
   FacebookConnectionSchema,
 } from './schemas/facebook-connection.schema';
 import { ReportsModule } from './reports/reports.module';
+import { APP_GUARD } from '@nestjs/core';
+import { SalesSubscriptionsModule } from './sales-subscriptions/sales-subscriptions.module';
+import { SalesSubscriptionAccessGuard } from './sales-subscriptions/sales-subscription-access.guard';
 
 const envFilePath = [
   resolve(process.cwd(), '.env'),
@@ -72,8 +75,15 @@ const envFilePath = [
     AnalyticsModule,
     ReportsModule,
     PhoneContactsModule,
+    SalesSubscriptionsModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [
+    AppService,
+    {
+      provide: APP_GUARD,
+      useExisting: SalesSubscriptionAccessGuard,
+    },
+  ],
 })
 export class AppModule {}

@@ -3,8 +3,8 @@ import { AppSidebar } from "@/components/app-sidebar";
 import { DashboardTopbar } from "@/components/dashboard-topbar";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { redirect } from "next/navigation";
-
-const API_BASE = process.env.API_URL || "http://localhost:8000";
+import { fetchPostFlowUser } from "@/lib/postflow-user";
+import { TrialStatusBanner } from "@/components/trial-status-banner";
 
 export default async function DashboardLayout({
   children,
@@ -23,21 +23,28 @@ export default async function DashboardLayout({
     console.error("[Auth] Unable to load the current Clerk user", error);
     return null;
   });
-  const email = user?.primaryEmailAddress?.emailAddress ?? user?.emailAddresses[0]?.emailAddress;
+  const email =
+    user?.primaryEmailAddress?.emailAddress ??
+    user?.emailAddresses[0]?.emailAddress;
   const firstName = user?.firstName ?? undefined;
   const lastName = user?.lastName ?? undefined;
 
-  const accessResponse = await fetch(`${API_BASE}/api/auth/me`, {
-    headers: {
-      "x-clerk-user-id": clerkUserId,
-      ...(email ? { "x-clerk-user-email": email } : {}),
-      ...(firstName ? { "x-clerk-user-first-name": firstName } : {}),
-      ...(lastName ? { "x-clerk-user-last-name": lastName } : {}),
-    },
-    cache: "no-store",
+  const postflowUser = await fetchPostFlowUser({
+    clerkUserId,
+    email,
+    firstName,
+    lastName,
   });
-  if (!accessResponse.ok) redirect("/access-denied");
-  const postflowUser = await accessResponse.json();
+  if (!postflowUser) redirect("/access-denied");
+  if (
+    postflowUser.accountType === "INDIVIDUAL_SALES" &&
+    !postflowUser.subscription
+  ) {
+    redirect("/access-denied");
+  }
+  if (postflowUser.subscription && !postflowUser.subscription.isAccessAllowed) {
+    redirect("/trial-expired");
+  }
 
   return (
     <SidebarProvider>
@@ -49,6 +56,7 @@ export default async function DashboardLayout({
             <DashboardTopbar role={postflowUser.role} />
           </header>
           <div className="flex-1 p-4 sm:p-6 lg:p-8">
+            <TrialStatusBanner subscription={postflowUser.subscription} />
             {children}
           </div>
         </main>
@@ -58,7 +66,7 @@ export default async function DashboardLayout({
         <span
           id="postflow-user-meta"
           data-postflow-user-id={clerkUserId}
-          style={{ display: 'none' }}
+          style={{ display: "none" }}
           aria-hidden="true"
         />
       )}

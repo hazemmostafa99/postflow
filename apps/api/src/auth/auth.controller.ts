@@ -5,10 +5,15 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { AuthorizationService } from './authorization.service';
+import { isIndividualSalesUser } from '../sales-subscriptions/sales-subscription-policy';
+import { SalesSubscriptionsService } from '../sales-subscriptions/sales-subscriptions.service';
 
 @Controller('api/auth')
 export class AuthController {
-  constructor(private readonly authorization: AuthorizationService) {}
+  constructor(
+    private readonly authorization: AuthorizationService,
+    private readonly salesSubscriptions: SalesSubscriptionsService,
+  ) {}
 
   @Get('me')
   async me(
@@ -24,6 +29,11 @@ export class AuthController {
       email,
       { firstName, lastName },
     );
+    const isIndividualSales = isIndividualSalesUser(user);
+    const subscription = isIndividualSales
+      ? await this.salesSubscriptions.ensureTrial(clerkUserId)
+      : null;
+
     return {
       id: user._id.toString(),
       clerkUserId: user.clerkUserId,
@@ -33,6 +43,8 @@ export class AuthController {
       role: user.role,
       status: user.status,
       teamId: user.teamId ?? null,
+      accountType: isIndividualSales ? 'INDIVIDUAL_SALES' : 'COMPANY_MANAGED',
+      subscription,
     };
   }
 }
