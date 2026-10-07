@@ -53,7 +53,7 @@ export default async function DashboardLayout({
           </div>
         </main>
       </div>
-      {/* Hidden meta element for the PostFlow extension to read the user ID */}
+      {/* Hidden meta element for the iPostFlow extension to read the user ID */}
       {clerkUserId && (
         <span
           id="postflow-user-meta"

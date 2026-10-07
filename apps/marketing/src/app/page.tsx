@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { LandingPage } from "@/components/landing-page";
 
 export const metadata: Metadata = {
-  title: "PostFlow — Social publishing built for sales",
+  title: "iPostFlow — Social publishing built for sales",
   description:
     "Plan, publish, and track social content from one focused sales workspace.",
   alternates: {

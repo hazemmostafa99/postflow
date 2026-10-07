@@ -12,11 +12,11 @@ const marketingUrl = process.env.NEXT_PUBLIC_MARKETING_URL ?? "http://localhost:
 export const metadata: Metadata = {
   metadataBase: new URL(marketingUrl),
   title: {
-    default: "PostFlow — Social publishing built for sales",
-    template: "%s | PostFlow",
+    default: "iPostFlow — Social publishing built for sales",
+    template: "%s | iPostFlow",
   },
   description:
-    "Plan, publish, track, and turn social activity into sales opportunities with PostFlow.",
+    "Plan, publish, track, and turn social activity into sales opportunities with iPostFlow.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

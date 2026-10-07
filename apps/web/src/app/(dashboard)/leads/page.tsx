@@ -92,8 +92,8 @@ function pageHref(page: number, search: string, category: string): string {
 }
 
 export const metadata = {
-  title: "Leads - PostFlow",
-  description: "View phone leads collected with PostFlow.",
+  title: "Leads - iPostFlow",
+  description: "View phone leads collected with iPostFlow.",
 };
 
 export default async function LeadsPage({

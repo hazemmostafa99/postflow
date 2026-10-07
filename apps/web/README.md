@@ -1,6 +1,6 @@
-# PostFlow Web
+# iPostFlow Web
 
-The web app is the authenticated PostFlow Sales dashboard. It handles authentication, post creation, group selection, post lists, and publishing status views. The public website lives in `apps/marketing`.
+The web app is the authenticated iPostFlow Sales dashboard. It handles authentication, post creation, group selection, post lists, and publishing status views. The public website lives in `apps/marketing`.
 
 ## Stack
 
@@ -35,7 +35,7 @@ NEXT_PUBLIC_MARKETING_URL=http://localhost:3000
 
 `NEXT_PUBLIC_MARKETING_URL` points back to the public Marketing application.
 
-For production, Next.js automatically loads `.env.production`. Use `.env.production.example` as the deployment template and set the production Clerk keys in the hosting provider's secret environment variables. The production template keeps the current API endpoint unchanged until the separate PostFlow API and database are ready.
+For production, Next.js automatically loads `.env.production`. Use `.env.production.example` as the deployment template and set the production Clerk keys in the hosting provider's secret environment variables. The production template keeps the current API endpoint unchanged until the separate iPostFlow API and database are ready.
 
 ## Development
 

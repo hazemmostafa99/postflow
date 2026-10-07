@@ -229,7 +229,7 @@ function OverallStatusBadge({ jobs }: { jobs: Job[] }) {
 }
 
 export const metadata = {
-  title: "Post Details — PostFlow",
+  title: "Post Details — iPostFlow",
 };
 
 export default async function PostDetailsPage({ params }: { params: Promise<{ id: string }> }) {

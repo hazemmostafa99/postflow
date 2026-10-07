@@ -94,7 +94,7 @@ function getConnectionView(connection: FacebookConnection, now: number): Connect
   };
 
   if (offline || rawStatus === "DISCONNECTED") {
-    return { ...base, state: "OFFLINE", stateLabel: "Offline", message: "Open this Chrome profile to reconnect PostFlow." };
+    return { ...base, state: "OFFLINE", stateLabel: "Offline", message: "Open this Chrome profile to reconnect iPostFlow." };
   }
 
   if (rawStatus === "ACCOUNT_MISMATCH" || workerStatus === "ACCOUNT_MISMATCH") {
@@ -151,7 +151,7 @@ function accountIdentity(connection: FacebookConnection): string {
 }
 
 function browserLabel(connection: FacebookConnection): string {
-  return connection.extensionInstanceId ? "PostFlow extension connected" : "Legacy installation";
+  return connection.extensionInstanceId ? "iPostFlow extension connected" : "Legacy installation";
 }
 
 function maskedId(value?: string): string {
@@ -340,7 +340,7 @@ function UnavailableState({ isRefreshing, onRefresh }: { isRefreshing: boolean; 
         <AlertTriangle className="h-6 w-6 text-red-600" />
       </div>
       <h2 className="font-semibold text-foreground">Connections could not be loaded</h2>
-      <p className="mt-1 max-w-md text-sm text-muted-foreground">PostFlow could not reach the connections service. Your connection data has not been removed.</p>
+      <p className="mt-1 max-w-md text-sm text-muted-foreground">iPostFlow could not reach the connections service. Your connection data has not been removed.</p>
       <button type="button" onClick={onRefresh} disabled={isRefreshing} className="mt-5 inline-flex h-9 items-center justify-center gap-2 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-60">
         <RefreshCw className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`} />
         Try again
@@ -354,7 +354,7 @@ function EmptyState() {
     <section className="surface flex min-h-72 flex-col items-center justify-center border-dashed px-6 text-center">
       <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-xl bg-primary/10 text-primary"><Link2 className="h-7 w-7" /></div>
       <h2 className="text-base font-semibold text-foreground">Connect your first Facebook account</h2>
-      <p className="mt-1 max-w-md text-sm leading-6 text-muted-foreground">Open Facebook in a Chrome profile with the PostFlow extension installed. The account will appear here after the extension connects.</p>
+      <p className="mt-1 max-w-md text-sm leading-6 text-muted-foreground">Open Facebook in a Chrome profile with the iPostFlow extension installed. The account will appear here after the extension connects.</p>
     </section>
   );
 }

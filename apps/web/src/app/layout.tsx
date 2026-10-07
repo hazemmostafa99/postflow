@@ -9,11 +9,8 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: {
-    default: "PostFlow Sales",
-    template: "%s | PostFlow",
-  },
-  description: "PostFlow sales publishing dashboard.",
+  title:  "iPostFlow",
+  description: "iPostFlow sales publishing dashboard.",
   robots: { index: false, follow: false },
 };
 

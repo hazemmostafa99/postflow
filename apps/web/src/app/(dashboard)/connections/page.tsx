@@ -31,8 +31,8 @@ async function fetchConnections(userId: string): Promise<ConnectionsResult> {
 }
 
 export const metadata = {
-  title: "Connections - PostFlow",
-  description: "Monitor Facebook accounts and PostFlow browser connections.",
+  title: "Connections - iPostFlow",
+  description: "Monitor Facebook accounts and iPostFlow browser connections.",
 };
 
 export default async function ConnectionsPage() {

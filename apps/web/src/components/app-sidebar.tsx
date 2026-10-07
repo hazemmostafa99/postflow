@@ -29,16 +29,20 @@ const items = [
 const MARKETING_URL = process.env.NEXT_PUBLIC_MARKETING_URL ?? "http://localhost:3000"
 
 export function AppSidebar({ role, ...props }: React.ComponentProps<typeof Sidebar> & { role?: string }) {
-  const visibleItems = items.filter((item) => item.title !== "Users" || role === "ADMIN" || role === "MANAGER");
+  const visibleItems = items.filter((item) => {
+    if (item.title === "Users") return role === "ADMIN" || role === "MANAGER";
+    if (item.title === "Teams") return role !== "SALES";
+    return true;
+  });
 
   return (
     <Sidebar variant="sidebar" {...props}>
       <SidebarHeader className="flex h-16 justify-center border-b border-sidebar-border px-4">
-        <Link href={MARKETING_URL} className="flex items-center gap-2 text-xl font-bold tracking-tight text-sidebar-foreground" aria-label="PostFlow website">
+        <Link href={MARKETING_URL} className="flex items-center gap-2 text-xl font-bold tracking-tight text-sidebar-foreground" aria-label="iPostFlow website">
           <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground shadow-sm">
             <Send className="h-5 w-5" />
           </span>
-          <span>PostFlow</span>
+          <span>iPostFlow</span>
         </Link>
       </SidebarHeader>
       <SidebarContent>

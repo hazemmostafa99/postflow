@@ -2,9 +2,9 @@ import type { Metadata } from "next";
 import { LandingPage } from "@/components/landing-page";
 
 export const metadata: Metadata = {
-  title: "PostFlow for Companies — Organize your sales operation",
+  title: "iPostFlow for Companies — Organize your sales operation",
   description:
-    "Give your sales organization a dedicated PostFlow workspace with teams, roles, publishing visibility, and guided setup.",
+    "Give your sales organization a dedicated iPostFlow workspace with teams, roles, publishing visibility, and guided setup.",
   alternates: {
     canonical: "/companies",
     languages: { en: "/companies", ar: "/ar/companies" },

@@ -130,7 +130,7 @@ const companyFeatures = [
     icon: Globe2,
     title: "Own a dedicated workspace",
     description:
-      "Your company gets its own PostFlow subdomain with a setup shaped around the way your teams work.",
+      "Your company gets its own iPostFlow subdomain with a setup shaped around the way your teams work.",
   },
   {
     icon: CalendarClock,
@@ -169,7 +169,7 @@ const arabicCompanyFeatures = [
     icon: Globe2,
     title: "مساحة شغل مخصوص لشركتك",
     description:
-      "شركتك بتاخد نطاق فرعي خاص على PostFlow، بإعداد يناسب طريقة شغل فرقك.",
+      "شركتك بتاخد نطاق فرعي خاص على iPostFlow، بإعداد يناسب طريقة شغل فرقك.",
   },
   {
     icon: CalendarClock,
@@ -201,7 +201,7 @@ function Logo({ inverse = false }: { inverse?: boolean }) {
       <span className={`grid h-9 w-9 place-items-center rounded-xl ${inverse ? "bg-white text-[#12352f]" : "bg-primary text-primary-foreground"}`}>
         <Send className="h-4 w-4" />
       </span>
-      <span className="text-lg font-bold tracking-[-0.03em]">PostFlow</span>
+      <span className="text-lg font-bold tracking-[-0.03em]">iPostFlow</span>
     </span>
   );
 }
@@ -234,8 +234,8 @@ export function LandingPage({
   }));
   const whatsappMessage = encodeURIComponent(
     t(
-      "Hi Tkhayal, I would like to learn more about a PostFlow company workspace.",
-      "أهلًا تخيل، عايز أعرف أكتر عن مساحة PostFlow المخصصة للشركات.",
+      "Hi Tkhayal, I would like to learn more about a iPostFlow company workspace.",
+      "أهلًا تخيل، عايز أعرف أكتر عن مساحة iPostFlow المخصصة للشركات.",
     ),
   );
   const whatsappHref = whatsappNumber
@@ -333,12 +333,12 @@ export function LandingPage({
             <p className="mt-7 max-w-xl text-lg leading-8 text-white/65 sm:text-xl">
               {isCompany
                 ? t(
-                    "PostFlow gives every team a clear way to publish, follow activity, and manage leads—while leadership keeps the full company view.",
-                    "PostFlow بيدي كل فريق طريقة واضحة للنشر والمتابعة وإدارة العملاء المحتملين، والإدارة بتفضل شايفة الصورة كاملة.",
+                    "iPostFlow gives every team a clear way to publish, follow activity, and manage leads—while leadership keeps the full company view.",
+                    "iPostFlow بيدي كل فريق طريقة واضحة للنشر والمتابعة وإدارة العملاء المحتملين، والإدارة بتفضل شايفة الصورة كاملة.",
                   )
                 : t(
-                    "PostFlow brings publishing, tracking, and lead follow-up into one focused workspace—so you spend less time managing posts and more time selling.",
-                    "PostFlow بيجمع النشر والمتابعة وإدارة العملاء المحتملين في مساحة شغل واحدة، عشان متضيعش وقتك في النشر وتركز أكتر في البيع.",
+                    "iPostFlow brings publishing, tracking, and lead follow-up into one focused workspace—so you spend less time managing posts and more time selling.",
+                    "iPostFlow بيجمع النشر والمتابعة وإدارة العملاء المحتملين في مساحة شغل واحدة، عشان متضيعش وقتك في النشر وتركز أكتر في البيع.",
                   )}
             </p>
             <div className="mt-9 flex flex-col gap-3 sm:flex-row">
@@ -378,7 +378,7 @@ export function LandingPage({
                 </div>
                 <div className="grid min-h-[430px] grid-cols-[64px_1fr] sm:grid-cols-[150px_1fr]">
                   <aside className="bg-[#173c35] p-3 text-white">
-                    <div className="mb-8 flex items-center gap-2 px-1 text-xs font-bold"><Send className="h-4 w-4 text-[#86d9aa]" /><span className="hidden sm:inline">PostFlow</span></div>
+                    <div className="mb-8 flex items-center gap-2 px-1 text-xs font-bold"><Send className="h-4 w-4 text-[#86d9aa]" /><span className="hidden sm:inline">iPostFlow</span></div>
                     <div className="space-y-2">
                       {[Layers3, Send, BarChart3, Phone].map((Icon, index) => (
                         <div key={index} className={`flex items-center gap-2 rounded-lg p-2 text-[10px] ${index === 0 ? "bg-white/12 text-white" : "text-white/45"}`}>
@@ -458,7 +458,7 @@ export function LandingPage({
           <div className="max-w-2xl">
             <SectionLabel>{isCompany ? t("Built for your organization", "معمول لشركتك") : t("Everything in one flow", "كل حاجة في مسار شغل واحد")}</SectionLabel>
             <h2 className="text-4xl font-semibold leading-tight tracking-[-0.045em] sm:text-5xl">{isCompany ? t("Give every sales team structure without slowing them down.", "نظّم كل فرق المبيعات من غير ما تعطّل شغلهم.") : t("Social selling should feel organized, not overwhelming.", "البيع على السوشيال ميديا المفروض يبقى منظم، مش مُرهق.")}</h2>
-            <p className="mt-5 text-lg leading-8 text-[#657a74]">{isCompany ? t("PostFlow connects people, publishing, leads, and reporting in one company workspace—so leaders see more and teams move faster.", "PostFlow بيجمع الأشخاص والنشر والعملاء والتقارير في مساحة واحدة للشركة، عشان الإدارة تشوف أكتر والفرق تتحرك أسرع.") : t("PostFlow keeps the work between an idea and a new lead moving—with fewer tools, fewer missed steps, and a much clearer view.", "PostFlow بيخلّي الشغل ماشي من الفكرة للعميل المحتمل، بأدوات أقل وخطوات ضايعة أقل وصورة أوضح بكتير.")}</p>
+            <p className="mt-5 text-lg leading-8 text-[#657a74]">{isCompany ? t("iPostFlow connects people, publishing, leads, and reporting in one company workspace—so leaders see more and teams move faster.", "iPostFlow بيجمع الأشخاص والنشر والعملاء والتقارير في مساحة واحدة للشركة، عشان الإدارة تشوف أكتر والفرق تتحرك أسرع.") : t("iPostFlow keeps the work between an idea and a new lead moving—with fewer tools, fewer missed steps, and a much clearer view.", "iPostFlow بيخلّي الشغل ماشي من الفكرة للعميل المحتمل، بأدوات أقل وخطوات ضايعة أقل وصورة أوضح بكتير.")}</p>
           </div>
           <div className="mt-14 grid gap-4 md:grid-cols-2 lg:grid-cols-3">
             {localizedFeatures.map(({ icon: Icon, title, description }, index) => (
@@ -570,18 +570,18 @@ export function LandingPage({
           <div>
             <SectionLabel>{t("Questions, answered", "أسئلة وإجابات")}</SectionLabel>
             <h2 className="text-4xl font-semibold tracking-[-0.045em] sm:text-5xl">{t("Before you start.", "قبل ما تبدأ.")}</h2>
-            <p className="mt-5 text-[#657a74]">{t("Everything you need to know about the first version of PostFlow.", "كل اللي محتاج تعرفه عن أول نسخة من PostFlow.")}</p>
+            <p className="mt-5 text-[#657a74]">{t("Everything you need to know about the first version of iPostFlow.", "كل اللي محتاج تعرفه عن أول نسخة من iPostFlow.")}</p>
           </div>
           <div className="divide-y divide-[#17352f]/10 border-y border-[#17352f]/10">
             {[
               ...(isCompany ? [
-                [t("What does a company workspace include?", "مساحة الشركة فيها إيه؟"), t("A dedicated PostFlow subdomain, team structure, role-based access, company visibility, and guided setup with our team.", "نطاق فرعي مخصوص على PostFlow، وتنظيم للفرق، وصلاحيات حسب الدور، ورؤية للشركة كلها، وتجهيز مع فريقنا.")],
+                [t("What does a company workspace include?", "مساحة الشركة فيها إيه؟"), t("A dedicated iPostFlow subdomain, team structure, role-based access, company visibility, and guided setup with our team.", "نطاق فرعي مخصوص على iPostFlow، وتنظيم للفرق، وصلاحيات حسب الدور، ورؤية للشركة كلها، وتجهيز مع فريقنا.")],
                 [t("Can we organize multiple sales teams?", "ينفع ننظم أكتر من فريق مبيعات؟"), t("Yes. You can structure managers, team leaders, and sales reps while keeping each team clearly organized.", "آه. تقدر تنظم المديرين وقادة الفرق ومندوبي المبيعات، وكل فريق يفضل واضح ومرتب.")],
                 [t("How is company pricing decided?", "سعر الشركات بيتحدد إزاي؟"), t("We plan the workspace around your team size and setup needs, then confirm the commercial details directly with you.", "بنفهم عدد الفرق والمستخدمين واحتياجات التجهيز، وبعدها بنتفق معاك على التفاصيل المناسبة.")],
                 [t("How do we get started?", "نبدأ إزاي؟"), t("Contact us on WhatsApp. We will understand your workflow, plan the subdomain, and guide your onboarding.", "كلمنا على واتساب. هنفهم طريقة شغلك، ونخطط النطاق الفرعي، ونجهز شركتك خطوة بخطوة.")],
               ] : [
-                [t("Which platforms does PostFlow focus on?", "PostFlow بيركز على أنهي منصات؟"), t("PostFlow currently focuses on Facebook publishing, with Instagram, TikTok, WhatsApp, and other channels included in the broader product direction.", "PostFlow بيركز دلوقتي على النشر في فيسبوك، وإنستغرام وتيك توك وواتساب ومنصات تانية ضمن خطة تطوير المنتج.")],
-                [t("Who is PostFlow for?", "PostFlow معمول لمين؟"), t("PostFlow is designed for salespeople and teams that use social media to create visibility, start conversations, and generate new business.", "PostFlow معمول لمندوبي وفرق المبيعات اللي بيستخدموا السوشيال ميديا عشان يظهروا أكتر، ويبدأوا محادثات، ويجيبوا فرص شغل جديدة.")],
+                [t("Which platforms does iPostFlow focus on?", "iPostFlow بيركز على أنهي منصات؟"), t("iPostFlow currently focuses on Facebook publishing, with Instagram, TikTok, WhatsApp, and other channels included in the broader product direction.", "iPostFlow بيركز دلوقتي على النشر في فيسبوك، وإنستغرام وتيك توك وواتساب ومنصات تانية ضمن خطة تطوير المنتج.")],
+                [t("Who is iPostFlow for?", "iPostFlow معمول لمين؟"), t("iPostFlow is designed for salespeople and teams that use social media to create visibility, start conversations, and generate new business.", "iPostFlow معمول لمندوبي وفرق المبيعات اللي بيستخدموا السوشيال ميديا عشان يظهروا أكتر، ويبدأوا محادثات، ويجيبوا فرص شغل جديدة.")],
                 [t("Is there a free trial?", "في تجربة مجانية؟"), t("Yes. Individual sales users get full access free for one month, then choose monthly or yearly billing.", "آه. مندوب المبيعات بياخد كل المميزات مجانًا لمدة شهر كامل، وبعدها يختار الدفع الشهري أو السنوي.")],
                 [t("Can I move to a company workspace later?", "ينفع أنقل لمساحة شركة بعدين؟"), t("Yes. When you need teams, roles, and a dedicated subdomain, contact us to plan the company setup.", "آه. لما تحتاج فرق وصلاحيات ونطاق فرعي مخصوص، كلمنا عشان نجهز مساحة الشركة.")],
               ]),
@@ -601,7 +601,7 @@ export function LandingPage({
           <div className="absolute -bottom-24 -right-16 h-64 w-64 rounded-full border-[48px] border-[#2d806e]/10" />
           <div className="relative mx-auto max-w-2xl">
             <h2 className="text-4xl font-semibold tracking-[-0.05em] sm:text-5xl">{isCompany ? t("Ready to give every sales team a better system?", "جاهز تدي كل فرق المبيعات نظام أحسن؟") : t("Ready to put your social selling in motion?", "جاهز تحرّك مبيعاتك على السوشيال ميديا؟")}</h2>
-            <p className="mx-auto mt-5 max-w-xl text-lg leading-8 text-[#60766f]">{isCompany ? t("Tell us how your company works, and we will help shape a dedicated PostFlow workspace around it.", "قولنا شركتك بتشتغل إزاي، وإحنا نساعدك نجهز مساحة PostFlow مخصوص ليها.") : t("Create your PostFlow workspace and turn a scattered routine into one clear, repeatable flow.", "اعمل مساحة شغلك على PostFlow وحوّل روتينك المشتت لمسار واضح تقدر تكرره كل يوم.")}</p>
+            <p className="mx-auto mt-5 max-w-xl text-lg leading-8 text-[#60766f]">{isCompany ? t("Tell us how your company works, and we will help shape a dedicated iPostFlow workspace around it.", "قولنا شركتك بتشتغل إزاي، وإحنا نساعدك نجهز مساحة iPostFlow مخصوص ليها.") : t("Create your iPostFlow workspace and turn a scattered routine into one clear, repeatable flow.", "اعمل مساحة شغلك على iPostFlow وحوّل روتينك المشتت لمسار واضح تقدر تكرره كل يوم.")}</p>
             <div className="mt-8 flex flex-col justify-center gap-3 sm:flex-row">
               {isCompany ? (
                 <a className="inline-flex h-12 items-center justify-center gap-2 rounded-full bg-[#173c35] px-7 text-sm font-bold text-white hover:bg-[#102d28]" href={whatsappHref}><MessageCircle className="h-4 w-4" /> {t("Talk to us on WhatsApp", "كلمنا على واتساب")}</a>

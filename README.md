@@ -1,6 +1,6 @@
-# PostFlow
+# iPostFlow
 
-PostFlow is a local-first publishing workspace for creating posts in a web app and publishing them to Facebook Groups through a Chrome extension.
+iPostFlow is a local-first publishing workspace for creating posts in a web app and publishing them to Facebook Groups through a Chrome extension.
 
 The project is split into four apps:
 

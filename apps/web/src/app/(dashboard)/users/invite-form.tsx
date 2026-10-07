@@ -57,7 +57,7 @@ export function InviteForm({ teams }: { teams: Array<{ _id: string; name: string
   >
     <form onSubmit={submit} className="my-auto w-full max-w-md space-y-4 rounded-xl border border-border bg-card p-5 shadow-2xl">
       <div className="flex items-start justify-between gap-4">
-        <div><h2 id="invite-user-title" className="text-base font-semibold">Invite a user</h2><p className="mt-1 text-xs text-muted-foreground">Send a Clerk invitation and assign the PostFlow access role.</p></div>
+        <div><h2 id="invite-user-title" className="text-base font-semibold">Invite a user</h2><p className="mt-1 text-xs text-muted-foreground">Send a Clerk invitation and assign the iPostFlow access role.</p></div>
         <button type="button" onClick={() => setIsOpen(false)} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground" aria-label="Close"><X className="h-4 w-4" /></button>
       </div>
       <div><label className="text-sm font-medium">Email</label><input name="email" type="email" required className="mt-2 h-10 w-full rounded-lg border border-border bg-background px-3 text-sm" placeholder="name@company.com" /></div>
