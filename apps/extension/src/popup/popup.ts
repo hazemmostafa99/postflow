@@ -688,7 +688,7 @@ openDashboardButton.addEventListener("click", async () => {
     url: [
       "http://localhost:3001/*",
       "http://127.0.0.1:3001/*",
-      "https://fitcure.online/*",
+      "https://sales.ipostflow.com/*",
     ],
   });
   const existingTab = existingTabs.find((tab) => tab.id !== undefined);

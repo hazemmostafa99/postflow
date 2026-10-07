@@ -14,7 +14,7 @@ The extension connects the local PostFlow dashboard/API with Facebook. It detect
 Build-time public API configuration is committed in:
 
 - `.env.development`: `API_BASE_URL=http://localhost:8000`
-- `.env.production`: `API_BASE_URL=https://api.fitcure.online`
+- `.env.production`: `API_BASE_URL=https://sales-api.ipostflow.com`
 
 Both files also define the public rollout switch
 `AUTOMATIC_ANALYTICS_ENABLED`. It is `true` for local development and defaults
@@ -39,12 +39,12 @@ other `.env` files are not loaded. Never put secrets in extension environment
 files or bundled code.
 
 The manifest permits both API hosts and the production frontend. The dashboard
-content script runs on localhost and `https://fitcure.online/*` to read the
+content script runs on localhost and `https://sales.ipostflow.com/*` to read the
 signed-in user ID and handle dashboard sync actions.
 
 ```text
 Web: http://localhost:3001
-Production web: https://fitcure.online
+Production web: https://sales.ipostflow.com
 Facebook: https://www.facebook.com/*
 ```
 
@@ -94,7 +94,7 @@ link on `chrome://extensions` and open **Console**. Each service worker start lo
 ```text
 [PostFlow] DEV environment | API: http://localhost:8000
 # Or:
-[PostFlow] PROD environment | API: https://api.fitcure.online
+[PostFlow] PROD environment | API: https://sales-api.ipostflow.com
 ```
 
 The same line reports `Automatic analytics: ON` or `OFF`. This identifies the

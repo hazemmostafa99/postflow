@@ -15,8 +15,8 @@
     "https://www.facebook.com/*",
     "http://localhost:8000/*",
     "http://127.0.0.1:8000/*",
-    "https://api.fitcure.online/*",
-    "https://fitcure.online/*",
+    "https://sales-api.ipostflow.com/*",
+    "https://sales.ipostflow.com/*",
     "http://localhost:3001/*"
   ],
   "background": {
@@ -53,7 +53,7 @@
       "run_at": "document_idle"
     },
     {
-      "matches": ["http://localhost:3001/*", "http://127.0.0.1:3001/*", "https://fitcure.online/*"],
+      "matches": ["http://localhost:3001/*", "http://127.0.0.1:3001/*", "https://sales.ipostflow.com/*"],
       "js": ["dist/postflow-content.js"],
       "run_at": "document_idle"
     }
