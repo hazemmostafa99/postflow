@@ -11,6 +11,7 @@ import {
   UnauthorizedException,
   NotFoundException,
   BadRequestException,
+  ForbiddenException,
   Query,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
@@ -39,6 +40,11 @@ import {
   FacebookConnectionStatus,
   FacebookConnectionWorkerStatus,
 } from '../schemas/facebook-connection.schema';
+import {
+  ExtensionInstallationDocument,
+  ExtensionLifecycleStatus,
+} from '../schemas/extension-installation.schema';
+import { ExtensionsService } from '../extensions/extensions.service';
 import { toPublishJobPayload } from './publish-job-payload';
 
 type PostEngagementSyncResult = {
@@ -176,6 +182,7 @@ export class JobsController {
     private readonly postModel: Model<PostDocument>,
     @InjectModel(FacebookConnection.name)
     private readonly connectionModel: Model<FacebookConnectionDocument>,
+    private readonly extensionsService: ExtensionsService,
   ) {}
 
   private logMaintenanceEvent(
@@ -208,24 +215,46 @@ export class JobsController {
     });
   }
 
+  /**
+   * Resolves the worker's verified connection for a worker action.
+   *
+   * Gate order is strict and fails closed:
+   *  1. The installation must exist, not be revoked, and present a valid
+   *     installation credential (verifyWorkerIdentity).
+   *  2. New claims additionally require an ACTIVE lifecycle.
+   *  3. The connection must come from the installation resolution (owned by
+   *     the user, unarchived, and the active binding of this installation).
+   *  4. The Facebook session identity must still be verified.
+   */
   private async getVerifiedWorkerConnection(
     clerkUserId: string,
-    extensionInstanceId?: string,
+    extensionInstanceId: string | undefined,
+    credential: string | undefined,
+    options: { requireActive: boolean } = { requireActive: true },
   ): Promise<FacebookConnectionDocument | null> {
     const normalizedInstanceId = extensionInstanceId?.trim();
     if (!normalizedInstanceId) return null;
-    const connection = await this.connectionModel
-      .findOne({ clerkUserId, extensionInstanceId: normalizedInstanceId })
-      .lean()
-      .exec();
+    const installation = await this.extensionsService.verifyWorkerIdentity(
+      clerkUserId,
+      normalizedInstanceId,
+      credential,
+    );
+    if (options.requireActive) {
+      this.extensionsService.assertInstallationActive(installation);
+    }
+    const connection = await this.extensionsService.resolveActiveWorkerConnection(
+      clerkUserId,
+      installation,
+    );
+    if (!connection) return null;
     const verified = Boolean(
-      connection?.status === FacebookConnectionStatus.CONNECTED &&
+      connection.status === FacebookConnectionStatus.CONNECTED &&
       connection.facebookSessionDetected &&
       connection.facebookUserId &&
       connection.detectedFacebookUserId &&
       connection.facebookUserId === connection.detectedFacebookUserId,
     );
-    return verified ? (connection as FacebookConnectionDocument) : null;
+    return verified ? connection : null;
   }
 
   private requireExtensionInstanceId(extensionInstanceId?: string): string {
@@ -241,7 +270,9 @@ export class JobsController {
   private async assertWorkerOwnsJob(
     clerkUserId: string,
     extensionInstanceId: string | undefined,
+    credential: string | undefined,
     job: PublishingJobDocument,
+    options: { requireActive: boolean } = { requireActive: true },
   ): Promise<FacebookConnectionDocument> {
     const normalizedInstanceId = this.requireExtensionInstanceId(
       extensionInstanceId,
@@ -249,6 +280,8 @@ export class JobsController {
     const connection = await this.getVerifiedWorkerConnection(
       clerkUserId,
       normalizedInstanceId,
+      credential,
+      options,
     );
     if (!connection) {
       this.logMaintenanceEvent(
@@ -323,6 +356,7 @@ export class JobsController {
   private async assertMaintenanceClaim(
     clerkUserId: string,
     extensionInstanceId: string | undefined,
+    credential: string | undefined,
     job: PublishingJobDocument,
     claimType: MaintenanceClaimType,
     claimToken?: string,
@@ -333,7 +367,9 @@ export class JobsController {
     const connection = await this.assertWorkerOwnsJob(
       clerkUserId,
       normalizedInstanceId,
+      credential,
       job,
+      { requireActive: false },
     );
 
     const hasClaim = Boolean(
@@ -398,6 +434,7 @@ export class JobsController {
   private async claimSpecificMaintenanceJob(
     clerkUserId: string,
     extensionInstanceId: string | undefined,
+    credential: string | undefined,
     id: string,
     claimType: MaintenanceClaimType,
   ) {
@@ -411,6 +448,7 @@ export class JobsController {
     const connection = await this.assertWorkerOwnsJob(
       clerkUserId,
       extensionInstanceId,
+      credential,
       job,
     );
     const now = new Date();
@@ -542,6 +580,7 @@ export class JobsController {
   async getNextJob(
     @Headers('x-clerk-user-id') clerkUserId: string,
     @Headers('x-extension-instance-id') extensionInstanceId?: string,
+    @Headers('x-extension-credential') credential?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
@@ -552,6 +591,7 @@ export class JobsController {
     const connection = await this.getVerifiedWorkerConnection(
       clerkUserId,
       normalizedInstanceId,
+      credential,
     );
     if (!connection) return null;
     const connectionId = connection?._id;
@@ -634,6 +674,7 @@ export class JobsController {
     @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Query('limit') limit?: string,
     @Query('manualOnly') manualOnly?: string,
+    @Headers('x-extension-credential') credential?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
@@ -643,6 +684,7 @@ export class JobsController {
     const connection = await this.getVerifiedWorkerConnection(
       clerkUserId,
       normalizedInstanceId,
+      credential,
     );
     if (!connection) {
       this.logMaintenanceEvent(
@@ -792,6 +834,7 @@ export class JobsController {
     @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Query('limit') limit?: string,
     @Query('manualOnly') manualOnly?: string,
+    @Headers('x-extension-credential') credential?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
@@ -801,6 +844,7 @@ export class JobsController {
     const connection = await this.getVerifiedWorkerConnection(
       clerkUserId,
       normalizedInstanceId,
+      credential,
     );
     if (!connection) {
       this.logMaintenanceEvent(
@@ -985,6 +1029,7 @@ export class JobsController {
     @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Param('id') id: string,
     @Body() body: { type?: MaintenanceClaimType },
+    @Headers('x-extension-credential') credential?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
@@ -997,6 +1042,7 @@ export class JobsController {
     return this.claimSpecificMaintenanceJob(
       clerkUserId,
       extensionInstanceId,
+      credential,
       id,
       body.type,
     );
@@ -1007,6 +1053,7 @@ export class JobsController {
     @Headers('x-clerk-user-id') clerkUserId: string,
     @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Param('id') id: string,
+    @Headers('x-extension-credential') credential?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
@@ -1016,7 +1063,13 @@ export class JobsController {
     if (post.clerkUserId !== clerkUserId) {
       throw new UnauthorizedException('Not your job');
     }
-    await this.assertWorkerOwnsJob(clerkUserId, extensionInstanceId, job);
+    await this.assertWorkerOwnsJob(
+      clerkUserId,
+      extensionInstanceId,
+      credential,
+      job,
+      { requireActive: false },
+    );
     return {
       id: job._id.toString(),
       status: job.status,
@@ -1031,6 +1084,7 @@ export class JobsController {
     @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Param('id') id: string,
     @Body() body: PostEngagementSyncResult,
+    @Headers('x-extension-credential') credential?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
@@ -1046,6 +1100,7 @@ export class JobsController {
     await this.assertMaintenanceClaim(
       clerkUserId,
       extensionInstanceId,
+      credential,
       job,
       MaintenanceClaimType.ENGAGEMENT,
       body.claimToken,
@@ -1127,6 +1182,7 @@ export class JobsController {
       reason?: string;
       claimToken?: string;
     },
+    @Headers('x-extension-credential') credential?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
@@ -1153,6 +1209,7 @@ export class JobsController {
     await this.assertMaintenanceClaim(
       clerkUserId,
       extensionInstanceId,
+      credential,
       job,
       MaintenanceClaimType.PENDING_APPROVAL,
       body.claimToken,
@@ -1310,6 +1367,7 @@ export class JobsController {
         reason?: string;
       };
     },
+    @Headers('x-extension-credential') credential?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
@@ -1344,12 +1402,52 @@ export class JobsController {
     const normalizedInstanceId = this.requireExtensionInstanceId(
       extensionInstanceId,
     );
-    const workerConnection = await this.assertWorkerOwnsJob(
+    const installation = await this.extensionsService.verifyWorkerIdentity(
       clerkUserId,
       normalizedInstanceId,
-      job,
+      credential,
     );
+    const workerConnection = await this.getVerifiedWorkerConnection(
+      clerkUserId,
+      normalizedInstanceId,
+      credential,
+      { requireActive: false },
+    );
+    if (!workerConnection) {
+      throw new UnauthorizedException(
+        'Extension instance is not linked to a verified Facebook connection',
+      );
+    }
+    if (String(job.facebookConnectionId) !== String(workerConnection._id)) {
+      throw new UnauthorizedException(
+        'Job is assigned to another Facebook connection',
+      );
+    }
     const workerConnectionId = workerConnection._id;
+
+    // Final-result grace: a paused or disconnecting installation may only
+    // finish work it claimed before the transition, and only while its lease
+    // is still valid. It can never pull a queued job back into RUNNING.
+    if (installation.status !== ExtensionLifecycleStatus.ACTIVE) {
+      const holdsValidLease = Boolean(
+        job.claimedByExtensionInstanceId === installation.extensionInstanceId &&
+        job.claimExpiresAt &&
+        job.claimExpiresAt.getTime() > Date.now(),
+      );
+      if (!holdsValidLease) {
+        throw new ForbiddenException(
+          'Extension is not active and holds no valid job lease.',
+        );
+      }
+      if (
+        body.status === PublishingJobStatus.RUNNING ||
+        body.status === PublishingJobStatus.PENDING
+      ) {
+        throw new ForbiddenException(
+          'A paused or disconnecting extension cannot claim new work.',
+        );
+      }
+    }
 
     const previousStatus = job.status;
     if (

@@ -11,9 +11,11 @@ import {
   FacebookConnection,
   FacebookConnectionSchema,
 } from '../schemas/facebook-connection.schema';
+import { ExtensionsModule } from '../extensions/extensions.module';
 
 @Module({
   imports: [
+    ExtensionsModule,
     MongooseModule.forFeature([
       { name: Group.name, schema: GroupSchema },
       { name: PublishingJob.name, schema: PublishingJobSchema },

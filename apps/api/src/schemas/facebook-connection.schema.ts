@@ -48,6 +48,23 @@ export class FacebookConnection {
   @Prop()
   archiveReason?: string;
 
+  /**
+   * One-time reconnect approval issued by an authenticated dashboard action.
+   * Only a hash of the approval token is stored; the plaintext is returned
+   * once and consumed by the reinstallation recovery flow.
+   */
+  @Prop()
+  reconnectApprovalTokenHash?: string;
+
+  @Prop()
+  reconnectApprovalRequestedAt?: Date;
+
+  @Prop()
+  reconnectApprovalExpiresAt?: Date;
+
+  @Prop()
+  reconnectApprovalUsedAt?: Date;
+
   /** User-provided label for recognizing this Chrome Profile. */
   @Prop({ trim: true, maxlength: 60 })
   displayName?: string;

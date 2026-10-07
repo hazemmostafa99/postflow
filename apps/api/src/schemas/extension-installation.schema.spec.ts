@@ -24,9 +24,12 @@ describe('ExtensionInstallation lifecycle schema', () => {
   it('has unique instance and active connection binding indexes', () => {
     const indexes = ExtensionInstallationSchema.indexes();
     const instanceIndex = indexes.find(([keys]) => keys.extensionInstanceId === 1);
-    const bindingIndex = indexes.find(([keys]) => keys.facebookConnectionId === 1);
+    const bindingIndex = indexes.find(
+      ([_keys, options]) => options?.name === 'active_facebook_connection_binding',
+    );
 
     expect(instanceIndex?.[1]).toMatchObject({ unique: true, sparse: true });
+    expect(bindingIndex).toBeDefined();
     expect(bindingIndex?.[1]).toMatchObject({ unique: true });
     expect(bindingIndex?.[1].partialFilterExpression).toEqual({
       facebookConnectionId: { $type: 'objectId' },

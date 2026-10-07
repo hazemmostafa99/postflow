@@ -72,8 +72,20 @@
     "rootDir": "src",
     "testRegex": ".*\\.spec\\.ts$",
     "transform": {
-      "^.+\\.(t|j)s$": "ts-jest"
+      "^.+\\.tsx?$": "ts-jest",
+      "^.+\\.js$": [
+        "ts-jest",
+        {
+          "diagnostics": false,
+          "tsconfig": {
+            "allowJs": true
+          }
+        }
+      ]
     },
+    "transformIgnorePatterns": [
+      "[\\\\/]node_modules[\\\\/](?!@nestjs[\\\\/]mongoose)"
+    ],
     "collectCoverageFrom": [
       "**/*.(t|j)s"
     ],

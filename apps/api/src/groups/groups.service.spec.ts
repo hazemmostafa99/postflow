@@ -23,6 +23,8 @@ describe('GroupsService.syncGroups', () => {
   function createHarness(options?: {
     connection?: Record<string, unknown> | null;
     bulkWriteError?: unknown;
+    installationStatus?: string;
+    verifyIdentityThrows?: unknown;
   }) {
     const bulkWrite = jest.fn().mockImplementation(() => {
       if (options?.bulkWriteError) return Promise.reject(options.bulkWriteError);
@@ -38,18 +40,53 @@ describe('GroupsService.syncGroups', () => {
       : options.connection;
     const connectionModel = {
       findOne: jest.fn().mockReturnValue({
-        lean: jest.fn().mockReturnValue({
-          exec: jest.fn().mockResolvedValue(connection),
-        }),
+        lean: jest.fn().mockReturnThis(),
+        exec: jest.fn().mockResolvedValue(connection),
       }),
+    };
+    const extensionsService = {
+      verifyWorkerIdentity: jest.fn(
+        async (_clerk: string, instanceId?: string) => {
+          if (options?.verifyIdentityThrows) throw options.verifyIdentityThrows;
+          return {
+            _id: { toString: () => 'installation-1' },
+            clerkUserId,
+            extensionInstanceId: instanceId?.trim(),
+            status: options?.installationStatus ?? 'ACTIVE',
+          };
+        },
+      ),
+      assertInstallationActive: jest.fn(
+        (installation: { status?: string }) => {
+          if (installation.status === 'ACTIVE') return;
+          throw new ForbiddenException(
+            'Extension is not active and cannot claim new work.',
+          );
+        },
+      ),
+      resolveActiveWorkerConnection: jest.fn(
+        async (
+          _clerk: string,
+          installation: { extensionInstanceId?: string },
+        ) => {
+          const query = connectionModel.findOne({
+            clerkUserId,
+            extensionInstanceId: installation.extensionInstanceId,
+          });
+          if (!query || typeof query.exec !== 'function') return null;
+          const found = await query.exec();
+          return (found as Record<string, unknown> | null) ?? null;
+        },
+      ),
     };
     const service = new GroupsService(
       groupModel as never,
       jobModel as never,
       connectionModel as never,
+      extensionsService as never,
     );
 
-    return { service, groupModel, connectionModel };
+    return { service, groupModel, connectionModel, extensionsService };
   }
 
   function verifiedConnection() {
@@ -117,6 +154,40 @@ describe('GroupsService.syncGroups', () => {
     ).rejects.toBeInstanceOf(ForbiddenException);
   });
 
+  it('blocks sync for a paused extension installation', async () => {
+    const { service, groupModel } = createHarness({
+      installationStatus: 'PAUSED',
+    });
+
+    await expect(
+      service.syncGroups(
+        clerkUserId,
+        [
+          {
+            externalId: 'group-one',
+            name: 'Group One',
+            url: 'https://www.facebook.com/groups/group-one/',
+          },
+        ],
+        extensionInstanceId,
+      ),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(groupModel.bulkWrite).not.toHaveBeenCalled();
+  });
+
+  it('blocks sync for a revoked extension installation', async () => {
+    const { service, groupModel } = createHarness({
+      verifyIdentityThrows: new ForbiddenException(
+        'Extension installation has been revoked.',
+      ),
+    });
+
+    await expect(
+      service.syncGroups(clerkUserId, [], extensionInstanceId),
+    ).rejects.toThrow('Extension installation has been revoked.');
+    expect(groupModel.bulkWrite).not.toHaveBeenCalled();
+  });
+
   it('turns stale duplicate group indexes into an actionable conflict', async () => {
     const { service } = createHarness({
       bulkWriteError: { code: 11000 },
@@ -158,6 +229,11 @@ describe('GroupsService.listGroups', () => {
       groupModel as never,
       {} as never,
       {} as never,
+      {
+        verifyWorkerIdentity: jest.fn(),
+        assertInstallationActive: jest.fn(),
+        resolveActiveWorkerConnection: jest.fn(),
+      } as never,
     );
 
     await service.listGroups('clerk-user-1', { connectionIds });
@@ -186,6 +262,11 @@ describe('GroupsService.deleteGroup', () => {
       { findOneAndDelete } as never,
       { deleteMany } as never,
       {} as never,
+      {
+        verifyWorkerIdentity: jest.fn(),
+        assertInstallationActive: jest.fn(),
+        resolveActiveWorkerConnection: jest.fn(),
+      } as never,
     );
 
     await service.deleteGroup(clerkUserId, groupId.toString());

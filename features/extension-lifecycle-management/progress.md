@@ -187,27 +187,80 @@ any shared or production database.
 
 ### Checklist
 
-- [ ] Issue a random credential when an installation is approved.
-- [ ] Store only its hash and version in the backend.
-- [ ] Store the credential only in extension-local storage.
-- [ ] Authenticate worker requests with instance ID plus credential.
-- [ ] Prevent webpage scripts from reading the credential.
-- [ ] Remove credential values from logs and API responses.
-- [ ] Return explicit registration outcomes.
-- [ ] Make known PAUSED registration remain paused.
-- [ ] Make REVOKE_PENDING registration remain pending.
-- [ ] Reject known REVOKED installation registration.
-- [ ] Stop heartbeat from changing lifecycle back to ACTIVE.
-- [ ] Retain revoked installation tombstones.
-- [ ] Add token rotation and revocation tests.
+- [x] Issue a random credential when an installation is approved.
+- [x] Store only its hash and version in the backend.
+- [x] Store the credential only in extension-local storage.
+- [x] Authenticate worker requests with instance ID plus credential.
+- [x] Prevent webpage scripts from reading the credential.
+- [x] Remove credential values from logs and API responses.
+- [x] Return explicit registration outcomes.
+- [x] Make known PAUSED registration remain paused.
+- [x] Make REVOKE_PENDING registration remain pending.
+- [x] Reject known REVOKED installation registration.
+- [x] Stop heartbeat from changing lifecycle back to ACTIVE.
+- [x] Retain revoked installation tombstones.
+- [x] Add token rotation and revocation tests.
 
 ### Review Notes
 
 ```text
-Status: NOT STARTED
+Status: IMPLEMENTED — review pending
 
-This phase closes the current weakness where caller-supplied identity headers
-are sufficient for worker API access and upsert traffic can reactivate records.
+Files changed:
+
+- `apps/api/src/extensions/installation-credential.ts` (new) + `.spec.ts`
+- `apps/api/src/extensions/extensions.service.ts`
+- `apps/api/src/extensions/extensions.controller.ts`
+- `apps/api/src/extensions/extensions.module.ts`
+- `apps/api/src/extensions/extensions.service.spec.ts`
+- `apps/api/src/extensions/extensions.controller.spec.ts`
+- `apps/api/src/schemas/extension-installation.schema.ts`
+- `apps/extension/src/background.ts`
+
+Behavior:
+
+- An approved installation is issued a random `pfc_` base64url token at
+  registration time; the backend persists only its SHA-256 hex hash plus a
+  version counter (`credentialHash`, `credentialVersion`).
+- The extension stores the plaintext only in `chrome.storage.local`
+  (`extensionCredential`), which page scripts cannot read, and sends it as the
+  `x-extension-credential` header on every API call when present.
+- Worker endpoints authenticate with instance ID plus credential
+  (`verifyWorkerIdentity`). REVOKED is checked before the credential.
+  Plaintext credential values never leave issuance, are absent from API
+  responses (hashed fields stripped in `sanitizeConnection`/
+  `sanitizeInstallation`), and are never logged.
+- `register` returns an explicit `RegistrationOutcome`. Known PAUSED stays
+  paused, REVOKE_PENDING stays pending (or finalizes to REVOKED once leases
+  expire), and a REVOKED tombstone returns outcome `REVOKED` with a reason and
+  is never mutated or reactivated.
+- Heartbeat refreshes liveness but never changes the lifecycle, and preserves
+  persistent worker statuses (PUBLISHING, BLOCKED, LOGIN_REQUIRED,
+  ACCOUNT_MISMATCH, CHECKPOINT_OR_VERIFICATION, CAPTCHA_OR_CHALLENGE,
+  MANUAL_INTERVENTION_REQUIRED).
+- Legacy installations without a credential hash keep working until their next
+  register issues a credential and bumps `credentialVersion`; after that,
+  missing, wrong, or revoked credentials fail closed with 403.
+- Revoked installation tombstones are retained; no hard deletes.
+- `maybeFinalizeRevocation` now returns `Promise<boolean>` and `register`
+  branches on the result, so a finalized REVOKE_PENDING cannot fall through to
+  ACTIVE.
+
+Tests:
+
+- `installation-credential.spec.ts`: prefixed token generation, non-persistence
+  (hash differs from the plaintext), timing-safe verification, masking.
+- `extensions.service.spec.ts`: credential gate (legacy no-hash, missing,
+  wrong, revoked, matching), register outcomes including the REVOKED
+  fallthrough after finalization, and heartbeat that preserves lifecycle.
+- `extensions.controller.spec.ts`: credential forwarding on worker routes,
+  dashboard route mapping.
+
+Verification on 2026-10-08:
+
+- `npm test` in `apps/api`: 20/20 suites, 185/185 tests pass.
+- `npm run build` in `apps/api`: passes.
+- `npm run build:dev` in `apps/extension`: passes (tsc clean).
 ```
 
 ### Review Gate
@@ -215,34 +268,89 @@ are sufficient for worker API access and upsert traffic can reactivate records.
 No pause, disconnect, or reconnect UI should be released until revoked worker
 traffic fails closed in automated tests.
 
+Revoked worker traffic now fails closed (403), and REVOKED registration halts
+the handshake with outcome `REVOKED`. Gate is satisfied for release of the
+lifecycle dashboard once Phase 5/6 reviews are complete.
+
 ---
 
 ## Phase 5 — Backend Lifecycle Management API
 
 ### Checklist
 
-- [ ] Return normalized lifecycle, connectivity, and health fields from the
+- [x] Return normalized lifecycle, connectivity, and health fields from the
   connection list API.
-- [ ] Add owner-authorized rename endpoint integration.
-- [ ] Add idempotent pause endpoint.
-- [ ] Add idempotent resume endpoint.
-- [ ] Add graceful disconnect endpoint.
-- [ ] Add separately confirmed force-disconnect endpoint.
-- [ ] Add soft remove/archive endpoint.
-- [ ] Add archived connection listing.
-- [ ] Add restore/reconnect approval endpoint.
-- [ ] Validate every target belongs to the authenticated PostFlow user.
-- [ ] Add lifecycle audit events.
-- [ ] Add controller and service tests for every allowed and rejected
+- [x] Add owner-authorized rename endpoint integration.
+- [x] Add idempotent pause endpoint.
+- [x] Add idempotent resume endpoint.
+- [x] Add graceful disconnect endpoint.
+- [x] Add separately confirmed force-disconnect endpoint.
+- [x] Add soft remove/archive endpoint.
+- [x] Add archived connection listing.
+- [x] Add restore/reconnect approval endpoint.
+- [x] Validate every target belongs to the authenticated PostFlow user.
+- [x] Add lifecycle audit events.
+- [x] Add controller and service tests for every allowed and rejected
   transition.
 
 ### Review Notes
 
 ```text
-Status: NOT STARTED
+Status: IMPLEMENTED — review pending
 
-The existing unique rename path can be reused, but lifecycle mutations need
-new endpoints and transition validation.
+Endpoints (all owner-authorized via `x-clerk-user-id`; `requireOwnedConnection`
+rejects anything that is not found or belongs to another user):
+
+- `GET /api/extensions/connections` — normalized lifecycle (ACTIVE/PAUSED/
+  REVOKE_PENDING/REVOKED), derived connectivity (ONLINE/OFFLINE with reason),
+  health (worker status), masked instance ID, and the active installation
+  binding per connection.
+- `GET /api/extensions/connections/archived` — archived connection listing.
+- `PATCH /api/extensions/connections/:id/name` — unique-name rename with
+  conflict handling (reuses the existing uniqueness rules).
+- `POST /api/extensions/connections/:id/pause` — idempotent pause of the
+  bound installation; rejects paused-but-unknown and REVOKED bindings.
+- `POST /api/extensions/connections/:id/resume` — idempotent resume back to
+  ACTIVE; a REVOKED installation must be reconnected from the Archived view.
+- `POST /api/extensions/connections/:id/disconnect` — graceful disconnect:
+  moves to REVOKE_PENDING, finalizes immediately when nothing is in flight,
+  and waits for lease expiry when a job or maintenance claim is running.
+- `POST /api/extensions/connections/:id/force-disconnect` — separate route
+  that revokes immediately and clears the active binding (emergency action).
+- `DELETE /api/extensions/connections/:id` — soft remove/archive: revokes the
+  installation, clears the binding, and archives the connection. No hard
+  delete; tombstones are retained.
+- `POST /api/extensions/connections/:id/reconnect-approval` — issues a
+  short-lived (10 min) single-use approval token; only its hash is stored.
+  Consumed by the Phase 9 reinstall flow.
+
+Lifecycle audit:
+
+- Every mutation writes an `ExtensionLifecycleAuditEvent` with the DASHBOARD
+  actor, previous/next lifecycle, and reason. `recordAudit` is best-effort:
+  an audit failure is logged and does not roll back the action.
+
+Tests in `extensions.service.spec.ts`:
+
+- Ownership: pause on another user's connection → not found.
+- Pause: ACTIVE → PAUSED with audit record.
+- Resume: PAUSED → ACTIVE; REVOKED resume is rejected.
+- Disconnect: graceful finalizes immediately when idle, waits for a running
+  leased job; force revokes immediately even with an in-flight claim.
+- Remove: revokes the installation and archives the connection without
+  deleting either record.
+- Reconnect approval: issue (hash only), consume exactly once, expired/invalid
+  rejection.
+- Listing: non-archived only, derived connectivity, and offline classification
+  for stale/missing heartbeats.
+
+`extensions.controller.spec.ts` maps every dashboard route to service calls and
+asserts the credential header is forwarded on worker routes.
+
+Verification on 2026-10-08:
+
+- `npm test` in `apps/api`: 20/20 suites, 185/185 tests pass.
+- `npm run build` in `apps/api`: passes.
 ```
 
 ### Review Gate
@@ -250,38 +358,98 @@ new endpoints and transition validation.
 Review API transition rules and error messages before building destructive
 dashboard actions.
 
+Transition rules and rejection messages are implemented and tested; review the
+endpoint surface above before Phase 8 builds the action menu.
+
 ---
 
 ## Phase 6 — Worker Claims and In-Flight Job Safety
 
 ### Checklist
 
-- [ ] Require ACTIVE lifecycle for new publishing claims.
-- [ ] Require ACTIVE lifecycle for pending-approval claims.
-- [ ] Require ACTIVE lifecycle for engagement claims.
-- [ ] Exclude archived connections from all new work.
-- [ ] Verify the requesting installation is the current connection binding.
-- [ ] Allow PAUSED/REVOKE_PENDING workers to finish only previously leased
+- [x] Require ACTIVE lifecycle for new publishing claims.
+- [x] Require ACTIVE lifecycle for pending-approval claims.
+- [x] Require ACTIVE lifecycle for engagement claims.
+- [x] Exclude archived connections from all new work.
+- [x] Verify the requesting installation is the current connection binding.
+- [x] Allow PAUSED/REVOKE_PENDING workers to finish only previously leased
   work.
-- [ ] Reject results from revoked, replaced, foreign, or stale workers.
-- [ ] Define graceful disconnect completion after job finish or lease expiry.
-- [ ] Keep queued jobs waiting instead of silently canceling them.
-- [ ] Expose a clear waiting-for-connection reason to dashboard APIs.
-- [ ] Add concurrency and duplicate-publish regression tests.
+- [x] Reject results from revoked, replaced, foreign, or stale workers.
+- [x] Define graceful disconnect completion after job finish or lease expiry.
+- [x] Keep queued jobs waiting instead of silently canceling them.
+- [x] Expose a clear waiting-for-connection reason to dashboard APIs.
+- [x] Add concurrency and duplicate-publish regression tests.
 
 ### Review Notes
 
 ```text
-Status: NOT STARTED
+Status: IMPLEMENTED — review pending
 
-This phase must reuse the ownership and lease rules documented by
-`extension-owned-maintenance-sync`. It must not introduce a user-wide fallback.
+Files changed:
+
+- `apps/api/src/posts/jobs.controller.ts` (+ `jobs.controller.spec.ts`)
+- `apps/api/src/posts/posts.module.ts`
+- `apps/api/src/groups/groups.service.ts` (+ spec), `groups.controller.ts`
+  (+ spec), `groups.module.ts`
+- `apps/api/src/extensions/extensions.service.ts` (claim-gate helpers
+  `assertInstallationActive`, `resolveActiveWorkerConnection`)
+
+Shared claim gate (`getVerifiedWorkerConnection`, used by publishing,
+pending-approval, engagement, and maintenance surfaces), strict and
+fail-closed:
+
+1. Installation exists, is non-revoked, and presents a valid credential
+   (`verifyWorkerIdentity`).
+2. New claims additionally require an ACTIVE lifecycle
+   (`assertInstallationActive`); PAUSED and REVOKE_PENDING get distinct
+   rejection messages.
+3. The resolved connection must be the installation's active binding
+   (`resolveActiveWorkerConnection`), must not be archived, and the Facebook
+   session identity must still be verified (CONNECTED status, matching
+   `facebookUserId`/`detectedFacebookUserId`).
+
+Result safety in jobs:
+
+- `updateJobStatus` accepts PAUSED/REVOKE_PENDING final results only for work
+  claimed before the transition while a valid lease/token is held; an ACTIVE
+  installation advances a claimed job to SUCCESS; a paused installation without
+  a lease, a job pulled back into RUNNING under pause, stale claim tokens,
+  expired leases, revoked installations, and unverified connections are all
+  rejected.
+- Graceful disconnect waits for the running lease (REVOKE_PENDING) and
+  finalizes to REVOKED when no leased job or maintenance claim remains
+  (`maybeFinalizeRevocation`).
+- Queued jobs remain queued and keep a clear waiting-for-connection status
+  instead of being canceled; dashboard maintenance requests made without an
+  extension header are still queued by design.
+- Group sync uses the equivalent `assertVerifiedConnection` gate (verify
+  identity + credential + ACTIVE + active binding + Facebook identity verified)
+  and throws Forbidden for blocked claims.
+
+Concurrency/duplicate-publish coverage in `jobs.controller.spec.ts`:
+
+- Only one of two simultaneous requests claims the same job; reclaim after a
+  lease expires; foreign connection and unverified claims are rejected.
+- New lifecycle suite: ACTIVE success, paused with/without lease,
+  REVOKE_PENDING final result under a valid lease, revoked rejection, and
+  unverified-connection rejection.
+
+Also covered in `groups.service.spec.ts`: identity-unverified, paused, and
+revoked installations are blocked from syncing.
+
+Verification on 2026-10-08:
+
+- `npm test` in `apps/api`: 20/20 suites, 185/185 tests pass.
+- `npm run build` in `apps/api`: passes.
 ```
 
 ### Review Gate
 
 All publishing and maintenance claim tests must pass before an extension is
 allowed to react to lifecycle commands.
+
+All publishing and maintenance claim tests pass; the extension can now safely
+react to lifecycle commands in Phase 7.
 
 ---
 
@@ -411,11 +579,21 @@ Automated atomic-rebind tests must pass before manual reinstall testing.
 ### Review Notes
 
 ```text
-Status: NOT STARTED
+Status: PARTIAL — Phase 4–6 verification gates complete
 
-The repository currently has a known Jest/ESM configuration issue in the API
-test runner that must be resolved or explicitly isolated before this phase can
-be considered complete. Successful compilation alone is not sufficient.
+API build (`npm run build`) passes.
+Development extension build (`npm run build:dev`, tsc) passes.
+
+The previously known Jest/ESM configuration issue in the API test runner is
+resolved: `npm test` in `apps/api` reports 20/20 suites and 185/185 tests green.
+Remaining checklist items depend on Phases 7–9 work (extension lifecycle
+enforcement, dashboard UX, reinstall recovery).
+
+Note: the extension Node test suite has one pre-existing failure,
+`graphql-spy.test.cjs` ("carries an encoded composer video id into its
+successful response event"). It loads only `src/graphql-spy.ts`, which is
+untouched by this feature and confirmed failing at the base commit `a5098d4`;
+it is unrelated and not a regression from lifecycle work.
 ```
 
 ### Review Gate
@@ -500,13 +678,13 @@ rollout occurs.
 | 1. Existing architecture review | Complete | Pending user review |
 | 2. Product and state definition | Complete | Pending user review |
 | 3. Lifecycle data model and migration | Implemented; apply pending review | No |
-| 4. Installation credential and registration guard | Not started | No |
-| 5. Backend lifecycle management API | Not started | No |
-| 6. Worker claims and in-flight job safety | Not started | No |
+| 4. Installation credential and registration guard | Implemented | No |
+| 5. Backend lifecycle management API | Implemented | No |
+| 6. Worker claims and in-flight job safety | Implemented | No |
 | 7. Extension lifecycle enforcement | Not started | No |
 | 8. Connections dashboard UX | Not started | No |
 | 9. Reinstall detection and explicit recovery | Not started | No |
-| 10. Automated verification | Not started | No |
+| 10. Automated verification | Partial (Phase 4–6 gates green) | No |
 | 11. Manual browser and multi-profile validation | Not started | No |
 | 12. Rollout, monitoring, and cleanup | Not started | No |
 
@@ -515,13 +693,21 @@ rollout occurs.
 ## Current Status
 
 ```text
-Status: PHASE 3 IMPLEMENTED; DATABASE APPLY PENDING REVIEW
-Current phase: Phase 3 — Lifecycle data model and migration.
-Next action: Review the clean report-only result, apply the migration with
-explicit approval, then continue to Phase 4 registration guards.
+Status: PHASES 4–6 IMPLEMENTED; USER REVIEW PENDING
+Current phase: Phase 4–6 — installation credential and registration guard,
+backend lifecycle API, and worker claim/in-flight safety.
+Next action: Review the Phase 4–6 evidence below, then start Phase 7
+(extension lifecycle enforcement) or address requested changes.
 
-Existing fast-registration and unique-name work remains in the working tree,
-but it does not implement pause, revoke, archive, or reconnect lifecycle.
+Verification recap on 2026-10-08:
+
+- `npm test` in `apps/api`: 20/20 suites, 185/185 tests pass.
+- `npm run build` in `apps/api`: passes.
+- `npm run build:dev` in `apps/extension`: passes (tsc clean).
+
+The Phase 3 database migration is still report-only, with the apply step
+pending review. The extension `graphql-spy.test.cjs` failure is pre-existing
+at the base commit `a5098d4` and unrelated to this feature.
 ```
 
 ---

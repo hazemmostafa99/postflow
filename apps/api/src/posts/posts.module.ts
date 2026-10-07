@@ -15,10 +15,12 @@ import {
 } from '../schemas/facebook-connection.schema';
 import { User, UserSchema } from '../schemas/user.schema';
 import { AuthModule } from '../auth/auth.module';
+import { ExtensionsModule } from '../extensions/extensions.module';
 
 @Module({
   imports: [
     AuthModule,
+    ExtensionsModule,
     MongooseModule.forFeature([
       { name: Post.name, schema: PostSchema },
       { name: PublishingJob.name, schema: PublishingJobSchema },

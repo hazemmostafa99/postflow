@@ -11,6 +11,14 @@ import {
   FacebookConnection,
   FacebookConnectionSchema,
 } from '../schemas/facebook-connection.schema';
+import {
+  PublishingJob,
+  PublishingJobSchema,
+} from '../schemas/publishing-job.schema';
+import {
+  ExtensionLifecycleAuditEvent,
+  ExtensionLifecycleAuditEventSchema,
+} from '../schemas/extension-lifecycle-audit.schema';
 
 @Module({
   imports: [
@@ -18,9 +26,15 @@ import {
       { name: ExtensionInstallation.name, schema: ExtensionInstallationSchema },
       { name: User.name, schema: UserSchema },
       { name: FacebookConnection.name, schema: FacebookConnectionSchema },
+      { name: PublishingJob.name, schema: PublishingJobSchema },
+      {
+        name: ExtensionLifecycleAuditEvent.name,
+        schema: ExtensionLifecycleAuditEventSchema,
+      },
     ]),
   ],
   providers: [ExtensionsService],
   controllers: [ExtensionsController],
+  exports: [ExtensionsService],
 })
 export class ExtensionsModule {}

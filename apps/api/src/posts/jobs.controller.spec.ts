@@ -10,6 +10,7 @@ jest.mock('@nestjs/mongoose', () => ({
   },
 }));
 
+import { ForbiddenException } from '@nestjs/common';
 import { JobsController } from './jobs.controller';
 import {
   FacebookSubmissionStatus,
@@ -138,13 +139,51 @@ describe('JobsController.getNextJob', () => {
           : queryChain(null)),
       updateOne: jest.fn(),
     };
+    const extensionsService = {
+      verifyWorkerIdentity: jest.fn(
+        async (_clerkUserId: string, extensionInstanceId?: string) => {
+          const normalized = extensionInstanceId?.trim();
+          if (!normalized) {
+            throw new Error('x-extension-instance-id header is required');
+          }
+          return {
+            _id: { toString: () => 'installation-1' },
+            clerkUserId,
+            extensionInstanceId: normalized,
+            status: 'ACTIVE',
+          };
+        },
+      ),
+      assertInstallationActive: jest.fn(),
+      resolveActiveWorkerConnection: jest.fn(
+        async (
+          _clerkUserId: string,
+          installation: { extensionInstanceId?: string },
+        ) => {
+          const query = connectionModel.findOne({
+            clerkUserId,
+            extensionInstanceId: installation.extensionInstanceId,
+          });
+          if (!query || typeof query.exec !== 'function') return null;
+          const found = await query.exec();
+          return found ?? null;
+        },
+      ),
+    };
     const controller = new JobsController(
       jobModel as never,
       postModel as never,
       connectionModel as never,
+      extensionsService as never,
     );
 
-    return { controller, jobModel, jobChain, connectionModel };
+    return {
+      controller,
+      jobModel,
+      jobChain,
+      connectionModel,
+      extensionsService,
+    };
   }
 
   it('returns a normalized group payload while preserving legacy fields', async () => {
@@ -288,6 +327,7 @@ describe('JobsController.getNextJob', () => {
 });
 
 describe('JobsController target-specific sync guards', () => {
+  const clerkUserId = 'clerk-user-1';
   const extensionInstanceId = 'extension-1';
   const connectionObjectId = { toString: () => 'connection-1' };
 
@@ -335,11 +375,43 @@ describe('JobsController target-specific sync guards', () => {
         exec: jest.fn().mockResolvedValue(verifiedConnection),
       }),
     };
+    const extensionsService = {
+      verifyWorkerIdentity: jest.fn(
+        async (_clerk: string, instanceId?: string) => {
+          const normalized = instanceId?.trim();
+          if (!normalized) {
+            throw new Error('x-extension-instance-id header is required');
+          }
+          return {
+            _id: { toString: () => 'installation-1' },
+            clerkUserId,
+            extensionInstanceId: normalized,
+            status: 'ACTIVE',
+          };
+        },
+      ),
+      assertInstallationActive: jest.fn(),
+      resolveActiveWorkerConnection: jest.fn(
+        async (
+          _clerk: string,
+          installation: { extensionInstanceId?: string },
+        ) => {
+          const query = connectionModel.findOne({
+            clerkUserId,
+            extensionInstanceId: installation.extensionInstanceId,
+          });
+          if (!query || typeof query.exec !== 'function') return null;
+          const found = await query.exec();
+          return (found as Record<string, unknown> | null) ?? null;
+        },
+      ),
+    };
     return {
       controller: new JobsController(
         jobModel as never,
         {} as never,
         connectionModel as never,
+        extensionsService as never,
       ),
       profileJob,
     };
@@ -500,11 +572,37 @@ describe('JobsController maintenance claims', () => {
     const connectionModel = {
       findOne: jest.fn().mockReturnValue(resultChain(connection)),
     };
+    const extensionsService = {
+      verifyWorkerIdentity: jest.fn(
+        async (_clerk: string, instanceId?: string) => ({
+          _id: { toString: () => 'installation-1' },
+          clerkUserId,
+          extensionInstanceId: instanceId?.trim(),
+          status: 'ACTIVE',
+        }),
+      ),
+      assertInstallationActive: jest.fn(),
+      resolveActiveWorkerConnection: jest.fn(
+        async (
+          _clerk: string,
+          installation: { extensionInstanceId?: string },
+        ) => {
+          const query = connectionModel.findOne({
+            clerkUserId,
+            extensionInstanceId: installation.extensionInstanceId,
+          });
+          if (!query || typeof query.exec !== 'function') return null;
+          const found = await query.exec();
+          return (found as Record<string, unknown> | null) ?? null;
+        },
+      ),
+    };
     return {
       controller: new JobsController(
         jobModel as never,
         postModel as never,
         connectionModel as never,
+        extensionsService as never,
       ),
       findOneAndUpdate,
     };
@@ -630,10 +728,36 @@ describe('JobsController concurrent maintenance lease recovery', () => {
         exec: jest.fn().mockResolvedValue([{ _id: postObjectId }]),
       }),
     };
+    const extensionsService = {
+      verifyWorkerIdentity: jest.fn(
+        async (_clerk: string, instanceId?: string) => ({
+          _id: { toString: () => 'installation-1' },
+          clerkUserId,
+          extensionInstanceId: instanceId?.trim(),
+          status: 'ACTIVE',
+        }),
+      ),
+      assertInstallationActive: jest.fn(),
+      resolveActiveWorkerConnection: jest.fn(
+        async (
+          _clerk: string,
+          installation: { extensionInstanceId?: string },
+        ) => {
+          const query = connectionModel.findOne({
+            clerkUserId,
+            extensionInstanceId: installation.extensionInstanceId,
+          });
+          if (!query || typeof query.exec !== 'function') return null;
+          const found = await query.exec();
+          return (found as Record<string, unknown> | null) ?? null;
+        },
+      ),
+    };
     const controller = new JobsController(
       { findOneAndUpdate } as never,
       postModel as never,
       connectionModel as never,
+      extensionsService as never,
     );
     return {
       controller,
@@ -707,11 +831,37 @@ describe('JobsController manual maintenance claims', () => {
     const connectionModel = {
       findOne: jest.fn().mockReturnValue(chain(connection)),
     };
+    const extensionsService = {
+      verifyWorkerIdentity: jest.fn(
+        async (_clerk: string, instanceId?: string) => ({
+          _id: { toString: () => 'installation-1' },
+          clerkUserId,
+          extensionInstanceId: instanceId?.trim(),
+          status: 'ACTIVE',
+        }),
+      ),
+      assertInstallationActive: jest.fn(),
+      resolveActiveWorkerConnection: jest.fn(
+        async (
+          _clerk: string,
+          installation: { extensionInstanceId?: string },
+        ) => {
+          const query = connectionModel.findOne({
+            clerkUserId,
+            extensionInstanceId: installation.extensionInstanceId,
+          });
+          if (!query || typeof query.exec !== 'function') return null;
+          const found = await query.exec();
+          return (found as Record<string, unknown> | null) ?? null;
+        },
+      ),
+    };
     return {
       controller: new JobsController(
         jobModel as never,
         {} as never,
         connectionModel as never,
+        extensionsService as never,
       ),
       findOneAndUpdate,
     };
@@ -807,5 +957,200 @@ describe('JobsController manual maintenance claims', () => {
       'Extension instance is not linked to a verified Facebook connection',
     );
     expect(findOneAndUpdate).not.toHaveBeenCalled();
+  });
+});
+
+describe('JobsController.updateJobStatus lifecycle gating', () => {
+  const clerkUserId = 'clerk-user-1';
+  const extensionInstanceId = 'extension-1';
+  const connectionObjectId = { toString: () => 'connection-1' };
+  const postObjectId = { toString: () => 'post-1' };
+
+  function createStatusController(options?: {
+    installationStatus?: string;
+    claimedBy?: string;
+    claimExpiresAt?: Date;
+    previousStatus?: string;
+    verifyIdentityThrows?: unknown;
+    connection?: Record<string, unknown> | null;
+  }) {
+    const job = {
+      _id: { toString: () => 'job-1' },
+      postId: { clerkUserId, _id: postObjectId },
+      facebookConnectionId: connectionObjectId,
+      status: options?.previousStatus ?? PublishingJobStatus.RUNNING,
+      claimedByExtensionInstanceId: options?.claimedBy ?? extensionInstanceId,
+      claimExpiresAt:
+        options?.claimExpiresAt ?? new Date(Date.now() + 60_000),
+      attempts: 1,
+      save: jest.fn().mockResolvedValue(undefined),
+    };
+    const jobModel = {
+      findById: jest.fn().mockReturnValue({
+        populate: jest.fn().mockReturnThis(),
+        exec: jest.fn().mockResolvedValue(job),
+      }),
+      find: jest.fn().mockReturnValue({
+        where: jest.fn().mockReturnValue({
+          equals: jest.fn().mockReturnValue({
+            select: jest.fn().mockReturnValue({
+              lean: jest.fn().mockReturnValue({
+                exec: jest.fn().mockResolvedValue([]),
+              }),
+            }),
+          }),
+        }),
+      }),
+    };
+    const connection =
+      options?.connection === undefined
+        ? {
+            _id: connectionObjectId,
+            extensionInstanceId,
+            status: 'CONNECTED',
+            facebookSessionDetected: true,
+            facebookUserId: 'facebook-user-1',
+            detectedFacebookUserId: 'facebook-user-1',
+          }
+        : options.connection;
+    const connectionModel = {
+      findOne: jest.fn().mockReturnValue({
+        lean: jest.fn().mockReturnThis(),
+        exec: jest.fn().mockResolvedValue(connection),
+      }),
+      updateOne: jest.fn(),
+    };
+    const extensionsService = {
+      verifyWorkerIdentity: jest.fn(
+        async (_clerk: string, instanceId?: string) => {
+          if (options?.verifyIdentityThrows) throw options.verifyIdentityThrows;
+          return {
+            _id: { toString: () => 'installation-1' },
+            clerkUserId,
+            extensionInstanceId: instanceId?.trim(),
+            status: options?.installationStatus ?? 'ACTIVE',
+          };
+        },
+      ),
+      assertInstallationActive: jest.fn(),
+      resolveActiveWorkerConnection: jest.fn(
+        async (
+          _clerk: string,
+          installation: { extensionInstanceId?: string },
+        ) => {
+          const query = connectionModel.findOne({
+            clerkUserId,
+            extensionInstanceId: installation.extensionInstanceId,
+          });
+          if (!query || typeof query.exec !== 'function') return null;
+          const found = await query.exec();
+          return (found as Record<string, unknown> | null) ?? null;
+        },
+      ),
+    };
+    const controller = new JobsController(
+      jobModel as never,
+      {} as never,
+      connectionModel as never,
+      extensionsService as never,
+    );
+    return { controller, job, jobModel, extensionsService };
+  }
+
+  it('allows an ACTIVE installation to advance a claimed job to SUCCESS', async () => {
+    const { controller, job } = createStatusController();
+
+    await expect(
+      controller.updateJobStatus(clerkUserId, extensionInstanceId, 'job-1', {
+        status: PublishingJobStatus.SUCCESS,
+      }),
+    ).resolves.toBe(job);
+    expect(job.save).toHaveBeenCalled();
+  });
+
+  it('rejects a paused installation that holds no valid job lease', async () => {
+    const { controller, jobModel } = createStatusController({
+      installationStatus: 'PAUSED',
+      claimExpiresAt: new Date(Date.now() - 1_000),
+    });
+
+    await expect(
+      controller.updateJobStatus(clerkUserId, extensionInstanceId, 'job-1', {
+        status: PublishingJobStatus.SUCCESS,
+      }),
+    ).rejects.toThrow('Extension is not active and holds no valid job lease.');
+    expect(jobModel.findById).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows a paused installation to finish a job claimed before the pause', async () => {
+    const { controller, job } = createStatusController({
+      installationStatus: 'PAUSED',
+    });
+
+    await expect(
+      controller.updateJobStatus(clerkUserId, extensionInstanceId, 'job-1', {
+        status: PublishingJobStatus.SUCCESS,
+      }),
+    ).resolves.toBe(job);
+    expect(job.save).toHaveBeenCalled();
+  });
+
+  it('forbids a paused installation from pulling a job back into RUNNING', async () => {
+    const { controller, job } = createStatusController({
+      installationStatus: 'PAUSED',
+      previousStatus: PublishingJobStatus.PENDING,
+    });
+
+    await expect(
+      controller.updateJobStatus(clerkUserId, extensionInstanceId, 'job-1', {
+        status: PublishingJobStatus.RUNNING,
+      }),
+    ).rejects.toThrow(
+      'A paused or disconnecting extension cannot claim new work.',
+    );
+    expect(job.save).not.toHaveBeenCalled();
+  });
+
+  it('allows a REVOKE_PENDING installation to submit a final result under a valid lease', async () => {
+    const { controller, job } = createStatusController({
+      installationStatus: 'REVOKE_PENDING',
+    });
+
+    await expect(
+      controller.updateJobStatus(clerkUserId, extensionInstanceId, 'job-1', {
+        status: PublishingJobStatus.FAILED,
+      }),
+    ).resolves.toBe(job);
+    expect(job.save).toHaveBeenCalled();
+  });
+
+  it('rejects final results from a revoked installation', async () => {
+    const { controller, job } = createStatusController({
+      verifyIdentityThrows: new ForbiddenException(
+        'Extension installation has been revoked.',
+      ),
+    });
+
+    await expect(
+      controller.updateJobStatus(clerkUserId, extensionInstanceId, 'job-1', {
+        status: PublishingJobStatus.SUCCESS,
+      }),
+    ).rejects.toThrow('Extension installation has been revoked.');
+    expect(job.save).not.toHaveBeenCalled();
+  });
+
+  it('rejects a status update from an unverified connection', async () => {
+    const { controller, job } = createStatusController({
+      connection: null,
+    });
+
+    await expect(
+      controller.updateJobStatus(clerkUserId, extensionInstanceId, 'job-1', {
+        status: PublishingJobStatus.SUCCESS,
+      }),
+    ).rejects.toThrow(
+      'Extension instance is not linked to a verified Facebook connection',
+    );
+    expect(job.save).not.toHaveBeenCalled();
   });
 });

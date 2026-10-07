@@ -57,6 +57,8 @@ const ENGAGEMENT_SYNC_ALARM_INITIALIZED_KEY = 'engagementSyncAlarmInitialized';
 const MAINTENANCE_DIAGNOSTICS_KEY = 'maintenanceDiagnosticsV1';
 const EXTENSION_INSTANCE_ID_KEY = 'extensionInstanceId';
 const EXTENSION_NAME_KEY = 'extensionName';
+const EXTENSION_CREDENTIAL_KEY = 'extensionCredential';
+const EXTENSION_CREDENTIAL_ISSUED_AT_KEY = 'credentialIssuedAt';
 const TAB_ACTION_RETRY_COUNT = 6;
 const TAB_ACTION_RETRY_DELAY_MS = 500;
 const FACEBOOK_NOTIFICATIONS_URL = 'https://www.facebook.com/notifications/';
@@ -240,6 +242,26 @@ async function getExtensionName(): Promise<string> {
     : '';
 }
 
+async function getExtensionCredential(): Promise<string | null> {
+  const result = await chrome.storage.local.get(EXTENSION_CREDENTIAL_KEY);
+  const credential = result[EXTENSION_CREDENTIAL_KEY];
+  return typeof credential === 'string' && credential.trim()
+    ? credential.trim()
+    : null;
+}
+
+// Persists the single-use installation credential issued by the backend. The
+// credential is a random revocable bearer token; only its SHA-256 hash lives on
+// the server, so the extension must keep the raw value to authenticate.
+async function persistExtensionCredential(credential?: string): Promise<void> {
+  if (typeof credential !== 'string' || !credential.trim()) return;
+  await chrome.storage.local.set({
+    [EXTENSION_CREDENTIAL_KEY]: credential.trim(),
+    [EXTENSION_CREDENTIAL_ISSUED_AT_KEY]: Date.now(),
+  });
+  console.log('[PostFlow] Installation credential stored');
+}
+
 // Uses shared authentication and URL fallback; detailed failures are opt-in for UI workflows.
 async function apiFetch(
   path: string,
@@ -252,10 +274,12 @@ async function apiFetch(
     return includeFailureDetails ? { apiFetchError: true, status: 400 } : null;
   }
 
-  const [clerkUserId, extensionInstanceId] = await Promise.all([
-    getClerkUserId(),
-    getExtensionInstanceId(),
-  ]);
+  const [clerkUserId, extensionInstanceId, extensionCredential] =
+    await Promise.all([
+      getClerkUserId(),
+      getExtensionInstanceId(),
+      getExtensionCredential(),
+    ]);
   if (!clerkUserId) {
     console.warn('[PostFlow] No user ID found — skipping API call:', path);
     return includeFailureDetails ? { apiFetchError: true, status: 401 } : null;
@@ -284,6 +308,9 @@ async function apiFetch(
           'Content-Type': 'application/json',
           'x-clerk-user-id': clerkUserId,
           'x-extension-instance-id': extensionInstanceId,
+          ...(extensionCredential
+            ? { 'x-extension-credential': extensionCredential }
+            : {}),
         },
         body: body ? JSON.stringify(body) : undefined,
       });
@@ -563,8 +590,30 @@ function registerExtension(): Promise<boolean> {
     );
     if (result) {
       await chrome.alarms.clear(REGISTER_RETRY_ALARM);
+      const registrationStatus = typeof result.status === 'string'
+        ? result.status
+        : 'ACTIVE';
+      // A revoked or disconnecting installation must never be reactivated by
+      // register; stop the connection handshake and surface the outcome.
+      if (registrationStatus === 'REVOKED' || registrationStatus === 'REVOKE_PENDING') {
+        console.warn(
+          `[PostFlow] Registration halted (${registrationStatus})`,
+          typeof result.reason === 'string' ? result.reason : '',
+        );
+        await chrome.storage.local.set({
+          extensionConnectionStage: registrationStatus === 'REVOKED'
+            ? 'revoked'
+            : 'revoke-pending',
+        });
+        return false;
+      }
+      // The backend issues a fresh credential on first registration and when a
+      // legacy installation is upgraded; persist it for future requests.
+      if (typeof result.credentialIssued === 'string' && result.credentialIssued) {
+        await persistExtensionCredential(result.credentialIssued);
+      }
       await chrome.storage.local.set({ extensionConnectionStage: 'verifying-facebook' });
-      console.log('[PostFlow] Registered with backend:', result._id);
+      console.log('[PostFlow] Registered with backend:', registrationStatus);
       const facebookReady = await refreshFacebookSession();
       await chrome.storage.local.set({
         extensionConnectionStage: facebookReady ? 'connected' : 'facebook-required',
@@ -592,8 +641,13 @@ async function sendHeartbeat() {
     undefined,
     'POST',
   );
-  if (result) {
-    console.log('[PostFlow] Heartbeat sent at', new Date().toISOString());
+  if (result && typeof result.status === 'string') {
+    console.log(
+      `[PostFlow] Heartbeat sent at ${new Date().toISOString()} | lifecycle: ${result.status}`,
+    );
+    if (result.status === 'REVOKE_PENDING') {
+      console.warn('[PostFlow] Extension is disconnecting; finishing in-flight work');
+    }
   }
 }
 
