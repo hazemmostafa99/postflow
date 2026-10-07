@@ -16,8 +16,7 @@ import {
   UserRound,
   WifiOff,
 } from "lucide-react";
-import { useMemo, useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { TopbarPortal } from "@/components/topbar-portal";
 
 export interface FacebookConnection {
@@ -211,12 +210,52 @@ interface ConnectionsDashboardProps {
   refreshedAt: string;
 }
 
-export function ConnectionsDashboard({ connections, unavailable, refreshedAt }: ConnectionsDashboardProps) {
-  const router = useRouter();
+export function ConnectionsDashboard({
+  connections: initialConnections,
+  unavailable: initiallyUnavailable,
+  refreshedAt,
+}: ConnectionsDashboardProps) {
+  const [connections, setConnections] = useState(initialConnections);
+  const [unavailable, setUnavailable] = useState(initiallyUnavailable);
+  const [lastRefreshedAt, setLastRefreshedAt] = useState(refreshedAt);
   const [filter, setFilter] = useState<ConnectionFilter>("ALL");
   const [query, setQuery] = useState("");
-  const [isRefreshing, startRefresh] = useTransition();
-  const now = new Date(refreshedAt).getTime();
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const now = new Date(lastRefreshedAt).getTime();
+
+  const refresh = useCallback(async (showSpinner = true) => {
+    if (showSpinner) setIsRefreshing(true);
+    try {
+      const response = await fetch("/api/extensions/connections", { cache: "no-store" });
+      const data: unknown = await response.json();
+      if (!response.ok || !Array.isArray(data)) {
+        setUnavailable(true);
+        return;
+      }
+      setConnections(data as FacebookConnection[]);
+      setUnavailable(false);
+      setLastRefreshedAt(new Date().toISOString());
+    } catch {
+      setUnavailable(true);
+    } finally {
+      if (showSpinner) setIsRefreshing(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    // Keep the list fresh while a newly installed extension completes setup.
+    const refreshInterval = window.setInterval(() => {
+      void refresh(false);
+    }, 2_000);
+    const stopRefresh = window.setTimeout(() => {
+      window.clearInterval(refreshInterval);
+    }, 30_000);
+
+    return () => {
+      window.clearInterval(refreshInterval);
+      window.clearTimeout(stopRefresh);
+    };
+  }, [refresh]);
 
   const views = useMemo(
     () => connections.map((connection) => getConnectionView(connection, now)),
@@ -253,10 +292,6 @@ export function ConnectionsDashboard({ connections, unavailable, refreshedAt }: 
       ));
   }, [filter, query, views]);
 
-  function refresh() {
-    startRefresh(() => router.refresh());
-  }
-
   return (
     <div className="page-shell">
       <TopbarPortal>
@@ -283,7 +318,7 @@ export function ConnectionsDashboard({ connections, unavailable, refreshedAt }: 
           </select>
           <button
             type="button"
-            onClick={refresh}
+            onClick={() => void refresh()}
             disabled={isRefreshing}
             className="col-span-2 inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-border bg-background px-3 text-xs font-medium shadow-sm transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60 sm:col-span-1"
           >
@@ -294,7 +329,7 @@ export function ConnectionsDashboard({ connections, unavailable, refreshedAt }: 
       </TopbarPortal>
 
       {unavailable ? (
-        <UnavailableState isRefreshing={isRefreshing} onRefresh={refresh} />
+        <UnavailableState isRefreshing={isRefreshing} onRefresh={() => void refresh()} />
       ) : connections.length === 0 ? (
         <EmptyState />
       ) : (

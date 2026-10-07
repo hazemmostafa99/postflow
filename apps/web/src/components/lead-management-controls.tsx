@@ -1,17 +1,33 @@
 "use client";
 
 import { FormEvent, useRef, useState } from "react";
-import { Loader2, Pencil, Plus, Trash2, X } from "lucide-react";
+import { Loader2, Pencil, Plus, X } from "lucide-react";
 import { useRouter } from "next/navigation";
 
-interface LeadEditorProps {
-  mode: "create" | "edit";
-  id?: string;
-  initialNumber?: string;
-  initialCategory?: string;
+/** Display labels for the stored qualification status values. */
+export const LEAD_QUALIFICATION_STATUSES = [
+  { value: "UNREVIEWED", label: "Needs review" },
+  { value: "QUALIFIED", label: "Qualified" },
+  { value: "NOT_QUALIFIED", label: "Not qualified" },
+] as const;
+
+export type LeadQualificationStatus =
+  (typeof LEAD_QUALIFICATION_STATUSES)[number]["value"];
+
+/** Friendly label for a stored status, defaulting legacy/unknown values to the needs-review label. */
+export function leadStatusLabel(
+  status?: LeadQualificationStatus | null | string,
+): string {
+  return (
+    LEAD_QUALIFICATION_STATUSES.find((option) => option.value === status)
+      ?.label ?? "Needs review"
+  );
 }
 
-function responseMessage(data: unknown, fallback: string): string {
+const NOTES_MAX_LENGTH = 2000;
+
+/** Extracts the server's message field from a failed response body. */
+export function responseMessage(data: unknown, fallback: string): string {
   if (data && typeof data === "object" && "message" in data) {
     const message = (data as { message?: unknown }).message;
     if (typeof message === "string") return message;
@@ -20,11 +36,35 @@ function responseMessage(data: unknown, fallback: string): string {
   return fallback;
 }
 
-function LeadEditor({ mode, id, initialNumber = "", initialCategory = "" }: LeadEditorProps) {
+interface LeadEditorProps {
+  mode: "create" | "edit";
+  id?: string;
+  initialNumber?: string;
+  initialCategory?: string;
+  initialGroup?: string;
+  initialStatus?: LeadQualificationStatus;
+  initialNotes?: string;
+  /** When provided, the dialog reports the saved lead instead of refreshing the route. */
+  onSaved?: (data: unknown) => void;
+}
+
+export function LeadEditor({
+  mode,
+  id,
+  initialNumber = "",
+  initialCategory = "",
+  initialGroup = "",
+  initialStatus = "UNREVIEWED",
+  initialNotes = "",
+  onSaved,
+}: LeadEditorProps) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const router = useRouter();
   const [number, setNumber] = useState(initialNumber);
   const [category, setCategory] = useState(initialCategory);
+  const [group, setGroup] = useState(initialGroup);
+  const [status, setStatus] = useState(initialStatus);
+  const [notes, setNotes] = useState(initialNotes);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const isCreate = mode === "create";
@@ -32,6 +72,9 @@ function LeadEditor({ mode, id, initialNumber = "", initialCategory = "" }: Lead
   function open() {
     setNumber(initialNumber);
     setCategory(initialCategory);
+    setGroup(initialGroup);
+    setStatus(isCreate ? "UNREVIEWED" : initialStatus);
+    setNotes(isCreate ? "" : initialNotes);
     setError("");
     dialogRef.current?.showModal();
   }
@@ -51,12 +94,19 @@ function LeadEditor({ mode, id, initialNumber = "", initialCategory = "" }: Lead
       const response = await fetch(endpoint, {
         method: isCreate ? "POST" : "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ number, category }),
+        body: JSON.stringify({
+          number,
+          category,
+          group,
+          qualificationStatus: status,
+          notes,
+        }),
       });
       const data = await response.json().catch(() => null);
       if (!response.ok) throw new Error(responseMessage(data, "Could not save this phone number."));
       dialogRef.current?.close();
-      router.refresh();
+      if (onSaved) onSaved(data);
+      else router.refresh();
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "Could not save this phone number.");
     } finally {
@@ -64,25 +114,33 @@ function LeadEditor({ mode, id, initialNumber = "", initialCategory = "" }: Lead
     }
   }
 
+  const notesRemaining = NOTES_MAX_LENGTH - notes.length;
+
   return (
     <>
       <button
         type="button"
         onClick={open}
         className={isCreate
-          ? "inline-flex h-9 shrink-0 items-center justify-center gap-2 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-          : "inline-flex h-8 w-8 items-center justify-center rounded-md border border-border text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"}
+          ? "inline-flex h-9 shrink-0 items-center justify-center gap-2 rounded-lg bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          : "inline-flex h-8 w-8 items-center justify-center rounded-lg border border-border text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"}
         aria-label={isCreate ? undefined : `Edit ${initialNumber}`}
       >
         {isCreate ? <><Plus className="h-4 w-4" /> Add number</> : <Pencil className="h-3.5 w-3.5" />}
       </button>
 
-      <dialog ref={dialogRef} className="m-auto w-[min(420px,calc(100%-2rem))] rounded-xl border border-border bg-card p-0 text-card-foreground shadow-2xl backdrop:bg-black/40">
+      <dialog
+        ref={dialogRef}
+        aria-labelledby={isCreate ? "add-lead-title" : "edit-lead-title"}
+        className="m-auto w-[min(460px,calc(100%-2rem))] rounded-xl border border-border bg-card p-0 text-card-foreground shadow-2xl backdrop:bg-black/40"
+      >
         <form onSubmit={submit} className="p-5">
           <div className="flex items-start justify-between gap-4">
             <div>
               <p className="page-kicker">Leads</p>
-              <h2 className="mt-1 text-lg font-semibold">{isCreate ? "Add phone number" : "Edit phone number"}</h2>
+              <h2 id={isCreate ? "add-lead-title" : "edit-lead-title"} className="mt-1 text-lg font-semibold">
+                {isCreate ? "Add phone number" : "Edit phone number"}
+              </h2>
             </div>
             <button type="button" onClick={close} aria-label="Close" className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground">
               <X className="h-4 w-4" />
@@ -100,7 +158,7 @@ function LeadEditor({ mode, id, initialNumber = "", initialCategory = "" }: Lead
                 maxLength={40}
                 required
                 autoFocus
-                className="h-10 rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="h-10 rounded-lg border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
               />
             </label>
             <label className="grid gap-1.5 text-sm font-medium">
@@ -109,17 +167,54 @@ function LeadEditor({ mode, id, initialNumber = "", initialCategory = "" }: Lead
                 type="text"
                 value={category}
                 onChange={(event) => setCategory(event.target.value)}
-                placeholder="e.g. Interested buyers"
+                placeholder="e.g. Facebook Marketplace"
                 maxLength={80}
-                className="h-10 rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="h-10 rounded-lg border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
               />
+            </label>
+            <label className="grid gap-1.5 text-sm font-medium">
+              Group <span className="text-xs font-normal text-muted-foreground">(optional)</span>
+              <input
+                type="text"
+                value={group}
+                onChange={(event) => setGroup(event.target.value)}
+                placeholder="e.g. Villas"
+                maxLength={80}
+                className="h-10 rounded-lg border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              />
+            </label>
+            <label className="grid gap-1.5 text-sm font-medium">
+              Qualification status
+              <select
+                value={status}
+                onChange={(event) => setStatus(event.target.value as LeadQualificationStatus)}
+                className="h-10 rounded-lg border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                {LEAD_QUALIFICATION_STATUSES.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </label>
+            <label className="grid gap-1.5 text-sm font-medium">
+              Notes
+              <textarea
+                value={notes}
+                onChange={(event) => setNotes(event.target.value)}
+                placeholder="Context about this lead, e.g. buying intent, budget, follow-up details"
+                maxLength={NOTES_MAX_LENGTH}
+                rows={4}
+                className="resize-y rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              />
+              <span className="text-right text-xs text-muted-foreground">
+                {notesRemaining.toLocaleString()}/{NOTES_MAX_LENGTH.toLocaleString()} characters remaining
+              </span>
             </label>
           </div>
 
           {error && <p role="alert" className="mt-3 text-sm text-red-600 dark:text-red-400">{error}</p>}
           <div className="mt-5 flex justify-end gap-2">
-            <button type="button" onClick={close} disabled={saving} className="h-9 rounded-md border border-border px-4 text-sm font-medium hover:bg-accent disabled:opacity-50">Cancel</button>
-            <button type="submit" disabled={saving} className="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
+            <button type="button" onClick={close} disabled={saving} className="h-9 rounded-lg border border-border px-4 text-sm font-medium hover:bg-accent disabled:opacity-50">Cancel</button>
+            <button type="submit" disabled={saving} className="inline-flex h-9 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">
               {saving && <Loader2 className="h-4 w-4 animate-spin" />}
               {isCreate ? "Add number" : "Save changes"}
             </button>
@@ -130,39 +225,6 @@ function LeadEditor({ mode, id, initialNumber = "", initialCategory = "" }: Lead
   );
 }
 
-export function AddLeadButton() {
-  return <LeadEditor mode="create" />;
-}
-
-export function LeadActions({ id, number, category }: { id: string; number: string; category: string }) {
-  const router = useRouter();
-  const [deleting, setDeleting] = useState(false);
-
-  async function remove() {
-    if (!window.confirm(`Delete ${number}? This action cannot be undone.`)) return;
-    setDeleting(true);
-    try {
-      const response = await fetch(`/api/phone-contacts/${encodeURIComponent(id)}`, { method: "DELETE" });
-      if (!response.ok) throw new Error();
-      router.refresh();
-    } catch {
-      window.alert("Could not delete this phone number. Please try again.");
-      setDeleting(false);
-    }
-  }
-
-  return (
-    <div className="flex items-center justify-end gap-2">
-      <LeadEditor mode="edit" id={id} initialNumber={number} initialCategory={category} />
-      <button
-        type="button"
-        onClick={remove}
-        disabled={deleting}
-        aria-label={`Delete ${number}`}
-        className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-red-500/20 text-red-600 transition-colors hover:bg-red-500/10 disabled:opacity-50 dark:text-red-400"
-      >
-        {deleting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
-      </button>
-    </div>
-  );
+export function AddLeadButton({ onSaved }: { onSaved?: (data: unknown) => void }) {
+  return <LeadEditor mode="create" onSaved={onSaved} />;
 }

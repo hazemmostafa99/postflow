@@ -38,6 +38,22 @@ function safeSend(message: object) {
   }
 }
 
+function notifyAuthContextReady() {
+  if (!isExtensionAlive()) return;
+  try {
+    chrome.runtime.sendMessage({ type: 'AUTH_CONTEXT_READY' }, (response) => {
+      if (chrome.runtime.lastError) return;
+      if (response?.ok) {
+        // Registration and Facebook verification are complete, so group sync
+        // can start without racing the extension's one-minute retry alarm.
+        safeSend({ type: 'TRIGGER_GROUP_SYNC' });
+      }
+    });
+  } catch {
+    isContextValid = false;
+  }
+}
+
 function triggerGroupSync() {
   console.log('[PostFlow] Sync requested from Web App');
   if (!isExtensionAlive()) {
@@ -120,11 +136,12 @@ function extractAndStore() {
         }
         console.log('[PostFlow] User ID stored:', userId);
 
-        // If the user ID just became available (or changed), immediately
-        // re-sync all cached groups so nothing is lost from before login.
+        // Connect immediately when the authenticated user becomes available.
+        // The background worker starts group sync after registration succeeds.
         if (!previousId || previousId !== userId) {
           console.log('[PostFlow] User ID is new/changed — triggering group sync to flush cached groups');
-          safeSend({ type: 'TRIGGER_GROUP_SYNC' });
+          void chrome.storage.local.set({ extensionConnectionStage: 'user-found' });
+          notifyAuthContextReady();
         }
       });
     });

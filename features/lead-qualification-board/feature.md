@@ -17,6 +17,12 @@ signed-in user can:
 - Search and filter the board without losing the existing source and collection
   information.
 
+> **Product amendment (October 2026):** `category` and lead `group` are now
+> separate optional classifications. Any older statement in this document that
+> presents the existing `category` field as the lead group is superseded by this
+> decision. Group is currently stored as a free-text string; no Group collection
+> is introduced.
+
 The main working view should be a responsive two-column board:
 
 ```text
@@ -74,10 +80,10 @@ collected lead has not yet been rejected and must not be silently treated as
 
 For the first version, a lead belongs to zero or one business group.
 
-The existing `category` field is the persisted lead-group value. The dashboard
-should label this concept as `Group` or `Lead Group`, while the backend may keep
-the field name `category` for compatibility with the collector and existing
-stored data.
+The existing `category` field keeps its original meaning and remains displayed
+as `Category`. A separate optional `group` string organizes leads independently.
+Legacy records with no group are displayed as `Ungrouped`; their category is not
+changed.
 
 Examples:
 
@@ -86,7 +92,7 @@ Villas
 Apartments
 Real Estate
 Marketing
-Uncategorized
+Ungrouped
 ```
 
 This feature does not introduce a separate Group collection or reuse the

@@ -539,6 +539,8 @@ function setIndicator(dotId: string, textId: string, text: string, state: string
 
 async function loadConnectionStatus() {
   const result = await chrome.storage.local.get([
+    "clerkUserId",
+    "extensionConnectionStage",
     "webAppLastSeenAt",
     "groupsSyncStatus",
     "groupsSyncCount",
@@ -550,7 +552,14 @@ async function loadConnectionStatus() {
     ? result.facebookConnectionStatus
     : "UNKNOWN";
   const identityVerified = result.facebookIdentityVerified === true;
-  statusElement.textContent = identityVerified ? "Ready" : statusLabelForFacebook(facebookStatus);
+  const connectionStage = typeof result.extensionConnectionStage === "string"
+    ? result.extensionConnectionStage
+    : result.clerkUserId
+      ? "connecting"
+      : "waiting-for-dashboard";
+  statusElement.textContent = identityVerified
+    ? "Ready"
+    : statusLabelForConnection(connectionStage, facebookStatus);
   statusElement.className = `page-status ${identityVerified ? "ready" : "attention"}`;
 
   const webAppOnline = typeof result.webAppLastSeenAt === "number" &&
@@ -575,6 +584,14 @@ async function loadConnectionStatus() {
     : undefined;
   const lastSyncLabel = document.getElementById("last-sync-status");
   if (lastSyncLabel) lastSyncLabel.textContent = lastSyncedAt ? timeAgo(lastSyncedAt) : "Never";
+}
+
+function statusLabelForConnection(stage: string, facebookStatus: string): string {
+  if (stage === "waiting-for-dashboard") return "Open dashboard";
+  if (stage === "user-found" || stage === "connecting") return "Connecting...";
+  if (stage === "verifying-facebook") return "Verifying Facebook...";
+  if (stage === "backend-unavailable") return "Connection failed";
+  return statusLabelForFacebook(facebookStatus);
 }
 
 function statusLabelForFacebook(status: string): string {
@@ -716,6 +733,8 @@ openFacebookGroupsButton.addEventListener("click", async () => {
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local") return;
   const relevantKeys = new Set([
+    "clerkUserId",
+    "extensionConnectionStage",
     "facebookGroups",
     "groupsSyncStatus",
     "groupsSyncCount",
@@ -753,6 +772,8 @@ saveNameButton.addEventListener("click", async () => {
       setNameEditorOpen(false);
     } else {
       nameStatus.textContent = result?.error ?? "Could not save";
+      extensionNameInput.focus();
+      extensionNameInput.select();
     }
   } catch {
     nameStatus.textContent = "Could not save";

@@ -1,9 +1,15 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import {
   ExtensionInstallation,
   ExtensionInstallationDocument,
+  ExtensionLifecycleStatus,
 } from '../schemas/extension-installation.schema';
 import {
   FacebookConnection,
@@ -160,19 +166,69 @@ export class ExtensionsService {
       throw new BadRequestException('Extension name must be text.');
     }
 
-    const normalizedName = extensionName.trim();
+    const normalizedName = normalizeExtensionName(extensionName);
     if (normalizedName.length > 60) {
       throw new BadRequestException('Extension name must be 60 characters or fewer.');
     }
 
-    await this.connectionModel
-      .findOneAndUpdate(
-        this.getConnectionFilter(clerkUserId, extensionInstanceId),
-        normalizedName
-          ? { $set: { displayName: normalizedName } }
-          : { $unset: { displayName: 1 } },
-      )
+    const filter = this.getConnectionFilter(clerkUserId, extensionInstanceId);
+    if (!normalizedName) {
+      await this.connectionModel
+        .findOneAndUpdate(filter, { $unset: { displayName: 1, displayNameKey: 1 } })
+        .exec();
+      return;
+    }
+
+    const displayNameKey = normalizeExtensionNameKey(normalizedName);
+    const current = await this.connectionModel
+      .findOne(filter)
+      .select('_id')
+      .lean()
       .exec();
+    if (!current) throw new NotFoundException('Facebook connection not found.');
+
+    const duplicate = await this.connectionModel
+      .findOne({
+        clerkUserId,
+        displayNameKey,
+        _id: { $ne: current._id },
+      })
+      .select('_id')
+      .lean()
+      .exec();
+    if (duplicate) {
+      throw new ConflictException('An extension with this name already exists.');
+    }
+
+    try {
+      await this.connectionModel
+        .findOneAndUpdate(
+          filter,
+          { $set: { displayName: normalizedName, displayNameKey } },
+        )
+        .exec();
+    } catch (error) {
+      // The unique index is the final protection against two concurrent saves.
+      if (isDuplicateKeyError(error)) {
+        throw new ConflictException('An extension with this name already exists.');
+      }
+      throw error;
+    }
+  }
+
+  async rename(
+    clerkUserId: string,
+    extensionInstanceId: string | undefined,
+    extensionName: unknown,
+  ) {
+    await this.updateConnectionName(clerkUserId, extensionInstanceId, extensionName);
+    const connection = await this.connectionModel
+      .findOne(this.getConnectionFilter(clerkUserId, extensionInstanceId))
+      .select('displayName')
+      .lean()
+      .exec();
+    if (!connection) throw new NotFoundException('Facebook connection not found.');
+    return { displayName: connection.displayName ?? null };
   }
 
   /**
@@ -193,7 +249,7 @@ export class ExtensionsService {
     const filter = this.getInstallationFilter(clerkUserId, extensionInstanceId);
     const existing = await this.extensionModel.findOne(filter).exec();
     if (existing) {
-      existing.status = 'ACTIVE';
+      existing.status = ExtensionLifecycleStatus.ACTIVE;
       existing.lastHeartbeat = new Date();
       existing.facebookConnectionId = connection?._id;
       return existing.save();
@@ -203,7 +259,7 @@ export class ExtensionsService {
       ...(extensionInstanceId?.trim()
         ? { extensionInstanceId: extensionInstanceId.trim() }
         : {}),
-      status: 'ACTIVE',
+      status: ExtensionLifecycleStatus.ACTIVE,
       lastHeartbeat: new Date(),
       facebookConnectionId: connection?._id,
     });
@@ -249,7 +305,10 @@ export class ExtensionsService {
       .findOneAndUpdate(
         this.getInstallationFilter(clerkUserId, extensionInstanceId),
         {
-          $set: { lastHeartbeat: new Date(), status: 'ACTIVE' },
+          $set: {
+            lastHeartbeat: new Date(),
+            status: ExtensionLifecycleStatus.ACTIVE,
+          },
           $setOnInsert: {
             clerkUserId,
             ...(normalizedInstanceId
@@ -339,7 +398,7 @@ export class ExtensionsService {
           },
           $setOnInsert: {
             clerkUserId,
-            status: 'ACTIVE',
+            status: ExtensionLifecycleStatus.ACTIVE,
             ...(normalizedInstanceId
               ? { extensionInstanceId: normalizedInstanceId }
               : {}),
@@ -361,4 +420,17 @@ export class ExtensionsService {
     }
     return { installation, connection };
   }
+}
+
+export function normalizeExtensionName(value: string): string {
+  return value.normalize('NFKC').trim().replace(/\s+/g, ' ');
+}
+
+export function normalizeExtensionNameKey(value: string): string {
+  return normalizeExtensionName(value).toLowerCase();
+}
+
+function isDuplicateKeyError(error: unknown): error is { code: number } {
+  return typeof error === 'object' && error !== null &&
+    'code' in error && (error as { code?: unknown }).code === 11000;
 }

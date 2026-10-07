@@ -81,6 +81,7 @@ function logPhoneSync(
 interface ApiFetchFailure {
   apiFetchError: true;
   status: number;
+  message?: string;
 }
 
 // Identifies structured API failures returned only to callers that request details.
@@ -278,6 +279,7 @@ async function apiFetch(
     try {
       const response = await fetch(url, {
         method: httpMethod,
+        signal: AbortSignal.timeout(10_000),
         headers: {
           'Content-Type': 'application/json',
           'x-clerk-user-id': clerkUserId,
@@ -538,32 +540,56 @@ async function updateJobStatus(
 
 // ── Registration ──
 
-async function registerExtension() {
-  const extensionName = await getExtensionName();
-  const result = await apiFetch(
-    '/api/extensions/register',
-    extensionName ? { extensionName } : undefined,
-    'POST',
-  );
-  if (result) {
-    await chrome.alarms.clear(REGISTER_RETRY_ALARM);
-    console.log('[PostFlow] Registered with backend:', result._id);
-    void refreshFacebookSession();
-    return true;
-  }
-  chrome.alarms.create(REGISTER_RETRY_ALARM, {
-    delayInMinutes: REGISTER_RETRY_DELAY_MINUTES,
+let registrationPromise: Promise<boolean> | null = null;
+
+function registerExtension(): Promise<boolean> {
+  if (registrationPromise) return registrationPromise;
+
+  registrationPromise = (async () => {
+    const clerkUserId = await getClerkUserId();
+    if (!clerkUserId) {
+      await chrome.storage.local.set({ extensionConnectionStage: 'waiting-for-dashboard' });
+      chrome.alarms.create(REGISTER_RETRY_ALARM, {
+        delayInMinutes: REGISTER_RETRY_DELAY_MINUTES,
+      });
+      return false;
+    }
+
+    await chrome.storage.local.set({ extensionConnectionStage: 'connecting' });
+    const result = await apiFetch(
+      '/api/extensions/register',
+      undefined,
+      'POST',
+    );
+    if (result) {
+      await chrome.alarms.clear(REGISTER_RETRY_ALARM);
+      await chrome.storage.local.set({ extensionConnectionStage: 'verifying-facebook' });
+      console.log('[PostFlow] Registered with backend:', result._id);
+      const facebookReady = await refreshFacebookSession();
+      await chrome.storage.local.set({
+        extensionConnectionStage: facebookReady ? 'connected' : 'facebook-required',
+      });
+      return true;
+    }
+
+    await chrome.storage.local.set({ extensionConnectionStage: 'backend-unavailable' });
+    chrome.alarms.create(REGISTER_RETRY_ALARM, {
+      delayInMinutes: REGISTER_RETRY_DELAY_MINUTES,
+    });
+    return false;
+  })().finally(() => {
+    registrationPromise = null;
   });
-  return false;
+
+  return registrationPromise;
 }
 
 // ── Heartbeat ──
 
 async function sendHeartbeat() {
-  const extensionName = await getExtensionName();
   const result = await apiFetch(
     '/api/extensions/heartbeat',
-    extensionName ? { extensionName } : undefined,
+    undefined,
     'POST',
   );
   if (result) {
@@ -832,6 +858,24 @@ chrome.runtime.onConnect.addListener((port) => {
 // ── Session + sync messages ──
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'AUTH_CONTEXT_READY') {
+    void (async () => {
+      let registered = await registerExtension();
+      // An install-time attempt may have been finishing just as the dashboard
+      // supplied the user ID. Retry immediately instead of waiting one minute.
+      if (!registered && await getClerkUserId()) {
+        registered = await registerExtension();
+      }
+      return registered;
+    })()
+      .then((registered) => sendResponse({ ok: registered }))
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Could not connect extension',
+      }));
+    return true;
+  }
+
   if (message.type === 'SYNC_PHONE_NUMBERS') {
     if (sender.tab) {
       sendResponse({
@@ -989,9 +1033,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const extensionName = typeof message.extensionName === 'string'
         ? message.extensionName.trim()
         : '';
-      await chrome.storage.local.set({ [EXTENSION_NAME_KEY]: extensionName });
-      const registered = await registerExtension();
-      sendResponse({ ok: registered });
+      const response = await apiFetch(
+        '/api/extensions/name',
+        { extensionName },
+        'PATCH',
+        true,
+      );
+      if (isApiFetchFailure(response)) {
+        sendResponse({
+          ok: false,
+          error: response.status === 409
+            ? 'This name is already used by another extension.'
+            : response.message ?? 'Could not save extension name',
+        });
+        return;
+      }
+      const savedName = typeof response?.displayName === 'string'
+        ? response.displayName
+        : '';
+      await chrome.storage.local.set({ [EXTENSION_NAME_KEY]: savedName });
+      sendResponse({ ok: true, extensionName: savedName });
     })().catch((error) => {
       console.error('[PostFlow] Could not save extension name:', error);
       sendResponse({ ok: false, error: 'Could not save extension name' });
@@ -2829,8 +2890,37 @@ chrome.runtime.onStartup.addListener(() => {
   checkPendingJobs();
 });
 
-chrome.runtime.onInstalled.addListener(() => {
-  registerExtension();
-  sendHeartbeat();
-  checkPendingJobs();
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason === 'install') {
+    void chrome.storage.local.set({ extensionConnectionStage: 'waiting-for-dashboard' });
+  }
+  void injectPostflowBridgeIntoOpenDashboardTabs();
+  void registerExtension();
+  void sendHeartbeat();
+  void checkPendingJobs();
 });
+
+async function injectPostflowBridgeIntoOpenDashboardTabs(): Promise<void> {
+  const tabs = await chrome.tabs.query({
+    url: [
+      'http://localhost:3001/*',
+      'http://127.0.0.1:3001/*',
+      'https://fitcure.online/*',
+    ],
+  });
+  const scriptFile = getBackgroundSiblingScriptFile('postflow-content.js');
+  await Promise.all(tabs.map(async (tab) => {
+    if (tab.id === undefined) return;
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: [scriptFile],
+      });
+    } catch (error) {
+      console.warn('[PostFlow] Could not connect an already-open dashboard tab', {
+        tabId: tab.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }));
+}

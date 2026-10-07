@@ -3,19 +3,72 @@ import { Document, Schema as MongooseSchema, Types } from 'mongoose';
 
 export type ExtensionInstallationDocument = ExtensionInstallation & Document;
 
+export enum ExtensionLifecycleStatus {
+  ACTIVE = 'ACTIVE',
+  PAUSED = 'PAUSED',
+  REVOKE_PENDING = 'REVOKE_PENDING',
+  REVOKED = 'REVOKED',
+}
+
+export enum ExtensionRevocationReason {
+  USER_DISCONNECTED = 'USER_DISCONNECTED',
+  REMOVED = 'REMOVED',
+  REPLACED = 'REPLACED',
+  SECURITY = 'SECURITY',
+  MIGRATION = 'MIGRATION',
+}
+
 @Schema({ timestamps: true })
 export class ExtensionInstallation {
   @Prop({ required: true, index: true })
   clerkUserId: string;
 
-  @Prop({ index: true })
+  @Prop({ index: true, unique: true, sparse: true })
   extensionInstanceId?: string;
 
   @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'FacebookConnection', index: true })
   facebookConnectionId?: Types.ObjectId;
 
-  @Prop({ required: true, default: 'ACTIVE' }) // ACTIVE, INACTIVE, UNINSTALLED
-  status: string;
+  @Prop({
+    required: true,
+    enum: Object.values(ExtensionLifecycleStatus),
+    default: ExtensionLifecycleStatus.ACTIVE,
+  })
+  status: ExtensionLifecycleStatus;
+
+  @Prop({ default: Date.now })
+  statusChangedAt: Date;
+
+  @Prop()
+  statusChangedByClerkUserId?: string;
+
+  @Prop()
+  statusReason?: string;
+
+  @Prop()
+  revokedAt?: Date;
+
+  @Prop()
+  revokedByClerkUserId?: string;
+
+  @Prop({ enum: Object.values(ExtensionRevocationReason) })
+  revocationReason?: ExtensionRevocationReason;
+
+  @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'ExtensionInstallation' })
+  replacedByInstallationId?: Types.ObjectId;
+
+  /** Only a hash is persisted; the plaintext credential never reaches MongoDB. */
+  @Prop()
+  credentialHash?: string;
+
+  @Prop({ default: 0 })
+  credentialVersion: number;
+
+  @Prop()
+  credentialIssuedAt?: Date;
+
+  @Prop()
+  credentialRevokedAt?: Date;
 
   @Prop({ default: Date.now })
   lastHeartbeat: Date;
@@ -29,6 +82,24 @@ export const ExtensionInstallationSchema = SchemaFactory.createForClass(
 );
 
 ExtensionInstallationSchema.index(
-  { clerkUserId: 1, extensionInstanceId: 1 },
-  { unique: true, sparse: true },
+  { facebookConnectionId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      facebookConnectionId: { $type: 'objectId' },
+      status: {
+        $in: [
+          ExtensionLifecycleStatus.ACTIVE,
+          ExtensionLifecycleStatus.PAUSED,
+          ExtensionLifecycleStatus.REVOKE_PENDING,
+        ],
+      },
+    },
+    name: 'active_facebook_connection_binding',
+  },
+);
+
+ExtensionInstallationSchema.index(
+  { status: 1, lastHeartbeat: -1 },
+  { name: 'status_lastHeartbeat' },
 );

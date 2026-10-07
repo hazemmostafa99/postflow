@@ -1,6 +1,7 @@
 import {
   Controller,
   Post,
+  Patch,
   Body,
   Get,
   HttpCode,
@@ -65,6 +66,22 @@ export class ExtensionsController {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
     return this.extensionsService.heartbeat(clerkUserId, extensionInstanceId, body?.extensionName);
+  }
+
+  @Patch('name')
+  @HttpCode(HttpStatus.OK)
+  async rename(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Headers('x-extension-instance-id') extensionInstanceId?: string,
+    @Body() body?: ExtensionIdentityDto,
+  ) {
+    if (!clerkUserId)
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    return this.extensionsService.rename(
+      clerkUserId,
+      extensionInstanceId,
+      body?.extensionName,
+    );
   }
 
   /**
