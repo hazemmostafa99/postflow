@@ -15,7 +15,7 @@ import {
   Query,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { Model, Types } from 'mongoose';
 import {
   randomUUID,
 } from 'node:crypto';
@@ -40,6 +40,13 @@ import {
   FacebookConnectionStatus,
   FacebookConnectionWorkerStatus,
 } from '../schemas/facebook-connection.schema';
+import {
+  PlatformConnection,
+  PlatformConnectionDocument,
+  PlatformConnectionStatus,
+  PlatformConnectionWorkerStatus,
+} from '../schemas/platform-connection.schema';
+import { PublishingPlatform } from '../schemas/publishing-platform';
 import {
   ExtensionInstallationDocument,
   ExtensionLifecycleStatus,
@@ -109,6 +116,38 @@ const publishableTargetFilter = {
     { targetType: PublishingTargetType.PROFILE_FEED },
     { targetType: { $exists: false } },
     { targetType: null },
+  ],
+};
+
+const platformPublishableTargetFilter = {
+  $or: [
+    {
+      platform: PublishingPlatform.FACEBOOK,
+      targetType: {
+        $in: [PublishingTargetType.GROUP, PublishingTargetType.PROFILE_FEED],
+      },
+    },
+    {
+      platform: PublishingPlatform.INSTAGRAM,
+      targetType: {
+        $in: [
+          PublishingTargetType.INSTAGRAM_FEED,
+          PublishingTargetType.INSTAGRAM_REEL,
+        ],
+      },
+    },
+    {
+      platform: PublishingPlatform.TIKTOK,
+      targetType: { $in: [PublishingTargetType.TIKTOK_VIDEO] },
+    },
+    {
+      platform: { $exists: false },
+      $or: publishableTargetFilter.$or,
+    },
+    {
+      platform: null,
+      $or: publishableTargetFilter.$or,
+    },
   ],
 };
 
@@ -183,6 +222,8 @@ export class JobsController {
     @InjectModel(FacebookConnection.name)
     private readonly connectionModel: Model<FacebookConnectionDocument>,
     private readonly extensionsService: ExtensionsService,
+    @InjectModel(PlatformConnection.name)
+    private readonly platformConnectionModel?: Model<PlatformConnectionDocument>,
   ) {}
 
   private logMaintenanceEvent(
@@ -255,6 +296,86 @@ export class JobsController {
       connection.facebookUserId === connection.detectedFacebookUserId,
     );
     return verified ? connection : null;
+  }
+
+  /**
+   * Platform-aware version of getVerifiedWorkerConnection.
+   * Resolves the active PlatformConnection for a job's platform.
+   * Supports both legacy Facebook jobs (using facebookConnectionId) and new
+   * platform jobs (using platformConnectionId).
+   */
+  private async getVerifiedPlatformConnection(
+    clerkUserId: string,
+    extensionInstanceId: string | undefined,
+    credential: string | undefined,
+    platform: PublishingPlatform,
+    platformConnectionId?: Types.ObjectId,
+    facebookConnectionId?: Types.ObjectId,
+    options: { requireActive: boolean } = { requireActive: true },
+  ): Promise<{ platformConnection: PlatformConnectionDocument | null; facebookConnection: FacebookConnectionDocument | null }> {
+    const normalizedInstanceId = extensionInstanceId?.trim();
+    if (!normalizedInstanceId) return { platformConnection: null, facebookConnection: null };
+
+    const installation = await this.extensionsService.verifyWorkerIdentity(
+      clerkUserId,
+      normalizedInstanceId,
+      credential,
+    );
+    if (options.requireActive) {
+      this.extensionsService.assertInstallationActive(installation);
+    }
+
+    // For Facebook jobs with legacy facebookConnectionId, verify via Facebook connection
+    if (platform === PublishingPlatform.FACEBOOK && facebookConnectionId) {
+      const fbConnection = await this.connectionModel.findById(facebookConnectionId).exec();
+      if (!fbConnection) return { platformConnection: null, facebookConnection: null };
+
+      // Verify this installation owns the connection
+      if (
+        fbConnection.activeExtensionInstallationId &&
+        String(fbConnection.activeExtensionInstallationId) !== String(installation._id)
+      ) {
+        return { platformConnection: null, facebookConnection: null };
+      }
+
+      const verified = Boolean(
+        fbConnection.status === FacebookConnectionStatus.CONNECTED &&
+        fbConnection.facebookSessionDetected &&
+        fbConnection.facebookUserId &&
+        fbConnection.detectedFacebookUserId &&
+        fbConnection.facebookUserId === fbConnection.detectedFacebookUserId,
+      );
+
+      // Also get the platform connection for status updates
+      const pc = fbConnection._id && this.platformConnectionModel
+        ? await this.platformConnectionModel
+            .findOne({ legacyFacebookConnectionId: fbConnection._id })
+            .exec()
+        : null;
+
+      return verified ? { platformConnection: pc, facebookConnection: fbConnection } : { platformConnection: null, facebookConnection: null };
+    }
+
+    // For new platform jobs (Instagram, TikTok, or migrated Facebook), use platformConnectionId
+    if (platformConnectionId) {
+      const pc = await this.extensionsService.resolveActivePlatformConnection(
+        clerkUserId,
+        installation,
+        platform,
+      );
+      if (!pc || String(pc._id) !== String(platformConnectionId)) {
+        return { platformConnection: null, facebookConnection: null };
+      }
+
+      // Verify platform connection status
+      const verified = pc.status === PlatformConnectionStatus.CONNECTED &&
+        pc.sessionDetected &&
+        pc.workerStatus !== PlatformConnectionWorkerStatus.PUBLISHING;
+
+      return verified ? { platformConnection: pc, facebookConnection: null } : { platformConnection: null, facebookConnection: null };
+    }
+
+    return { platformConnection: null, facebookConnection: null };
   }
 
   private requireExtensionInstanceId(extensionInstanceId?: string): string {
@@ -588,13 +709,63 @@ export class JobsController {
     const normalizedInstanceId = this.requireExtensionInstanceId(
       extensionInstanceId,
     );
-    const connection = await this.getVerifiedWorkerConnection(
+
+    // Keep the legacy unit-test/consumer contract safe while the generic model
+    // is rolled out. The application modules always provide this model; an
+    // older direct controller harness may not.
+    if (!this.platformConnectionModel) {
+      const connection = await this.getVerifiedWorkerConnection(
+        clerkUserId,
+        normalizedInstanceId,
+        credential,
+      );
+      if (!connection) return null;
+      return this.claimLegacyFacebookJob(
+        clerkUserId,
+        normalizedInstanceId,
+        connection._id,
+      );
+    }
+
+    // Verify installation identity first
+    const installation = await this.extensionsService.verifyWorkerIdentity(
       clerkUserId,
       normalizedInstanceId,
       credential,
     );
-    if (!connection) return null;
-    const connectionId = connection?._id;
+    this.extensionsService.assertInstallationActive(installation);
+
+    // Find all platform connections owned by this installation
+    const platformConnections = await this.platformConnectionModel
+      .find({
+        activeExtensionInstallationId: installation._id,
+        archivedAt: { $exists: false },
+        status: PlatformConnectionStatus.CONNECTED,
+        workerStatus: { $ne: PlatformConnectionWorkerStatus.PUBLISHING },
+      })
+      .select('_id platform legacyFacebookConnectionId')
+      .lean()
+      .exec();
+
+    if (platformConnections.length === 0) {
+      // Check for legacy Facebook connection
+      const fbConnection = await this.extensionsService.resolveActiveWorkerConnection(
+        clerkUserId,
+        installation,
+      );
+      if (!fbConnection) return null;
+
+      // Legacy path for backward compatibility
+      return this.claimLegacyFacebookJob(clerkUserId, normalizedInstanceId, fbConnection._id);
+    }
+
+    // Build platform connection IDs by platform
+    const platformConnectionIdsByPlatform = new Map<string, Types.ObjectId[]>();
+    for (const pc of platformConnections) {
+      const arr = platformConnectionIdsByPlatform.get(pc.platform) || [];
+      arr.push(pc._id as Types.ObjectId);
+      platformConnectionIdsByPlatform.set(pc.platform, arr);
+    }
 
     // First find all posts belonging to this user
     const posts = await this.postModel
@@ -604,20 +775,111 @@ export class JobsController {
       .exec();
     const postIds = posts.map((p) => p._id.toString());
 
-    const now = new Date();
-    const ownershipFilter = { facebookConnectionId: connectionId };
-    const supportedTargetFilter = publishableTargetFilter;
+    if (postIds.length === 0) return null;
 
-    const leaseExpiresAt = new Date(
-      now.getTime() + JobsController.JOB_CLAIM_LEASE_MS,
-    );
+    const now = new Date();
+    const leaseExpiresAt = new Date(now.getTime() + JobsController.JOB_CLAIM_LEASE_MS);
+
+    // Build query for platform-aware jobs
+    const platformConnectionIds = platformConnections.map((pc) => pc._id);
+    const legacyFacebookConnectionIds = platformConnections
+      .filter((pc) => pc.platform === PublishingPlatform.FACEBOOK)
+      .map((pc) => pc.legacyFacebookConnectionId)
+      .filter((id): id is Types.ObjectId => !!id);
+
+    const ownershipFilter = {
+      $or: [
+        { platformConnectionId: { $in: platformConnectionIds } },
+        ...(legacyFacebookConnectionIds.length > 0
+          ? [{ facebookConnectionId: { $in: legacyFacebookConnectionIds } }]
+          : []),
+      ],
+    };
+
+    const supportedTargetFilter = platformPublishableTargetFilter;
+
     const job = (await this.jobModel
       .findOneAndUpdate(
         {
-          ...ownershipFilter,
           postId: { $in: postIds },
           $and: [
+            ownershipFilter,
             supportedTargetFilter,
+            {
+              $or: [
+                { scheduledFor: { $exists: false } },
+                { scheduledFor: null },
+                { scheduledFor: { $lte: now } },
+              ],
+            },
+          ],
+          $or: [
+            { status: PublishingJobStatus.PENDING },
+            {
+              status: PublishingJobStatus.RUNNING,
+              claimExpiresAt: { $lte: now },
+            },
+            {
+              status: PublishingJobStatus.RUNNING,
+              claimExpiresAt: { $exists: false },
+            },
+          ],
+        } as any,
+        {
+          $set: {
+            status: PublishingJobStatus.RUNNING,
+            claimedByExtensionInstanceId: normalizedInstanceId,
+            claimExpiresAt: leaseExpiresAt,
+            startedAt: now,
+          },
+        },
+        {
+          new: true,
+          sort: { scheduledFor: 1, flowOrder: 1, createdAt: 1 },
+        },
+      )
+      .populate('postId', 'content mediaUrls')
+      .populate('groupId', 'name url externalId')
+      .populate('platformConnectionId', 'platform displayName externalAccountId detectedExternalAccountId')
+      .populate(
+        'facebookConnectionId',
+        'displayName facebookUserId detectedFacebookUserId',
+      )
+      .exec()) as PublishingJobDocument | null;
+
+    if (!job) return null;
+
+    return toPublishJobPayload(job);
+  }
+
+  /**
+   * Legacy path for claiming Facebook jobs via facebookConnectionId.
+   * Used when an installation only has a legacy Facebook connection.
+   */
+  private async claimLegacyFacebookJob(
+    clerkUserId: string,
+    normalizedInstanceId: string,
+    facebookConnectionId: Types.ObjectId,
+  ) {
+    const posts = await this.postModel
+      .find({ clerkUserId })
+      .select('_id')
+      .lean<LeanId[]>()
+      .exec();
+    const postIds = posts.map((p) => p._id.toString());
+
+    if (postIds.length === 0) return null;
+
+    const now = new Date();
+    const leaseExpiresAt = new Date(now.getTime() + JobsController.JOB_CLAIM_LEASE_MS);
+
+    const job = (await this.jobModel
+      .findOneAndUpdate(
+        {
+          facebookConnectionId,
+          postId: { $in: postIds },
+          $and: [
+            publishableTargetFilter,
             {
               $or: [
                 { scheduledFor: { $exists: false } },

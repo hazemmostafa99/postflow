@@ -19,6 +19,10 @@ import {
   ExtensionLifecycleAuditEvent,
   ExtensionLifecycleAuditEventSchema,
 } from '../schemas/extension-lifecycle-audit.schema';
+import {
+  PlatformConnection,
+  PlatformConnectionSchema,
+} from '../schemas/platform-connection.schema';
 
 @Module({
   imports: [
@@ -31,6 +35,7 @@ import {
         name: ExtensionLifecycleAuditEvent.name,
         schema: ExtensionLifecycleAuditEventSchema,
       },
+      { name: PlatformConnection.name, schema: PlatformConnectionSchema },
     ]),
   ],
   providers: [ExtensionsService],

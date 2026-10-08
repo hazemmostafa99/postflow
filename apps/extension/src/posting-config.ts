@@ -1,3 +1,20 @@
+// Platform feature flags (generated into dist/env.js at build time).
+import {
+  FACEBOOK_EXTENSION_PUBLISHING_ENABLED,
+  INSTAGRAM_EXTENSION_PUBLISHING_ENABLED,
+  TIKTOK_EXTENSION_PUBLISHING_ENABLED,
+} from './env.js';
+
+export const PLATFORM_FEATURE_FLAGS = {
+  FACEBOOK: FACEBOOK_EXTENSION_PUBLISHING_ENABLED,
+  INSTAGRAM: INSTAGRAM_EXTENSION_PUBLISHING_ENABLED,
+  TIKTOK: TIKTOK_EXTENSION_PUBLISHING_ENABLED,
+} as const;
+
+export function isPlatformEnabled(platform: 'FACEBOOK' | 'INSTAGRAM' | 'TIKTOK'): boolean {
+  return PLATFORM_FEATURE_FLAGS[platform] === true;
+}
+
 const postingTiming: PostFlowPostingTimingConfig = {
   // Max time to wait for the Facebook tab to finish loading and for content.ts to report ready.
   facebookTabReadyTimeoutMs: 25000,

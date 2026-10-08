@@ -14,6 +14,13 @@ import {
   type PublishJob,
 } from './publishing-target.js';
 import {
+  checkPendingJobs as checkPlatformJobs,
+  handlePlatformQueueResume,
+  pausePlatformQueue,
+  resumePlatformQueue,
+  isPlatformQueuePaused,
+} from './job-orchestrator.js';
+import {
   ENGAGEMENT_MAINTENANCE_WAKE_INTERVAL_MINUTES,
   PENDING_MAINTENANCE_WAKE_INTERVAL_MINUTES,
   getMaintenanceAlarmFirstRunAt,
@@ -157,7 +164,7 @@ function isPostFlowDashboardUrl(value: string): boolean {
   }
 }
 
-async function getExtensionInstanceId(): Promise<string> {
+export async function getExtensionInstanceId(): Promise<string> {
   if (!extensionInstanceIdPromise) {
     extensionInstanceIdPromise = (async () => {
       const result = await chrome.storage.local.get(EXTENSION_INSTANCE_ID_KEY);
@@ -331,7 +338,7 @@ async function resetInstallationIdentityAfterCredentialLoss(): Promise<void> {
 }
 
 // Uses shared authentication and URL fallback; detailed failures are opt-in for UI workflows.
-async function apiFetch(
+export async function apiFetch(
   path: string,
   body?: Record<string, unknown>,
   method?: string,
@@ -631,7 +638,7 @@ async function collectPhoneNumbersFromActiveTab(): Promise<PhoneCollectionRespon
   }
 }
 
-async function updateJobStatus(
+export async function updateJobStatus(
   jobId: string,
   body: {
     status: string;
@@ -784,7 +791,7 @@ async function handleRevokedInstallation(): Promise<void> {
 }
 
 // Returns true if the local lifecycle status allows claiming new work.
-async function canClaimNewWork(): Promise<boolean> {
+export async function canClaimNewWork(): Promise<boolean> {
   const lifecycle = await getExtensionLifecycleStatus();
   if (!lifecycle) return true; // No status yet (first register), allow.
   if (lifecycle === 'PAUSED' || lifecycle === 'REVOKE_PENDING' || lifecycle === 'REVOKED') {
@@ -875,7 +882,7 @@ async function reportSession(sessionDetected: boolean, facebookUserId?: string |
   return verificationPromise;
 }
 
-async function refreshFacebookSession() {
+export async function refreshFacebookSession() {
   try {
     const cookie = await chrome.cookies.get({
       url: 'https://www.facebook.com/',
@@ -959,7 +966,7 @@ type ExtensionWorkerStatus =
   | 'CAPTCHA_OR_CHALLENGE'
   | 'MANUAL_INTERVENTION_REQUIRED';
 
-async function reportWorkerStatus(workerStatus: ExtensionWorkerStatus, reason?: string) {
+export async function reportWorkerStatus(workerStatus: ExtensionWorkerStatus, reason?: string) {
   await chrome.storage.local.set({
     extensionWorkerStatus: workerStatus,
     extensionWorkerReason: reason ? reason.slice(0, 500) : null,
@@ -1390,9 +1397,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message.type === 'RESUME_PUBLISH_QUEUE') {
-    publishQueuePaused = null;
-    void chrome.storage.local.remove('publishQueuePaused');
-    void reportWorkerStatus('IDLE');
+    // Support platform-specific resume
+    const platform = typeof message.platform === 'string' ? message.platform.toUpperCase() : null;
+    if (platform) {
+      resumePlatformQueue(platform);
+      void reportWorkerStatus('IDLE');
+    } else {
+      // Legacy: resume all platforms
+      publishQueuePaused = null;
+      void chrome.storage.local.remove('publishQueuePaused');
+      void reportWorkerStatus('IDLE');
+    }
     checkPendingJobs();
   }
 });
@@ -1409,7 +1424,7 @@ let publishQueuePaused: {
   pausedAt: number;
 } | null = null;
 let pendingCheckSequence = 0;
-let finishExecutionHandshake: (() => void) | null = null;
+let finishExecutionHandshake: (() => void) | null = () => {};
 let activeExecution: {
   jobId: string;
   tabId: number;
@@ -1417,6 +1432,34 @@ let activeExecution: {
   post: PublishJob['post'];
   profileVideoNotificationBaselineKeys?: string[] | null;
 } | null = null;
+
+/**
+ * Bridges the adapter-based worker to Facebook's existing result/identity
+ * handlers. The Facebook content script still owns all DOM automation, but
+ * these handlers need the active execution context to reject stale messages
+ * and to reconcile accepted profile videos.
+ */
+export async function prepareFacebookExecution(
+  job: PublishJob,
+  tabId: number,
+): Promise<string[] | null> {
+  const baseline =
+    job.target.type === 'PROFILE_FEED' && publishJobHasVideo(job.post)
+      ? await snapshotProcessedProfileVideoNotificationKeys(job.id)
+      : null;
+  activeExecution = {
+    jobId: job.id,
+    tabId,
+    target: job.target,
+    post: job.post,
+    profileVideoNotificationBaselineKeys: baseline,
+  };
+  return baseline;
+}
+
+export function clearFacebookExecution(jobId: string): void {
+  if (activeExecution?.jobId === jobId) activeExecution = null;
+}
 
 interface ProcessedProfileVideoNotificationScanResult {
   key: string;
@@ -1442,228 +1485,14 @@ void chrome.storage.local.get('publishQueuePaused').then((result) => {
   }
 }).catch(() => undefined);
 
+// Platform-aware job checking using the new orchestrator.
+// Legacy Facebook-only checkPendingJobs is kept for maintenance tasks.
 async function checkPendingJobs() {
-  if (!facebookIdentityVerified) {
-    console.log('[PostFlow] Publishing blocked until Facebook identity is verified', {
-      status: facebookConnectionStatus,
-    });
-    return;
-  }
-  if (!(await canClaimNewWork())) {
-    return;
-  }
-  if (publishQueuePaused) {
-    console.warn('[PostFlow] Publishing queue is paused; skipping job check', publishQueuePaused);
-    return;
-  }
-  if (isProcessingJob || isFacebookSyncBusy) {
-    console.log('[PostFlow] Skipping job check while Facebook navigation is busy', {
-      isProcessingJob,
-      isFacebookSyncBusy,
-    });
-    return;
-  }
-  isProcessingJob = true;
-
-  const job = normalizePublishJob(await apiFetch('/api/jobs/next'));
-  if (!job) {
-    console.log('[PostFlow] No pending jobs');
-    isProcessingJob = false;
-    return;
-  }
-  const executionJob = job;
-
-  console.log('[PostFlow] Found pending job', { jobId: executionJob.id, targetType: executionJob.target.type });
-
-  try {
-    // 1. Mark as running
-    await updateJobStatus(executionJob.id, { status: 'RUNNING' });
-
-    const targetUrl = executionJob.target.type === 'GROUP'
-      ? getSafeFacebookGroupUrl(executionJob.target, executionJob.target.url)
-      : getSafeFacebookProfileUrl(executionJob.target);
-    if (!targetUrl) {
-      console.error('[PostFlow] Refusing to navigate to invalid Facebook target URL', {
-        jobId: executionJob.id,
-        targetType: executionJob.target.type,
-      });
-      await updateJobStatus(executionJob.id, { status: 'FAILED', error: 'Invalid Facebook target URL' });
-      isProcessingJob = false;
-      return;
-    }
-
-    if (executionJob.target.type === 'PROFILE_FEED' && !(await verifyProfileTargetIdentity(executionJob.target))) {
-      await failProfileIdentityMismatch(executionJob);
-      return;
-    }
-
-    const profileVideoNotificationBaselineKeys =
-      executionJob.target.type === 'PROFILE_FEED' && publishJobHasVideo(executionJob.post)
-        ? await snapshotProcessedProfileVideoNotificationKeys(executionJob.id)
-        : undefined;
-    
-    const fbTab = await openFacebookTargetTab(targetUrl);
-
-    const tabId = fbTab.id;
-    if (!tabId) {
-      await updateJobStatus(executionJob.id, { status: 'FAILED', error: 'Could not get tab ID' });
-      isProcessingJob = false;
-      activeExecution = null;
-      return;
-    }
-    const readyTabId = tabId;
-    activeExecution = {
-      jobId: executionJob.id,
-      tabId: readyTabId,
-      target: executionJob.target,
-      post: executionJob.post,
-      profileVideoNotificationBaselineKeys,
-    };
-
-    // tabs.update/tabs.create resolves before the old Facebook document has
-    // necessarily been replaced. Sending EXECUTE_JOB immediately can make
-    // the previous page open its composer. Wait for the target group document.
-    const targetReady = await waitForFacebookTabDocument(readyTabId, targetUrl, POSTING_TIMING.facebookTabReadyTimeoutMs);
-    if (!targetReady) {
-      console.error('[PostFlow] Target Facebook page did not finish loading', { targetType: executionJob.target.type });
-      await updateJobStatus(executionJob.id, {
-        status: 'FAILED',
-        error: 'Target Facebook page did not finish loading',
-      });
-      isProcessingJob = false;
-      activeExecution = null;
-      return;
-    }
-    console.log('[PostFlow] Target Facebook page is loaded; waiting for content script', { targetType: executionJob.target.type });
-
-    const latestJob = await apiFetch(`/api/jobs/${executionJob.id}`) as { status?: string } | null;
-    if (latestJob?.status === 'CANCEL_REQUESTED') {
-      console.warn('[PostFlow] Job was canceled before Facebook execution started:', executionJob.id);
-      await updateJobStatus(executionJob.id, { status: 'CANCELED' });
-      isProcessingJob = false;
-      activeExecution = null;
-      checkPendingJobs();
-      return;
-    }
-
-      let sent = false;
-      let sendInFlight = false;
-      let identityFailureHandled = false;
-      let timeoutHandle: ReturnType<typeof setTimeout>;
-      let retryHandle: ReturnType<typeof setInterval> | null = null;
-
-    async function sendExecuteJob() {
-        if (activeExecution?.jobId !== executionJob.id || activeExecution?.tabId !== readyTabId) {
-          console.warn('[PostFlow] Skipping stale EXECUTE_JOB send', {
-            jobId: executionJob.id,
-            tabId: readyTabId,
-            activeExecution,
-          });
-          return;
-        }
-        if (sent) return;
-        if (sendInFlight) {
-          console.log('[PostFlow] Skipping overlapping EXECUTE_JOB send', executionJob.id);
-          return;
-        }
-        sendInFlight = true;
-        if (executionJob.target.type === 'PROFILE_FEED' && !(await verifyProfileTargetIdentity(executionJob.target))) {
-          sendInFlight = false;
-          if (!identityFailureHandled) {
-            identityFailureHandled = true;
-            cleanup();
-            await failProfileIdentityMismatch(executionJob);
-          }
-          return;
-        }
-        console.log('[PostFlow] Sending EXECUTE_JOB to Facebook tab', {
-          tabId: readyTabId,
-          jobId: executionJob.id,
-          targetType: executionJob.target.type,
-        });
-        chrome.tabs.sendMessage(readyTabId, {
-          type: 'EXECUTE_JOB',
-          jobId: executionJob.id,
-          post: executionJob.post,
-          target: executionJob.target,
-          profileVideoNotificationBaselineKeys,
-        }).then((response) => {
-          sendInFlight = false;
-          if (response?.accepted !== true) {
-            sent = false;
-            console.warn('[PostFlow] Facebook content script did not accept EXECUTE_JOB', {
-              jobId: executionJob.id,
-              error: response?.error,
-            });
-            return;
-          }
-          sent = true;
-          console.log('[PostFlow] Facebook content script accepted EXECUTE_JOB');
-        }).catch(() => {
-          sendInFlight = false;
-          sent = false;
-          console.log('[PostFlow] Facebook content script is not ready; retrying');
-        });
-      }
-
-      function onMessage(message: any, sender: chrome.runtime.MessageSender) {
-        if (message.type === 'CONTENT_SCRIPT_READY' && sender.tab?.id === readyTabId) {
-          if (activeExecution?.jobId !== executionJob.id || activeExecution?.tabId !== readyTabId) {
-            console.warn('[PostFlow] Ignoring stale content-script ready handler', {
-              jobId: executionJob.id,
-              tabId: readyTabId,
-              activeExecution,
-            });
-            cleanup();
-            return;
-          }
-          // A successful send means a content script already accepted this
-          // job. Never redeliver it to a replacement document: that can click
-          // Facebook's Post button twice.
-          console.log('[PostFlow] Facebook content script ready', {
-            jobId: executionJob.id,
-            deliveryAlreadyAccepted: sent,
-          });
-          void sendExecuteJob();
-        }
-      }
-
-    function cleanup() {
-        chrome.runtime.onMessage.removeListener(onMessage);
-        if (retryHandle) clearInterval(retryHandle);
-        if (finishExecutionHandshake === cleanup) finishExecutionHandshake = null;
-      }
-
-    finishExecutionHandshake = cleanup;
-
-    chrome.runtime.onMessage.addListener(onMessage);
-    void sendExecuteJob();
-    retryHandle = setInterval(() => void sendExecuteJob(), POSTING_TIMING.facebookMessageRetryIntervalMs);
-
-    timeoutHandle = setTimeout(async () => {
-        if (sent) return;
-        cleanup();
-        console.error('[PostFlow] Timed out waiting for Facebook tab to be ready');
-        await updateJobStatus(executionJob.id, {
-          status: 'FAILED',
-          error: 'Timed out waiting for Facebook page to load',
-        });
-        isProcessingJob = false;
-        activeExecution = null;
-    }, POSTING_TIMING.facebookTabReadyTimeoutMs);
-
-  } catch (err) {
-    console.error('[PostFlow] Error processing job:', err);
-    await updateJobStatus(executionJob.id, {
-      status: 'FAILED', 
-      error: 'Extension error while processing job' 
-    });
-    isProcessingJob = false;
-    activeExecution = null;
-  }
+  // Use the new platform-aware orchestrator for publishing jobs
+  await checkPlatformJobs();
 }
 
-async function verifyProfileTargetIdentity(target: ProfileFeedPublishTarget): Promise<boolean> {
+export async function verifyProfileTargetIdentity(target: ProfileFeedPublishTarget): Promise<boolean> {
   if (!/^\d+$/.test(target.facebookUserId)) return false;
   const verified = await refreshFacebookSession();
   const identity = await chrome.storage.local.get(['expectedFacebookUserId', 'detectedFacebookUserId']);

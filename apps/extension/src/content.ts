@@ -1,5 +1,16 @@
 // ── Constants ──
 
+interface FacebookResponseCandidateDetail {
+  requestUrl?: string;
+  requestStartedAt?: unknown;
+  isStoryCreateResponse?: unknown;
+  postUrls?: unknown[];
+  storyFbids?: unknown[];
+  videoIds?: unknown[];
+  uploadSessionIds?: unknown[];
+  pendingPostCandidates?: unknown[];
+}
+
 const EXCLUDED_SLUGS = new Set([
   "feed", "discover", "create", "joins",
   "requests", "questions", "members",
@@ -79,17 +90,6 @@ let isExecutingJob = false;
 let activeJobId: string | null = null;
 let activeJobUsesEnglishGroupFlow = false;
 let activeJobPublishedVideoIds: string[] = [];
-
-interface FacebookResponseCandidateDetail {
-  requestUrl?: string;
-  requestStartedAt?: unknown;
-  isStoryCreateResponse?: unknown;
-  postUrls?: unknown[];
-  storyFbids?: unknown[];
-  videoIds?: unknown[];
-  uploadSessionIds?: unknown[];
-  pendingPostCandidates?: unknown[];
-}
 
 interface PendingPostNetworkCandidate {
   postUrls: string[];

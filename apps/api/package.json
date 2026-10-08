@@ -16,6 +16,7 @@
     "repair-indexes": "node scripts/repair-indexes.mjs",
     "migrate-extension-name-uniqueness": "node scripts/migrate-extension-name-uniqueness.mjs",
     "migrate-extension-lifecycle": "node scripts/migrate-extension-lifecycle.mjs",
+    "migrate-publishing-platform": "node scripts/migrate-publishing-platform.mjs",
     "report-connection-ownership": "node scripts/migrate-connection-ownership.mjs --report-only",
     "migrate-connection-ownership": "node scripts/migrate-connection-ownership.mjs --apply",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",

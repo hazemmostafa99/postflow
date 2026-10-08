@@ -277,6 +277,57 @@ describe('JobsController.getNextJob', () => {
     });
   });
 
+  it('claims only jobs owned by the installation platform connections', async () => {
+    const instagramConnectionId = { toString: () => 'instagram-connection-1' };
+    const platformConnectionModel = {
+      find: jest.fn(() => ({
+        select: jest.fn().mockReturnThis(),
+        lean: jest.fn().mockReturnThis(),
+        exec: jest.fn().mockResolvedValue([
+          { _id: instagramConnectionId, platform: 'INSTAGRAM' },
+        ]),
+      })),
+    };
+    const postModel = {
+      find: jest.fn(() => queryChain([{ _id: postObjectId }])),
+    };
+    const jobModel = {
+      findOneAndUpdate: jest.fn(() => populatedJobChain(null)),
+    };
+    const connectionModel = { findOne: jest.fn(() => queryChain(null)) };
+    const extensionsService = {
+      verifyWorkerIdentity: jest.fn().mockResolvedValue({
+        _id: { toString: () => 'installation-1' },
+        clerkUserId,
+        extensionInstanceId,
+        status: 'ACTIVE',
+      }),
+      assertInstallationActive: jest.fn(),
+      resolveActiveWorkerConnection: jest.fn(),
+    };
+    const controller = new JobsController(
+      jobModel as never,
+      postModel as never,
+      connectionModel as never,
+      extensionsService as never,
+      platformConnectionModel as never,
+    );
+
+    await controller.getNextJob(clerkUserId, extensionInstanceId);
+
+    const [claimQuery] = jobModel.findOneAndUpdate.mock.calls[0];
+    expect(claimQuery.$and[0]).toEqual({
+      $or: [{ platformConnectionId: { $in: [instagramConnectionId] } }],
+    });
+    expect(claimQuery.$and[1]).toEqual(
+      expect.objectContaining({
+        $or: expect.arrayContaining([
+          expect.objectContaining({ platform: 'INSTAGRAM' }),
+        ]),
+      }),
+    );
+  });
+
   it('does not claim a job for an unverified extension connection', async () => {
     const { controller, jobModel } = createHarness({
       connection: {

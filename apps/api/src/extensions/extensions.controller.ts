@@ -12,6 +12,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { FacebookConnectionWorkerStatus } from '../schemas/facebook-connection.schema';
+import { PlatformConnectionWorkerStatus } from '../schemas/platform-connection.schema';
 import { ExtensionsService } from './extensions.service';
 
 class SessionDto {
@@ -21,6 +22,12 @@ class SessionDto {
 
 class WorkerStatusDto {
   workerStatus: FacebookConnectionWorkerStatus;
+  reason?: string;
+}
+
+class PlatformWorkerStatusDto {
+  platform: 'FACEBOOK' | 'INSTAGRAM' | 'TIKTOK';
+  workerStatus: PlatformConnectionWorkerStatus;
   reason?: string;
 }
 
@@ -246,6 +253,24 @@ export class ExtensionsController {
     @Body() body: WorkerStatusDto = new WorkerStatusDto(),
   ) {
     return this.extensionsService.updateWorkerStatus(
+      this.requireClerkUserId(clerkUserId),
+      extensionInstanceId,
+      credential,
+      body.workerStatus,
+      body.reason,
+    );
+  }
+
+  @Post('platform-status')
+  @HttpCode(HttpStatus.OK)
+  async platformStatus(
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+    @Headers('x-extension-instance-id') extensionInstanceId?: string,
+    @Headers('x-extension-credential') credential?: string,
+    @Body() body: PlatformWorkerStatusDto = new PlatformWorkerStatusDto(),
+  ) {
+    return this.extensionsService.updatePlatformConnectionWorkerStatus(
+      body.platform,
       this.requireClerkUserId(clerkUserId),
       extensionInstanceId,
       credential,

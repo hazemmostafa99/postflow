@@ -6,12 +6,17 @@ import {
   PublishingTargetType,
   validatePublishingTarget,
 } from './publishing-target';
+import { PublishingPlatform } from './publishing-platform';
 
 export {
   PublishingTargetType,
   resolvePublishingTargetType,
   validatePublishingTarget,
 } from './publishing-target';
+export {
+  PublishingPlatform,
+  resolvePublishingPlatform,
+} from './publishing-platform';
 
 export type PublishingJobDocument = PublishingJob & Document;
 
@@ -42,6 +47,15 @@ export class PublishingJob {
   postId: Post;
 
   @Prop({
+    type: String,
+    required: true,
+    enum: Object.values(PublishingPlatform),
+    default: PublishingPlatform.FACEBOOK,
+    index: true,
+  })
+  platform: PublishingPlatform;
+
+  @Prop({
     required: true,
     enum: PublishingTargetType,
     default: PublishingTargetType.GROUP,
@@ -59,6 +73,14 @@ export class PublishingJob {
     index: true,
   })
   facebookConnectionId?: Types.ObjectId;
+
+  /** Generic owner for Instagram, TikTok, and migrated Facebook jobs. */
+  @Prop({
+    type: MongooseSchema.Types.ObjectId,
+    ref: 'PlatformConnection',
+    index: true,
+  })
+  platformConnectionId?: Types.ObjectId;
 
   @Prop({ required: true, default: PublishingJobStatus.PENDING })
   status: string;
@@ -85,6 +107,14 @@ export class PublishingJob {
 
   @Prop()
   postUrl?: string;
+
+  /** Platform correlation ID for an accepted upload/publish operation. */
+  @Prop()
+  externalPublishId?: string;
+
+  /** Stable platform post identity when it can be detected reliably. */
+  @Prop()
+  externalPostId?: string;
 
   @Prop()
   submissionReason?: string;
@@ -167,9 +197,11 @@ PublishingJobSchema.index({ postId: 1 });
 
 PublishingJobSchema.pre('validate', function () {
   const validationError = validatePublishingTarget({
+    platform: this.platform,
     targetType: this.targetType,
     groupId: this.groupId,
     facebookConnectionId: this.facebookConnectionId,
+    platformConnectionId: this.platformConnectionId,
   });
   if (validationError) {
     this.invalidate(validationError.path, validationError.message);
@@ -184,6 +216,19 @@ PublishingJobSchema.index({
   flowOrder: 1,
   createdAt: 1,
 });
+
+PublishingJobSchema.index(
+  {
+    platformConnectionId: 1,
+    platform: 1,
+    targetType: 1,
+    status: 1,
+    scheduledFor: 1,
+    flowOrder: 1,
+    createdAt: 1,
+  },
+  { name: 'platform_connection_publish_queue' },
+);
 
 // Connection-scoped maintenance queues must be able to find due work without
 // scanning all jobs for a user or returning legacy jobs that have no owner.

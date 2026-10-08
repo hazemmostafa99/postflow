@@ -1,4 +1,5 @@
 import { PublishingTargetType } from '../schemas/publishing-target';
+import { PublishingPlatform } from '../schemas/publishing-platform';
 import {
   getFacebookProfileUrl,
   toPublishJobPayload,
@@ -28,6 +29,7 @@ describe('toPublishJobPayload', () => {
     expect(payload).toEqual({
       id: 'job-1',
       _id: 'job-1',
+      platform: PublishingPlatform.FACEBOOK,
       targetType: PublishingTargetType.GROUP,
       post: {
         content: 'Hello group',
@@ -69,6 +71,7 @@ describe('toPublishJobPayload', () => {
     expect(payload).toEqual({
       id: 'job-2',
       _id: 'job-2',
+      platform: PublishingPlatform.FACEBOOK,
       targetType: PublishingTargetType.PROFILE_FEED,
       post: {
         content: 'Hello profile',
@@ -103,6 +106,16 @@ describe('toPublishJobPayload', () => {
         targetType: PublishingTargetType.PROFILE_FEED,
         postId: { content: 'No identity' },
         facebookConnectionId: { _id: id('connection-1') },
+      }),
+    ).toBeNull();
+  });
+
+  it('fails closed for platform targets whose delivery adapter is not enabled', () => {
+    expect(
+      toPublishJobPayload({
+        _id: id('job-5'),
+        targetType: PublishingTargetType.INSTAGRAM_FEED,
+        postId: { content: 'Not deliverable yet' },
       }),
     ).toBeNull();
   });

@@ -9,7 +9,13 @@ if (!["development", "production"].includes(mode)) {
 
 // Read only the selected file and emit only this public value, never all env vars.
 const envFile = `.env.${mode}`;
-const { API_BASE_URL, AUTOMATIC_ANALYTICS_ENABLED } = parseEnv(readFileSync(envFile, "utf8"));
+const {
+  API_BASE_URL,
+  AUTOMATIC_ANALYTICS_ENABLED,
+  FACEBOOK_EXTENSION_PUBLISHING_ENABLED,
+  INSTAGRAM_EXTENSION_PUBLISHING_ENABLED,
+  TIKTOK_EXTENSION_PUBLISHING_ENABLED,
+} = parseEnv(readFileSync(envFile, "utf8"));
 if (!API_BASE_URL) {
   throw new Error(`API_BASE_URL is required in ${envFile}`);
 }
@@ -21,6 +27,9 @@ if (!["true", "false"].includes(AUTOMATIC_ANALYTICS_ENABLED ?? "")) {
   throw new Error(`AUTOMATIC_ANALYTICS_ENABLED in ${envFile} must be true or false`);
 }
 const automaticAnalyticsEnabled = AUTOMATIC_ANALYTICS_ENABLED === "true";
+const facebookPublishingEnabled = FACEBOOK_EXTENSION_PUBLISHING_ENABLED !== "false";
+const instagramPublishingEnabled = INSTAGRAM_EXTENSION_PUBLISHING_ENABLED === "true";
+const tiktokPublishingEnabled = TIKTOK_EXTENSION_PUBLISHING_ENABLED === "true";
 
 const files = [
   "popup/popup.html",
@@ -41,7 +50,7 @@ copyFileSync(
 );
 
 writeFileSync(resolve("dist/env.js"),
-  `// Generated from ${envFile}; public extension configuration.\nexport const BUILD_ENV = ${JSON.stringify(mode)};\nexport const API_BASE_URL = ${JSON.stringify(API_BASE_URL.replace(/\/+$/, ""))};\nexport const AUTOMATIC_ANALYTICS_ENABLED = ${JSON.stringify(automaticAnalyticsEnabled)};\n`);
+  `// Generated from ${envFile}; public extension configuration.\nexport const BUILD_ENV = ${JSON.stringify(mode)};\nexport const API_BASE_URL = ${JSON.stringify(API_BASE_URL.replace(/\/+$/, ""))};\nexport const AUTOMATIC_ANALYTICS_ENABLED = ${JSON.stringify(automaticAnalyticsEnabled)};\nexport const FACEBOOK_EXTENSION_PUBLISHING_ENABLED = ${JSON.stringify(facebookPublishingEnabled)};\nexport const INSTAGRAM_EXTENSION_PUBLISHING_ENABLED = ${JSON.stringify(instagramPublishingEnabled)};\nexport const TIKTOK_EXTENSION_PUBLISHING_ENABLED = ${JSON.stringify(tiktokPublishingEnabled)};\n`);
 
 // The source manifest supports loading the project folder; the packaged manifest
 // uses paths relative to dist so that dist itself can be loaded in Chrome.

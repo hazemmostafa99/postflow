@@ -22,6 +22,12 @@ import {
   FacebookConnectionWorkerStatus,
 } from '../schemas/facebook-connection.schema';
 import {
+  PlatformConnection,
+  PlatformConnectionDocument,
+  PlatformConnectionStatus,
+  PlatformConnectionWorkerStatus,
+} from '../schemas/platform-connection.schema';
+import {
   PublishingJob,
   PublishingJobDocument,
   PublishingJobStatus,
@@ -209,6 +215,8 @@ export class ExtensionsService {
     private readonly jobModel: Model<PublishingJobDocument>,
     @InjectModel(ExtensionLifecycleAuditEvent.name)
     private readonly auditModel: Model<ExtensionLifecycleAuditDocument>,
+    @InjectModel(PlatformConnection.name)
+    private readonly platformConnectionModel?: Model<PlatformConnectionDocument>,
   ) {}
 
   private getInstallationFilter(
@@ -379,6 +387,72 @@ export class ExtensionsService {
       return null;
     }
     return connection;
+  }
+
+  /**
+   * Platform-aware claim gate: resolves the active PlatformConnection for a given platform.
+   * Returns null if the installation doesn't own an active, non-archived connection for that platform.
+   */
+  async resolveActivePlatformConnection(
+    clerkUserId: string,
+    installation: ExtensionInstallationDocument,
+    platform: 'FACEBOOK' | 'INSTAGRAM' | 'TIKTOK',
+  ): Promise<PlatformConnectionDocument | null> {
+    if (!this.platformConnectionModel) return null;
+    const connection = await this.platformConnectionModel
+      .findOne({
+        clerkUserId,
+        platform: platform as any,
+        activeExtensionInstallationId: installation._id,
+        archivedAt: { $exists: false },
+      })
+      .exec();
+    if (!connection) return null;
+    // Verify the connection status allows claiming work
+    if (
+      connection.status !== PlatformConnectionStatus.CONNECTED ||
+      connection.workerStatus === PlatformConnectionWorkerStatus.PUBLISHING
+    ) {
+      return null;
+    }
+    return connection;
+  }
+
+  /**
+   * Get the platform connection for a specific platform connection ID, verifying ownership.
+   */
+  async getPlatformConnectionById(
+    clerkUserId: string,
+    platformConnectionId: string,
+  ): Promise<PlatformConnectionDocument | null> {
+    if (!this.platformConnectionModel) return null;
+    return this.platformConnectionModel
+      .findOne({ _id: platformConnectionId, clerkUserId })
+      .exec();
+  }
+
+  /**
+   * Update platform connection worker status by connection ID.
+   */
+  async updatePlatformConnectionWorkerStatusById(
+    platformConnectionId: string,
+    workerStatus: PlatformConnectionWorkerStatus,
+    reason?: string,
+  ): Promise<PlatformConnectionDocument | null> {
+    if (!this.platformConnectionModel) return null;
+    return this.platformConnectionModel
+      .findByIdAndUpdate(
+        platformConnectionId,
+        {
+          $set: {
+            workerStatus,
+            ...(reason ? { statusReason: reason.slice(0, 500) } : {}),
+            lastSeenAt: new Date(),
+          },
+        },
+        { new: true },
+      )
+      .exec();
   }
 
   /**
@@ -777,6 +851,61 @@ export class ExtensionsService {
     return this.sanitizeConnection(connection);
   }
 
+  /**
+   * Update platform connection worker status (for Instagram, TikTok, etc.)
+   */
+  async updatePlatformConnectionWorkerStatus(
+    platform: 'FACEBOOK' | 'INSTAGRAM' | 'TIKTOK',
+    clerkUserId: string,
+    extensionInstanceId?: string,
+    credential?: string,
+    workerStatus?: PlatformConnectionWorkerStatus,
+    reason?: string,
+  ) {
+    if (!this.platformConnectionModel) {
+      throw new NotFoundException('Platform connections are not enabled');
+    }
+    if (
+      !Object.values(PlatformConnectionWorkerStatus).includes(
+        workerStatus as PlatformConnectionWorkerStatus,
+      )
+    ) {
+      throw new BadRequestException('Invalid platform worker status');
+    }
+    const installation = await this.verifyWorkerIdentity(
+      clerkUserId,
+      extensionInstanceId,
+      credential,
+    );
+
+    // Find the platform connection for this installation
+    const platformConnection = await this.platformConnectionModel
+      .findOne({
+        activeExtensionInstallationId: installation._id,
+        platform: platform as any,
+        archivedAt: { $exists: false },
+      })
+      .exec();
+
+    if (!platformConnection) {
+      // An unbound installation has no platform connection to report status on yet.
+      return null;
+    }
+
+    const connectionStatus = mapPlatformWorkerStatusToConnectionStatus(workerStatus!);
+    platformConnection.workerStatus = workerStatus!;
+    if (connectionStatus) {
+      platformConnection.status = connectionStatus;
+    }
+    if (reason) {
+      platformConnection.statusReason = reason.slice(0, 500);
+    }
+    platformConnection.lastSeenAt = new Date();
+    await platformConnection.save();
+
+    return sanitizePlatformConnection(platformConnection);
+  }
+
   async updateSession(
     clerkUserId: string,
     extensionInstanceId?: string,
@@ -1028,6 +1157,9 @@ export class ExtensionsService {
     credential?: string,
     extensionName?: unknown,
   ) {
+    if (!this.platformConnectionModel) {
+      throw new NotFoundException('Platform connections are not enabled');
+    }
     const installation = await this.verifyWorkerIdentity(
       clerkUserId,
       extensionInstanceId,
@@ -2072,6 +2204,47 @@ function mapWorkerStatusToConnectionStatus(
     default:
       return undefined;
   }
+}
+
+function mapPlatformWorkerStatusToConnectionStatus(
+  workerStatus: PlatformConnectionWorkerStatus,
+): PlatformConnectionStatus | undefined {
+  switch (workerStatus) {
+    case PlatformConnectionWorkerStatus.LOGIN_REQUIRED:
+      return PlatformConnectionStatus.LOGIN_REQUIRED;
+    case PlatformConnectionWorkerStatus.ACCOUNT_MISMATCH:
+      return PlatformConnectionStatus.ACCOUNT_MISMATCH;
+    case PlatformConnectionWorkerStatus.BLOCKED:
+      return PlatformConnectionStatus.BLOCKED;
+    case PlatformConnectionWorkerStatus.IDLE:
+    case PlatformConnectionWorkerStatus.ONLINE:
+    case PlatformConnectionWorkerStatus.PUBLISHING:
+      return PlatformConnectionStatus.CONNECTED;
+    default:
+      return undefined;
+  }
+}
+
+function sanitizePlatformConnection(connection: PlatformConnectionDocument): Record<string, unknown> {
+  return {
+    _id: connection._id,
+    clerkUserId: connection.clerkUserId,
+    platform: connection.platform,
+    displayName: connection.displayName,
+    externalAccountId: connection.externalAccountId,
+    externalUsername: connection.externalUsername,
+    detectedExternalAccountId: connection.detectedExternalAccountId,
+    detectedExternalUsername: connection.detectedExternalUsername,
+    status: connection.status,
+    workerStatus: connection.workerStatus,
+    sessionDetected: connection.sessionDetected,
+    lastSeenAt: connection.lastSeenAt,
+    archivedAt: connection.archivedAt,
+    activeExtensionInstallationId: connection.activeExtensionInstallationId,
+    legacyFacebookConnectionId: connection.legacyFacebookConnectionId,
+    createdAt: connection.createdAt,
+    updatedAt: connection.updatedAt,
+  };
 }
 
 function buildInstallationMap(

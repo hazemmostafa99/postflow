@@ -16,6 +16,10 @@ import {
 import { User, UserSchema } from '../schemas/user.schema';
 import { AuthModule } from '../auth/auth.module';
 import { ExtensionsModule } from '../extensions/extensions.module';
+import {
+  PlatformConnection,
+  PlatformConnectionSchema,
+} from '../schemas/platform-connection.schema';
 
 @Module({
   imports: [
@@ -27,6 +31,7 @@ import { ExtensionsModule } from '../extensions/extensions.module';
       { name: Group.name, schema: GroupSchema },
       { name: FacebookConnection.name, schema: FacebookConnectionSchema },
       { name: User.name, schema: UserSchema },
+      { name: PlatformConnection.name, schema: PlatformConnectionSchema },
     ]),
   ],
   providers: [PostsService],
