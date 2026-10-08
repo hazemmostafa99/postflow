@@ -339,6 +339,221 @@ h2 {
   background: #fffbeb;
 }
 
+.page-status.paused {
+  border-color: rgba(59, 130, 246, 0.28);
+  color: #1d4ed8;
+  background: #eff6ff;
+}
+
+.page-status.disconnecting {
+  border-color: rgba(245, 158, 11, 0.28);
+  color: #b45309;
+  background: #fffbeb;
+}
+
+.page-status.revoked {
+  border-color: rgba(239, 68, 68, 0.28);
+  color: #b91c1c;
+  background: #fef2f2;
+}
+
+.connection-progress {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.setup-steps {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 5px;
+  margin: 7px 0 9px;
+}
+
+.setup-step {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  color: #94a3b8;
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.setup-step-dot {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 17px;
+  height: 17px;
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  background: #f8fafc;
+}
+
+.setup-step.active {
+  color: #1d4ed8;
+}
+
+.setup-step.active .setup-step-dot {
+  border-color: #93c5fd;
+  color: #1d4ed8;
+  background: #eff6ff;
+}
+
+.setup-step.complete {
+  color: #15803d;
+}
+
+.setup-step.complete .setup-step-dot {
+  border-color: #86efac;
+  color: #15803d;
+  background: #f0fdf4;
+}
+
+.connection-detail,
+.connection-account,
+.connection-updated {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.connection-detail {
+  color: #334155;
+  font-weight: 700;
+}
+
+.connection-account,
+.connection-updated {
+  margin-top: 3px;
+  color: #64748b;
+}
+
+.connection-action {
+  width: 100%;
+  margin-top: 7px;
+  justify-content: center;
+  font-size: 10px;
+}
+
+.lifecycle-dashboard-link {
+  margin-top: 8px;
+  padding: 8px 0;
+  text-align: center;
+}
+
+.lifecycle-dashboard-link .secondary-button {
+  width: 100%;
+  justify-content: center;
+}
+
+.recovery-panel {
+  margin-top: 8px;
+  padding: 12px;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  background: #eff6ff;
+}
+
+.recovery-panel h2 {
+  margin: 3px 0 0;
+  color: #172033;
+  font-size: 14px;
+}
+
+.recovery-copy {
+  margin: 6px 0 10px;
+  color: #475569;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.recovery-candidates {
+  display: grid;
+  gap: 7px;
+}
+
+.recovery-candidate {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid #dbeafe;
+  border-radius: 7px;
+  background: #ffffff;
+}
+
+.recovery-candidate strong,
+.recovery-candidate small {
+  display: block;
+}
+
+.recovery-candidate strong {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recovery-candidate small {
+  margin-top: 2px;
+  color: #64748b;
+  font-size: 10px;
+}
+
+.recovery-candidate button {
+  min-height: 32px;
+  padding: 6px 9px;
+  border: 0;
+  border-radius: 6px;
+  color: #ffffff;
+  background: #2563eb;
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.recovery-create {
+  width: 100%;
+  margin-top: 8px;
+  justify-content: center;
+}
+
+.recovery-panel button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.facebook-health {
+  margin: 6px 0 0;
+  padding: 6px 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  color: #374151;
+  background: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.facebook-health.ready {
+  border-color: rgba(22, 163, 74, 0.22);
+  color: #15803d;
+  background: #f0fdf4;
+}
+
+.facebook-health.attention {
+  border-color: rgba(245, 158, 11, 0.28);
+  color: #b45309;
+  background: #fffbeb;
+}
+
 .identity-panel {
   margin-top: 6px;
   padding: 0;

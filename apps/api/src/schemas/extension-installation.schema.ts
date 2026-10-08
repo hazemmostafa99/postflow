@@ -75,6 +75,14 @@ export class ExtensionInstallation {
 
   @Prop({ default: false })
   facebookSessionDetected: boolean;
+
+  /**
+   * The Facebook user id most recently detected for this installation. Used
+   * to verify identity before an explicit reconnect may rebind the
+   * installation to an existing connection.
+   */
+  @Prop()
+  detectedFacebookUserId?: string;
 }
 
 export const ExtensionInstallationSchema = SchemaFactory.createForClass(

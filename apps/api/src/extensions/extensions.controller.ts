@@ -28,6 +28,13 @@ class ExtensionIdentityDto {
   extensionName?: unknown;
 }
 
+class ReconnectDto {
+  connectionId?: string;
+  createNewConnection?: boolean;
+  confirmReplacement?: boolean;
+  approvalToken?: string;
+}
+
 /**
  * Extension-facing surface.
  *
@@ -244,6 +251,29 @@ export class ExtensionsController {
       credential,
       body.workerStatus,
       body.reason,
+    );
+  }
+
+  /**
+   * Explicit reinstall recovery: either rebinds this installation to an
+   * existing connection the user chose (reconnect) or completes the
+   * new-connection flow. Requires a verified Facebook identity and the
+   * installation credential; archived targets additionally require a
+   * dashboard-issued single-use approval code.
+   */
+  @Post('reconnect')
+  @HttpCode(HttpStatus.OK)
+  async reconnect(
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+    @Headers('x-extension-instance-id') extensionInstanceId?: string,
+    @Headers('x-extension-credential') credential?: string,
+    @Body() body: ReconnectDto = new ReconnectDto(),
+  ) {
+    return this.extensionsService.reconnect(
+      this.requireClerkUserId(clerkUserId),
+      extensionInstanceId,
+      credential,
+      body,
     );
   }
 }

@@ -25,6 +25,13 @@ interface ListPhoneContactsOptions {
   qualificationStatus?: string;
   page?: number;
   limit?: number;
+  cursor?: string;
+  includeMetadata?: boolean;
+}
+
+interface PhoneContactCursor {
+  lastSeenAt: Date;
+  id: Types.ObjectId;
 }
 
 export interface PhoneSyncResult {
@@ -181,6 +188,50 @@ function normalizeContactId(id: string): Types.ObjectId {
   return new Types.ObjectId(id);
 }
 
+function decodePhoneContactCursor(
+  value: string | undefined,
+): PhoneContactCursor | undefined {
+  if (!value) return undefined;
+  if (value.length > 512) {
+    throw new BadRequestException('Lead cursor is invalid.');
+  }
+  try {
+    const decoded: unknown = JSON.parse(
+      Buffer.from(value, 'base64url').toString('utf8'),
+    );
+    if (
+      !isRecord(decoded) ||
+      typeof decoded.lastSeenAt !== 'string' ||
+      typeof decoded.id !== 'string'
+    ) {
+      throw new Error('Invalid cursor shape');
+    }
+    const lastSeenAt = new Date(decoded.lastSeenAt);
+    if (
+      Number.isNaN(lastSeenAt.getTime()) ||
+      !Types.ObjectId.isValid(decoded.id)
+    ) {
+      throw new Error('Invalid cursor values');
+    }
+    return { lastSeenAt, id: new Types.ObjectId(decoded.id) };
+  } catch {
+    throw new BadRequestException('Lead cursor is invalid.');
+  }
+}
+
+function encodePhoneContactCursor(contact: {
+  _id: unknown;
+  lastSeenAt?: unknown;
+}): string {
+  const lastSeenAt = new Date(contact.lastSeenAt as string | number | Date);
+  return Buffer.from(
+    JSON.stringify({
+      lastSeenAt: lastSeenAt.toISOString(),
+      id: String(contact._id),
+    }),
+  ).toString('base64url');
+}
+
 function isDuplicateKeyError(error: unknown): boolean {
   return isRecord(error) && error.code === 11000;
 }
@@ -242,6 +293,8 @@ export class PhoneContactsService {
       : 20;
     const requestedPageNumber = Math.max(1, requestedPage);
     const limit = Math.min(100, Math.max(1, requestedLimit));
+    const cursor = decodePhoneContactCursor(options.cursor);
+    const includeMetadata = options.includeMetadata !== false;
     const search = options.search?.trim().slice(0, 128);
     const category = options.category?.trim().slice(0, 80);
     const group = options.group?.trim().slice(0, 80);
@@ -292,11 +345,13 @@ export class PhoneContactsService {
       ...(categoryFilter ? [categoryFilter] : []),
       ...(groupFilter ? [groupFilter] : []),
     ];
+    const filterConditions = [
+      ...baseFilters,
+      ...(statusFilter ? [statusFilter] : []),
+    ];
     const filter = {
       clerkUserId,
-      ...(baseFilters.length || statusFilter
-        ? { $and: [...baseFilters, ...(statusFilter ? [statusFilter] : [])] }
-        : {}),
+      ...(filterConditions.length ? { $and: filterConditions } : {}),
     };
     // Counts for each status reflect the active search/group filters so a
     // column can show its total even while a different column is paginated.
@@ -307,54 +362,90 @@ export class PhoneContactsService {
         : buildStatusFilter(status)),
     });
 
+    const metadata = includeMetadata
+      ? await Promise.all([
+          this.phoneContactModel.countDocuments(filter),
+          this.phoneContactModel.distinct('category', { clerkUserId }).exec(),
+          this.phoneContactModel.countDocuments({
+            clerkUserId,
+            $or: [
+              { category: { $exists: false } },
+              { category: '' },
+              { category: 'Uncategorized' },
+            ],
+          }),
+          this.phoneContactModel.distinct('group', { clerkUserId }).exec(),
+          this.phoneContactModel.countDocuments({
+            clerkUserId,
+            $or: [
+              { group: { $exists: false } },
+              { group: null },
+              { group: '' },
+              { group: 'Ungrouped' },
+            ],
+          }),
+          this.phoneContactModel.countDocuments(
+            countFilterForStatus('UNREVIEWED'),
+          ),
+          this.phoneContactModel.countDocuments(
+            countFilterForStatus('QUALIFIED'),
+          ),
+          this.phoneContactModel.countDocuments(
+            countFilterForStatus('NOT_QUALIFIED'),
+          ),
+        ] as const)
+      : undefined;
     const [
-      total,
-      storedCategories,
-      uncategorizedCount,
-      storedGroups,
-      ungroupedCount,
-      unreviewed,
-      qualified,
-      notQualified,
-    ] = await Promise.all([
-      this.phoneContactModel.countDocuments(filter),
-      this.phoneContactModel.distinct('category', { clerkUserId }).exec(),
-      this.phoneContactModel.countDocuments({
-        clerkUserId,
-        $or: [
-          { category: { $exists: false } },
-          { category: '' },
-          { category: 'Uncategorized' },
-        ],
-      }),
-      this.phoneContactModel.distinct('group', { clerkUserId }).exec(),
-      this.phoneContactModel.countDocuments({
-        clerkUserId,
-        $or: [
-          { group: { $exists: false } },
-          { group: null },
-          { group: '' },
-          { group: 'Ungrouped' },
-        ],
-      }),
-      this.phoneContactModel.countDocuments(countFilterForStatus('UNREVIEWED')),
-      this.phoneContactModel.countDocuments(countFilterForStatus('QUALIFIED')),
-      this.phoneContactModel.countDocuments(
-        countFilterForStatus('NOT_QUALIFIED'),
-      ),
-    ]);
+      total = 0,
+      storedCategories = [],
+      uncategorizedCount = 0,
+      storedGroups = [],
+      ungroupedCount = 0,
+      unreviewed = 0,
+      qualified = 0,
+      notQualified = 0,
+    ] = metadata ?? [];
     const totalPages = Math.max(1, Math.ceil(total / limit));
-    const page = Math.min(requestedPageNumber, totalPages);
-    const contacts = await this.phoneContactModel
-      .find(filter)
+    const page = includeMetadata
+      ? Math.min(requestedPageNumber, totalPages)
+      : requestedPageNumber;
+    const cursorFilter = cursor
+      ? {
+          $or: [
+            { lastSeenAt: { $lt: cursor.lastSeenAt } },
+            { lastSeenAt: cursor.lastSeenAt, _id: { $lt: cursor.id } },
+          ],
+        }
+      : undefined;
+    const contactsAfterCursor = await this.phoneContactModel
+      .find({
+        clerkUserId,
+        ...([...filterConditions, ...(cursorFilter ? [cursorFilter] : [])]
+          .length
+          ? {
+              $and: [
+                ...filterConditions,
+                ...(cursorFilter ? [cursorFilter] : []),
+              ],
+            }
+          : {}),
+      })
       .select(
         '_id normalizedNumber category group qualificationStatus notes source createdAt lastSeenAt',
       )
       .sort({ lastSeenAt: -1, _id: -1 })
-      .skip((page - 1) * limit)
-      .limit(limit)
+      .skip(cursor ? 0 : (page - 1) * limit)
+      .limit(limit + 1)
       .lean()
       .exec();
+    const hasMore =
+      contactsAfterCursor.length > limit ||
+      (!cursor && includeMetadata && page < totalPages);
+    const contacts = contactsAfterCursor.slice(0, limit);
+    const nextCursor =
+      hasMore && contacts.length
+        ? encodePhoneContactCursor(contacts[contacts.length - 1])
+        : null;
 
     return {
       contacts: contacts.map((contact) => ({
@@ -366,34 +457,47 @@ export class PhoneContactsService {
         notes: resolveNotes(contact.notes),
         group: resolveGroup(contact.group),
       })),
-      categories: Array.from(
-        new Set([
-          ...storedCategories.filter(
-            (value): value is string =>
-              typeof value === 'string' && Boolean(value.trim()),
-          ),
-          ...(uncategorizedCount > 0 ? ['Uncategorized'] : []),
-        ]),
-      ).sort((left, right) => left.localeCompare(right)),
-      groups: Array.from(
-        new Set([
-          ...storedGroups.filter(
-            (value): value is string =>
-              typeof value === 'string' && Boolean(value.trim()),
-          ),
-          ...(ungroupedCount > 0 ? ['Ungrouped'] : []),
-        ]),
-      ).sort((left, right) => left.localeCompare(right)),
-      statusCounts: {
-        UNREVIEWED: unreviewed,
-        QUALIFIED: qualified,
-        NOT_QUALIFIED: notQualified,
-      },
+      ...(includeMetadata
+        ? {
+            categories: Array.from(
+              new Set([
+                ...storedCategories.filter(
+                  (value): value is string =>
+                    typeof value === 'string' && Boolean(value.trim()),
+                ),
+                ...(uncategorizedCount > 0 ? ['Uncategorized'] : []),
+              ]),
+            ).sort((left, right) => left.localeCompare(right)),
+          }
+        : {}),
+      ...(includeMetadata
+        ? {
+            groups: Array.from(
+              new Set([
+                ...storedGroups.filter(
+                  (value): value is string =>
+                    typeof value === 'string' && Boolean(value.trim()),
+                ),
+                ...(ungroupedCount > 0 ? ['Ungrouped'] : []),
+              ]),
+            ).sort((left, right) => left.localeCompare(right)),
+          }
+        : {}),
+      ...(includeMetadata
+        ? {
+            statusCounts: {
+              UNREVIEWED: unreviewed,
+              QUALIFIED: qualified,
+              NOT_QUALIFIED: notQualified,
+            },
+          }
+        : {}),
       pagination: {
         page,
         limit,
-        total,
-        totalPages,
+        ...(includeMetadata ? { total, totalPages } : {}),
+        hasMore,
+        nextCursor,
       },
     };
   }

@@ -8,7 +8,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
+import { ClientSession, Model, Types } from 'mongoose';
 import {
   ExtensionInstallation,
   ExtensionInstallationDocument,
@@ -61,13 +61,22 @@ export type RegistrationOutcome =
   | { status: 'PAUSED'; connectionId: string | null; credentialIssued?: string }
   | { status: 'REVOKE_PENDING'; connectionId: string | null }
   | { status: 'REVOKED'; reason: string }
-  | { status: 'NEW_INSTALLATION'; connectionId: string | null; credentialIssued: string }
-  | { status: 'RECOVERY_AVAILABLE'; candidates: RecoveryCandidate[] };
+  | {
+      status: 'NEW_INSTALLATION';
+      connectionId: string | null;
+      credentialIssued: string;
+    }
+  | {
+      status: 'RECOVERY_AVAILABLE';
+      candidates: RecoveryCandidate[];
+      credentialIssued?: string;
+    };
 
 export type ConnectionConnectivity = {
   isOnline: boolean;
   connectivity: 'ONLINE' | 'OFFLINE';
-  connectivityReason: 'HEARTBEAT_RECENT' | 'HEARTBEAT_EXPIRED' | 'HEARTBEAT_MISSING';
+  connectivityReason:
+    'HEARTBEAT_RECENT' | 'HEARTBEAT_EXPIRED' | 'HEARTBEAT_MISSING';
 };
 
 /** Worker statuses the heartbeat must preserve rather than collapse to ONLINE. */
@@ -174,13 +183,16 @@ type LeanExtensionInstallation = {
 
 type ConnectionLike = FacebookConnectionDocument | LeanFacebookConnection;
 type InstallationLike =
-  | ExtensionInstallationDocument
-  | LeanExtensionInstallation;
+  ExtensionInstallationDocument | LeanExtensionInstallation;
 
-function isRevocationReason(value: unknown): value is ExtensionRevocationReason {
+function isRevocationReason(
+  value: unknown,
+): value is ExtensionRevocationReason {
   return (
     typeof value === 'string' &&
-    Object.values(ExtensionRevocationReason).includes(value as ExtensionRevocationReason)
+    Object.values(ExtensionRevocationReason).includes(
+      value as ExtensionRevocationReason,
+    )
   );
 }
 
@@ -199,14 +211,20 @@ export class ExtensionsService {
     private readonly auditModel: Model<ExtensionLifecycleAuditDocument>,
   ) {}
 
-  private getInstallationFilter(clerkUserId: string, extensionInstanceId?: string) {
+  private getInstallationFilter(
+    clerkUserId: string,
+    extensionInstanceId?: string,
+  ) {
     const normalizedInstanceId = extensionInstanceId?.trim();
     return normalizedInstanceId
       ? { clerkUserId, extensionInstanceId: normalizedInstanceId }
       : { clerkUserId };
   }
 
-  private getConnectionFilter(clerkUserId: string, extensionInstanceId?: string) {
+  private getConnectionFilter(
+    clerkUserId: string,
+    extensionInstanceId?: string,
+  ) {
     const normalizedInstanceId = extensionInstanceId?.trim();
     return normalizedInstanceId
       ? { clerkUserId, extensionInstanceId: normalizedInstanceId }
@@ -229,7 +247,9 @@ export class ExtensionsService {
     if (!Object.prototype.hasOwnProperty.call(updates, 'workerStatus')) {
       setOnInsert.workerStatus = FacebookConnectionWorkerStatus.OFFLINE;
     }
-    if (!Object.prototype.hasOwnProperty.call(updates, 'facebookSessionDetected')) {
+    if (
+      !Object.prototype.hasOwnProperty.call(updates, 'facebookSessionDetected')
+    ) {
       setOnInsert.facebookSessionDetected = false;
     }
 
@@ -264,7 +284,9 @@ export class ExtensionsService {
       throw new UnauthorizedException('x-clerk-user-id header is required');
     const normalizedInstanceId = extensionInstanceId?.trim();
     if (!normalizedInstanceId)
-      throw new UnauthorizedException('x-extension-instance-id header is required');
+      throw new UnauthorizedException(
+        'x-extension-instance-id header is required',
+      );
 
     const installation = await this.extensionModel
       .findOne({
@@ -303,9 +325,13 @@ export class ExtensionsService {
       throw new ForbiddenException('Installation credential has been revoked.');
     }
     if (!credential) {
-      throw new ForbiddenException('x-extension-credential header is required.');
+      throw new ForbiddenException(
+        'x-extension-credential header is required.',
+      );
     }
-    if (!verifyInstallationCredential(credential, installation.credentialHash)) {
+    if (
+      !verifyInstallationCredential(credential, installation.credentialHash)
+    ) {
       throw new ForbiddenException('Installation credential is invalid.');
     }
   }
@@ -340,11 +366,15 @@ export class ExtensionsService {
     clerkUserId: string,
     installation: ExtensionInstallationDocument,
   ): Promise<FacebookConnectionDocument | null> {
-    const connection = await this.resolveWorkerConnection(clerkUserId, installation);
+    const connection = await this.resolveWorkerConnection(
+      clerkUserId,
+      installation,
+    );
     if (!connection || connection.archivedAt) return null;
     if (
       connection.activeExtensionInstallationId &&
-      String(connection.activeExtensionInstallationId) !== String(installation._id)
+      String(connection.activeExtensionInstallationId) !==
+        String(installation._id)
     ) {
       return null;
     }
@@ -377,7 +407,10 @@ export class ExtensionsService {
     installation: ExtensionInstallationDocument,
     updates: Record<string, unknown>,
   ): Promise<FacebookConnectionDocument | null> {
-    const connection = await this.resolveWorkerConnection(clerkUserId, installation);
+    const connection = await this.resolveWorkerConnection(
+      clerkUserId,
+      installation,
+    );
     if (!connection) return null;
     // A removed connection must never be refreshed back onto the dashboard.
     if (connection.archivedAt) return connection;
@@ -397,9 +430,10 @@ export class ExtensionsService {
       nextLifecycle?: string;
       reason?: string;
     },
+    session?: ClientSession,
   ) {
     try {
-      await this.auditModel.create({
+      const audit = {
         clerkUserId: details.clerkUserId,
         facebookConnectionId: details.connectionId,
         extensionInstanceIdMasked: details.installation
@@ -410,7 +444,12 @@ export class ExtensionsService {
         previousLifecycle: details.previousLifecycle,
         nextLifecycle: details.nextLifecycle,
         reason: details.reason,
-      });
+      };
+      if (session) {
+        await this.auditModel.create([audit], { session });
+      } else {
+        await this.auditModel.create(audit);
+      }
     } catch (error) {
       // Audit is diagnostic; a failure must not roll back the lifecycle action.
       this.logger.warn(
@@ -437,7 +476,9 @@ export class ExtensionsService {
       throw new UnauthorizedException('x-clerk-user-id header is required');
     const normalizedInstanceId = extensionInstanceId?.trim();
     if (!normalizedInstanceId)
-      throw new UnauthorizedException('x-extension-instance-id header is required');
+      throw new UnauthorizedException(
+        'x-extension-instance-id header is required',
+      );
 
     const installation = await this.extensionModel
       .findOne({
@@ -493,6 +534,31 @@ export class ExtensionsService {
     if (installation.status === ExtensionLifecycleStatus.REVOKE_PENDING) {
       return { status: 'REVOKE_PENDING', connectionId };
     }
+
+    // An unbound installation whose Facebook identity was already verified
+    // re-reports its recovery candidates on every register — for example when
+    // the service worker restarts before the user has chosen to reconnect or
+    // create a new connection. Identity never auto-binds; the candidates are
+    // suggestions only.
+    if (
+      !connectionId &&
+      installation.facebookSessionDetected &&
+      installation.detectedFacebookUserId
+    ) {
+      const candidates = await this.findRecoveryCandidates(
+        clerkUserId,
+        installation,
+        installation.detectedFacebookUserId,
+      );
+      if (candidates.length > 0) {
+        return {
+          status: 'RECOVERY_AVAILABLE',
+          candidates,
+          ...(credentialIssued ? { credentialIssued } : {}),
+        };
+      }
+    }
+
     return {
       status: 'ACTIVE',
       connectionId,
@@ -500,16 +566,17 @@ export class ExtensionsService {
     };
   }
 
+  /**
+   * A reinstall registers as a NEW, UNBOUND installation: no Facebook
+   * connection is created or inherited here. The connection is created later
+   * either by the new-connection flow (first verified session with no
+   * recovery candidates) or by an explicit reconnect the user chooses.
+   */
   private async registerNewInstallation(
     clerkUserId: string,
     extensionInstanceId: string,
     extensionName?: unknown,
   ): Promise<RegistrationOutcome> {
-    const connection = await this.upsertConnection(clerkUserId, extensionInstanceId, {
-      workerStatus: FacebookConnectionWorkerStatus.ONLINE,
-    });
-    await this.updateConnectionName(clerkUserId, extensionInstanceId, extensionName);
-
     const now = new Date();
     const credential = generateInstallationCredential();
     const installation = await this.extensionModel.create({
@@ -518,34 +585,34 @@ export class ExtensionsService {
       status: ExtensionLifecycleStatus.ACTIVE,
       statusChangedAt: now,
       lastHeartbeat: now,
-      facebookConnectionId: connection?._id,
       facebookSessionDetected: false,
       credentialHash: hashInstallationCredential(credential),
       credentialVersion: 1,
       credentialIssuedAt: now,
     });
 
-    if (connection?._id) {
-      await this.connectionModel.updateOne(
-        { _id: connection._id },
-        { $set: { activeExtensionInstallationId: installation._id } },
-      );
-      installation.facebookConnectionId = connection._id;
-      await installation.save();
-    }
-
-    await this.recordAudit(ExtensionLifecycleAuditEventName.INSTALLATION_REGISTERED, {
+    // Validates the name (type/length) without requiring a connection; the
+    // name is applied to the connection once one exists.
+    await this.updateConnectionName(
       clerkUserId,
-      installation,
-      connectionId: connection?._id,
-      actor: ExtensionLifecycleActor.WORKER,
-      previousLifecycle: undefined,
-      nextLifecycle: ExtensionLifecycleStatus.ACTIVE,
-    });
+      extensionInstanceId,
+      extensionName,
+    );
+
+    await this.recordAudit(
+      ExtensionLifecycleAuditEventName.INSTALLATION_REGISTERED,
+      {
+        clerkUserId,
+        installation,
+        actor: ExtensionLifecycleActor.WORKER,
+        previousLifecycle: undefined,
+        nextLifecycle: ExtensionLifecycleStatus.ACTIVE,
+      },
+    );
 
     return {
       status: 'NEW_INSTALLATION',
-      connectionId: connection?._id ? String(connection._id) : null,
+      connectionId: null,
       credentialIssued: credential,
     };
   }
@@ -565,12 +632,16 @@ export class ExtensionsService {
     if (!installation.credentialHash) {
       const credential = generateInstallationCredential();
       installation.credentialHash = hashInstallationCredential(credential);
-      installation.credentialVersion = (installation.credentialVersion ?? 0) + 1;
+      installation.credentialVersion =
+        (installation.credentialVersion ?? 0) + 1;
       installation.credentialIssuedAt = new Date();
       credentialIssued = credential;
     }
 
-    let connection = await this.resolveWorkerConnection(clerkUserId, installation);
+    const connection = await this.resolveWorkerConnection(
+      clerkUserId,
+      installation,
+    );
     const workerStatusUpdates = {
       workerStatus: this.nextHeartbeatWorkerStatus(connection?.workerStatus),
     };
@@ -586,22 +657,16 @@ export class ExtensionsService {
         connection.activeExtensionInstallationId = installation._id;
       }
       await connection.save();
-    } else if (!connection) {
-      connection = await this.upsertConnection(
-        clerkUserId,
-        normalizedInstanceId,
-        workerStatusUpdates,
-      );
-      installation.facebookConnectionId = connection?._id;
-      if (connection && !connection.activeExtensionInstallationId) {
-        await this.connectionModel.updateOne(
-          { _id: connection._id },
-          { $set: { activeExtensionInstallationId: installation._id } },
-        );
-      }
     }
+    // No connection → the installation stays UNBOUND on purpose. Connections
+    // are only ever created by the new-connection flow (verified session with
+    // no recovery candidates) or an explicit reconnect.
 
-    await this.updateConnectionName(clerkUserId, normalizedInstanceId, extensionName);
+    await this.updateConnectionName(
+      clerkUserId,
+      normalizedInstanceId,
+      extensionName,
+    );
     await installation.save();
 
     return {
@@ -613,7 +678,8 @@ export class ExtensionsService {
   private nextHeartbeatWorkerStatus(
     existing: FacebookConnectionWorkerStatus | undefined,
   ): FacebookConnectionWorkerStatus {
-    if (existing && PERSISTENT_HEARTBEAT_STATUSES.has(existing)) return existing;
+    if (existing && PERSISTENT_HEARTBEAT_STATUSES.has(existing))
+      return existing;
     return FacebookConnectionWorkerStatus.ONLINE;
   }
 
@@ -635,20 +701,32 @@ export class ExtensionsService {
     );
     const normalizedInstanceId = installation.extensionInstanceId;
     if (!normalizedInstanceId)
-      throw new UnauthorizedException('x-extension-instance-id header is required');
+      throw new UnauthorizedException(
+        'x-extension-instance-id header is required',
+      );
 
     installation.lastHeartbeat = new Date();
     const existingConnection = await this.resolveWorkerConnection(
       clerkUserId,
       installation,
     );
-    const connection = await this.updateConnectionForWorker(clerkUserId, installation, {
-      workerStatus: this.nextHeartbeatWorkerStatus(existingConnection?.workerStatus),
-    });
+    const connection = await this.updateConnectionForWorker(
+      clerkUserId,
+      installation,
+      {
+        workerStatus: this.nextHeartbeatWorkerStatus(
+          existingConnection?.workerStatus,
+        ),
+      },
+    );
     if (connection) {
       installation.facebookConnectionId = connection._id;
     }
-    await this.updateConnectionName(clerkUserId, normalizedInstanceId, extensionName);
+    await this.updateConnectionName(
+      clerkUserId,
+      normalizedInstanceId,
+      extensionName,
+    );
     await installation.save();
     await this.maybeFinalizeRevocation(installation);
 
@@ -668,9 +746,11 @@ export class ExtensionsService {
     workerStatus?: FacebookConnectionWorkerStatus,
     reason?: string,
   ) {
-    if (!Object.values(FacebookConnectionWorkerStatus).includes(
-      workerStatus as FacebookConnectionWorkerStatus,
-    )) {
+    if (
+      !Object.values(FacebookConnectionWorkerStatus).includes(
+        workerStatus as FacebookConnectionWorkerStatus,
+      )
+    ) {
       throw new BadRequestException('Invalid extension worker status');
     }
     const installation = await this.verifyWorkerIdentity(
@@ -679,13 +759,20 @@ export class ExtensionsService {
       credential,
     );
     const connectionStatus = mapWorkerStatusToConnectionStatus(workerStatus!);
-    const connection = await this.updateConnectionForWorker(clerkUserId, installation, {
-      workerStatus,
-      ...(connectionStatus ? { status: connectionStatus } : {}),
-      ...(reason ? { statusReason: reason.slice(0, 500) } : {}),
-    });
+    const connection = await this.updateConnectionForWorker(
+      clerkUserId,
+      installation,
+      {
+        workerStatus,
+        ...(connectionStatus ? { status: connectionStatus } : {}),
+        ...(reason ? { statusReason: reason.slice(0, 500) } : {}),
+      },
+    );
     if (!connection) {
-      throw new NotFoundException('Facebook connection not found.');
+      // An unbound installation has no connection to report status on yet.
+      // Status becomes applicable once the new-connection or recovery flow
+      // completes; this is not an error.
+      return null;
     }
     return this.sanitizeConnection(connection);
   }
@@ -698,23 +785,41 @@ export class ExtensionsService {
     detectedFacebookUserId?: string,
   ): Promise<{
     installation: Record<string, unknown>;
-    connection: Record<string, unknown>;
+    connection: Record<string, unknown> | null;
+    recoveryCandidates: RecoveryCandidate[];
   }> {
     const installation = await this.verifyWorkerIdentity(
       clerkUserId,
       extensionInstanceId,
       credential,
     );
-    const normalizedFacebookUserId = detectedFacebookUserId?.trim() || undefined;
-    const existingConnection =
-      await this.resolveWorkerConnection(clerkUserId, installation);
-    const expectedFacebookUserId = existingConnection?.facebookUserId?.trim();
-    const identityMismatch = sessionDetected && (
-      !normalizedFacebookUserId ||
-      Boolean(
-        expectedFacebookUserId && expectedFacebookUserId !== normalizedFacebookUserId,
-      )
+    const normalizedFacebookUserId =
+      detectedFacebookUserId?.trim() || undefined;
+    const existingConnection = await this.resolveWorkerConnection(
+      clerkUserId,
+      installation,
     );
+
+    // A new (reinstalled) installation has no connection yet. Until the user
+    // decides, the session report only verifies identity and surfaces
+    // recovery candidates — it never binds automatically.
+    if (!existingConnection) {
+      return this.handleUnboundSession(
+        clerkUserId,
+        installation,
+        Boolean(sessionDetected),
+        normalizedFacebookUserId,
+      );
+    }
+
+    const expectedFacebookUserId = existingConnection.facebookUserId?.trim();
+    const identityMismatch =
+      sessionDetected &&
+      (!normalizedFacebookUserId ||
+        Boolean(
+          expectedFacebookUserId &&
+          expectedFacebookUserId !== normalizedFacebookUserId,
+        ));
     const shouldBindIdentity = Boolean(
       sessionDetected && normalizedFacebookUserId && !expectedFacebookUserId,
     );
@@ -739,29 +844,182 @@ export class ExtensionsService {
           ? existingConnection.workerStatus
           : FacebookConnectionWorkerStatus.IDLE;
 
-    const connection = await this.updateConnectionForWorker(clerkUserId, installation, {
-      status: connectionStatus,
-      workerStatus,
-      facebookSessionDetected: Boolean(sessionDetected),
-      ...(normalizedFacebookUserId
-        ? { detectedFacebookUserId: normalizedFacebookUserId }
-        : {}),
-      ...(shouldBindIdentity
-        ? { facebookUserId: normalizedFacebookUserId }
-        : {}),
-    });
+    const connection = await this.updateConnectionForWorker(
+      clerkUserId,
+      installation,
+      {
+        status: connectionStatus,
+        workerStatus,
+        facebookSessionDetected: Boolean(sessionDetected),
+        ...(normalizedFacebookUserId
+          ? { detectedFacebookUserId: normalizedFacebookUserId }
+          : {}),
+        ...(shouldBindIdentity
+          ? { facebookUserId: normalizedFacebookUserId }
+          : {}),
+      },
+    );
     if (!connection) {
       throw new NotFoundException('Facebook connection not found.');
     }
 
     installation.facebookSessionDetected = Boolean(sessionDetected);
+    if (normalizedFacebookUserId) {
+      installation.detectedFacebookUserId = normalizedFacebookUserId;
+    }
     installation.lastHeartbeat = new Date();
     await installation.save();
 
     return {
       installation: this.sanitizeInstallation(installation),
       connection: this.sanitizeConnection(connection),
+      recoveryCandidates: [],
     };
+  }
+
+  /**
+   * Session report for an installation that has no connection yet (a fresh
+   * reinstall). Verifies the PostFlow user context (credential gate above) and
+   * the detected Facebook identity, then either offers recovery candidates or
+   * completes the new-connection flow. The installation is never bound to an
+   * existing connection here — that requires an explicit user decision.
+   */
+  private async handleUnboundSession(
+    clerkUserId: string,
+    installation: ExtensionInstallationDocument,
+    sessionDetected: boolean,
+    detectedFacebookUserId?: string,
+  ): Promise<{
+    installation: Record<string, unknown>;
+    connection: Record<string, unknown> | null;
+    recoveryCandidates: RecoveryCandidate[];
+  }> {
+    installation.lastHeartbeat = new Date();
+
+    if (!sessionDetected || !detectedFacebookUserId) {
+      installation.facebookSessionDetected = false;
+      await installation.save();
+      return {
+        installation: this.sanitizeInstallation(installation),
+        connection: null,
+        recoveryCandidates: [],
+      };
+    }
+
+    installation.facebookSessionDetected = true;
+    installation.detectedFacebookUserId = detectedFacebookUserId;
+    await installation.save();
+
+    const candidates = await this.findRecoveryCandidates(
+      clerkUserId,
+      installation,
+      detectedFacebookUserId,
+    );
+    if (candidates.length > 0) {
+      // Identity match only creates a suggestion. Binding happens exclusively
+      // through POST /api/extensions/reconnect after the user chooses.
+      return {
+        installation: this.sanitizeInstallation(installation),
+        connection: null,
+        recoveryCandidates: candidates,
+      };
+    }
+
+    // No recoverable previous connection: complete the new-connection flow.
+    const normalizedInstanceId = installation.extensionInstanceId;
+    if (!normalizedInstanceId) {
+      return {
+        installation: this.sanitizeInstallation(installation),
+        connection: null,
+        recoveryCandidates: [],
+      };
+    }
+    const connection = await this.upsertConnection(
+      clerkUserId,
+      normalizedInstanceId,
+      {
+        status: FacebookConnectionStatus.CONNECTED,
+        workerStatus: FacebookConnectionWorkerStatus.IDLE,
+        facebookSessionDetected: true,
+        facebookUserId: detectedFacebookUserId,
+        detectedFacebookUserId,
+        activeExtensionInstallationId: installation._id,
+      },
+    );
+    if (connection) {
+      installation.facebookConnectionId = connection._id;
+      await installation.save();
+    }
+
+    return {
+      installation: this.sanitizeInstallation(installation),
+      connection: connection ? this.sanitizeConnection(connection) : null,
+      recoveryCandidates: [],
+    };
+  }
+
+  /**
+   * Finds connections this PostFlow user owns that the newly detected Facebook
+   * identity could explicitly recover. Suggestions only — never an auto-bind:
+   *
+   * - not archived (archived connections restore only through Archived)
+   * - expected Facebook user id matches the newly detected one
+   * - not currently publishing
+   * - active installation offline, revoked, or missing
+   */
+  private async findRecoveryCandidates(
+    clerkUserId: string,
+    installation: ExtensionInstallationDocument,
+    detectedFacebookUserId: string,
+  ): Promise<RecoveryCandidate[]> {
+    const connections = await this.connectionModel
+      .find({
+        clerkUserId,
+        archivedAt: null,
+        facebookUserId: detectedFacebookUserId,
+        workerStatus: { $ne: FacebookConnectionWorkerStatus.PUBLISHING },
+        _id: { $ne: installation.facebookConnectionId ?? null },
+      })
+      .sort({ lastSeenAt: -1 })
+      .limit(5)
+      .exec();
+
+    const candidates: RecoveryCandidate[] = [];
+    for (const connection of connections) {
+      const activeInstallation = connection.activeExtensionInstallationId
+        ? await this.extensionModel
+            .findById(connection.activeExtensionInstallationId)
+            .exec()
+        : null;
+
+      if (activeInstallation) {
+        if (String(activeInstallation._id) === String(installation._id))
+          continue;
+        const revoked =
+          activeInstallation.status === ExtensionLifecycleStatus.REVOKED;
+        const online = deriveConnectivity(
+          activeInstallation.lastHeartbeat,
+        ).isOnline;
+        // A healthy live worker is not recoverable. A revoked installation may
+        // still be online for a moment; it is a candidate and the reconnect
+        // endpoint requires stronger confirmation while it stays online.
+        if (!revoked && online) continue;
+        candidates.push({
+          connectionId: String(connection._id),
+          displayName: connection.displayName ?? undefined,
+          facebookUserId: connection.facebookUserId ?? undefined,
+          activeInstallationOnline: online,
+        });
+      } else {
+        candidates.push({
+          connectionId: String(connection._id),
+          displayName: connection.displayName ?? undefined,
+          facebookUserId: connection.facebookUserId ?? undefined,
+          activeInstallationOnline: false,
+        });
+      }
+    }
+    return candidates;
   }
 
   async rename(
@@ -777,18 +1035,329 @@ export class ExtensionsService {
     );
     const normalizedInstanceId = installation.extensionInstanceId;
     if (!normalizedInstanceId)
-      throw new UnauthorizedException('x-extension-instance-id header is required');
-    await this.updateConnectionName(clerkUserId, normalizedInstanceId, extensionName);
-    const connection = await this.resolveWorkerConnection(clerkUserId, installation);
+      throw new UnauthorizedException(
+        'x-extension-instance-id header is required',
+      );
+    await this.updateConnectionName(
+      clerkUserId,
+      normalizedInstanceId,
+      extensionName,
+    );
+    const connection = await this.resolveWorkerConnection(
+      clerkUserId,
+      installation,
+    );
     if (!connection)
       throw new NotFoundException('Facebook connection not found.');
     return { displayName: connection.displayName ?? null };
   }
 
+  // ── Reinstall recovery (worker, explicit user decision) ───────────────────
+
+  /**
+   * Explicit reconnect for a reinstalled (or restored) installation.
+   *
+   * Called only after the user chose "Reconnect …" (or "Create a new
+   * connection") — identity match alone never binds. On success the swap is
+   * atomic from the caller's perspective: a single guarded findOneAndUpdate
+   * decides the single winner, the old installation is revoked with reason
+   * REPLACED, and the connection's ID, name, groups, jobs, and history are
+   * preserved untouched.
+   */
+  async reconnect(
+    clerkUserId: string,
+    extensionInstanceId?: string,
+    credential?: string,
+    options?: {
+      connectionId?: string;
+      createNewConnection?: boolean;
+      confirmReplacement?: boolean;
+      approvalToken?: string;
+    },
+  ): Promise<Record<string, unknown>> {
+    const installation = await this.verifyWorkerIdentity(
+      clerkUserId,
+      extensionInstanceId,
+      credential,
+    );
+    const normalizedInstanceId = installation.extensionInstanceId;
+    if (!normalizedInstanceId)
+      throw new UnauthorizedException(
+        'x-extension-instance-id header is required',
+      );
+
+    // Every recovery decision, including "Create a new connection", is made
+    // only after this concrete installation has reported a Facebook identity.
+    // The caller-controlled PostFlow user id and an installation credential
+    // alone are not enough to create or inherit a logical connection.
+    if (
+      !installation.facebookSessionDetected ||
+      !installation.detectedFacebookUserId
+    ) {
+      throw new ConflictException(
+        'Facebook identity has not been verified for this installation.',
+      );
+    }
+
+    // Explicit "Create a new connection" choice. Idempotent: if this
+    // installation already has a connection, report it instead of duplicating.
+    if (options?.createNewConnection) {
+      const existing = await this.resolveWorkerConnection(
+        clerkUserId,
+        installation,
+      );
+      if (existing && !existing.archivedAt) {
+        return this.toReconnectResult(existing, installation);
+      }
+      if (existing?.archivedAt) {
+        throw new ConflictException(
+          'This installation belongs to an archived connection. Restore it with a reconnect approval code.',
+        );
+      }
+      const connection = await this.upsertConnection(
+        clerkUserId,
+        normalizedInstanceId,
+        {
+          status: FacebookConnectionStatus.CONNECTED,
+          workerStatus: FacebookConnectionWorkerStatus.IDLE,
+          facebookSessionDetected: true,
+          facebookUserId: installation.detectedFacebookUserId,
+          detectedFacebookUserId: installation.detectedFacebookUserId,
+          activeExtensionInstallationId: installation._id,
+        },
+      );
+      if (!connection) {
+        throw new ConflictException(
+          'Could not create the connection. Try again.',
+        );
+      }
+      connection.activeExtensionInstallationId = installation._id;
+      await connection.save();
+      installation.facebookConnectionId = connection._id;
+      await installation.save();
+      return this.toReconnectResult(connection, installation);
+    }
+
+    // Target resolution: an explicit connection id, or a dashboard-issued
+    // approval code whose hash identifies the connection to restore.
+    let targetConnectionId = options?.connectionId?.trim();
+    if (!targetConnectionId && options?.approvalToken) {
+      const byToken = await this.connectionModel
+        .findOne({
+          clerkUserId,
+          reconnectApprovalTokenHash: hashInstallationCredential(
+            options.approvalToken,
+          ),
+        })
+        .exec();
+      if (!byToken) {
+        throw new ForbiddenException('This reconnect approval is invalid.');
+      }
+      targetConnectionId = String(byToken._id);
+    }
+    if (!targetConnectionId) {
+      throw new BadRequestException(
+        'connectionId or createNewConnection is required.',
+      );
+    }
+
+    const target = await this.requireOwnedConnection(
+      clerkUserId,
+      targetConnectionId,
+    );
+
+    // Verify the new installation's detected Facebook identity before any
+    // rebind; ownership plus a matching identity is still not an auto-bind.
+    if (
+      !target.facebookUserId ||
+      target.facebookUserId !== installation.detectedFacebookUserId
+    ) {
+      throw new ConflictException(
+        'The detected Facebook account does not match this connection.',
+      );
+    }
+
+    // Idempotency: a network retry after a completed reconnect reports
+    // success again instead of failing or re-running the swap.
+    const currentBinding = await this.resolveWorkerConnection(
+      clerkUserId,
+      installation,
+    );
+    if (currentBinding && String(currentBinding._id) === String(target._id)) {
+      return this.toReconnectResult(target, installation);
+    }
+    if (currentBinding) {
+      throw new ConflictException(
+        'This installation is already connected to a different connection. Disconnect it first.',
+      );
+    }
+
+    // Archived connections restore only through an explicit, unexpired,
+    // single-use approval issued by the dashboard.
+    let approvalVerified = false;
+    if (options?.approvalToken && target.reconnectApprovalTokenHash) {
+      approvalVerified = verifyInstallationCredential(
+        options.approvalToken,
+        target.reconnectApprovalTokenHash,
+      );
+    }
+    if (target.archivedAt) {
+      if (!options?.approvalToken) {
+        throw new ForbiddenException(
+          'Restoring an archived connection requires a reconnect approval code.',
+        );
+      }
+      if (
+        !target.reconnectApprovalTokenHash ||
+        !target.reconnectApprovalExpiresAt
+      ) {
+        throw new ForbiddenException('No reconnect approval is pending.');
+      }
+      if (target.reconnectApprovalUsedAt) {
+        throw new ForbiddenException(
+          'This reconnect approval has already been used.',
+        );
+      }
+      if (target.reconnectApprovalExpiresAt.getTime() < Date.now()) {
+        throw new ForbiddenException('This reconnect approval has expired.');
+      }
+      if (!approvalVerified) {
+        throw new ForbiddenException('This reconnect approval is invalid.');
+      }
+    }
+
+    const previousActiveId = target.activeExtensionInstallationId ?? null;
+    // Also resolve a holder whose active binding is unset (mid-disconnect) so
+    // the swap can revoke it and keep the one-active-installation index
+    // satisfied when the new installation takes the binding.
+    const previousInstallation = await this.findBoundInstallation(target);
+
+    if (
+      previousInstallation &&
+      String(previousInstallation._id) !== String(installation._id)
+    ) {
+      const online = deriveConnectivity(
+        previousInstallation.lastHeartbeat,
+      ).isOnline;
+      const alive =
+        previousInstallation.status !== ExtensionLifecycleStatus.REVOKED;
+      if (alive && online) {
+        if (target.workerStatus === FacebookConnectionWorkerStatus.PUBLISHING) {
+          throw new ConflictException(
+            'The previous extension is publishing right now. Try again after the job finishes.',
+          );
+        }
+        if (!options?.confirmReplacement) {
+          throw new ConflictException(
+            'REPLACEMENT_CONFIRMATION_REQUIRED: The previous extension is still online. Confirm the replacement to continue.',
+          );
+        }
+      }
+    }
+
+    // Atomic claim: this single guarded findOneAndUpdate decides the single
+    // winner. A concurrent reconnect by another installation fails the guard;
+    // a retry of an already-completed reconnect matches the caller's own
+    // binding and succeeds idempotently. Unarchiving and approval consumption
+    // happen in the same write.
+    const claimSet: Record<string, unknown> = {
+      activeExtensionInstallationId: installation._id,
+      extensionInstanceId: normalizedInstanceId,
+      status: FacebookConnectionStatus.CONNECTED,
+      workerStatus: FacebookConnectionWorkerStatus.IDLE,
+      facebookSessionDetected: true,
+      detectedFacebookUserId: installation.detectedFacebookUserId,
+      lastSeenAt: new Date(),
+    };
+    if (approvalVerified) {
+      claimSet.reconnectApprovalUsedAt = new Date();
+    }
+    const claimUpdate: Record<string, unknown> = { $set: claimSet };
+    if (target.archivedAt) {
+      claimUpdate.$unset = {
+        archivedAt: 1,
+        archivedByClerkUserId: 1,
+        archiveReason: 1,
+      };
+    }
+    return this.runRecoveryTransaction(async (session) => {
+      const claimQuery = this.connectionModel.findOneAndUpdate(
+        {
+          _id: target._id,
+          $or: [
+            { activeExtensionInstallationId: previousActiveId },
+            { activeExtensionInstallationId: installation._id },
+          ],
+        },
+        claimUpdate,
+        { returnDocument: 'after' },
+      );
+      if (session) claimQuery.session(session);
+      const claimed = await claimQuery.exec();
+      if (!claimed) {
+        throw new ConflictException(
+          'RECONNECT_CONFLICT: Another reconnect already claimed this connection. Refresh and try again.',
+        );
+      }
+
+      // Revoke the old installation with reason REPLACED only after winning
+      // the guarded claim. The transaction makes the revocation and both
+      // sides of the new binding visible together.
+      if (
+        previousInstallation &&
+        String(previousInstallation._id) !== String(installation._id) &&
+        previousInstallation.status !== ExtensionLifecycleStatus.REVOKED
+      ) {
+        const previousStatus = previousInstallation.status;
+        previousInstallation.replacedByInstallationId = installation._id;
+        await this.revokeInstallation(previousInstallation, {
+          reason: ExtensionRevocationReason.REPLACED,
+          byClerkUserId: clerkUserId,
+          actor: ExtensionLifecycleActor.WORKER,
+          session,
+        });
+        await this.recordAudit(
+          ExtensionLifecycleAuditEventName.INSTALLATION_REPLACED,
+          {
+            clerkUserId,
+            installation: previousInstallation,
+            connectionId: target._id,
+            actor: ExtensionLifecycleActor.WORKER,
+            previousLifecycle: previousStatus,
+            nextLifecycle: ExtensionLifecycleStatus.REVOKED,
+            reason: ExtensionRevocationReason.REPLACED,
+          },
+          session,
+        );
+      }
+
+      installation.facebookConnectionId = target._id;
+      await installation.save(session ? { session } : undefined);
+
+      await this.recordAudit(
+        ExtensionLifecycleAuditEventName.RECOVERY_ACCEPTED,
+        {
+          clerkUserId,
+          installation,
+          connectionId: target._id,
+          actor: ExtensionLifecycleActor.WORKER,
+          previousLifecycle: installation.status,
+          nextLifecycle: installation.status,
+        },
+        session,
+      );
+
+      return this.toReconnectResult(claimed, installation);
+    });
+  }
+
   // ── Lifecycle mutations (dashboard, owner-authorized) ─────────────────────
 
   async pauseConnection(clerkUserId: string, connectionId: string) {
-    const connection = await this.requireOwnedConnection(clerkUserId, connectionId);
+    const connection = await this.requireOwnedConnection(
+      clerkUserId,
+      connectionId,
+    );
     const installation = await this.findBoundInstallation(connection);
     if (!installation)
       throw new ConflictException(
@@ -809,20 +1378,26 @@ export class ExtensionsService {
     installation.statusReason = undefined;
     await installation.save();
 
-    await this.recordAudit(ExtensionLifecycleAuditEventName.INSTALLATION_PAUSED, {
-      clerkUserId,
-      installation,
-      connectionId: connection._id,
-      actor: ExtensionLifecycleActor.DASHBOARD,
-      previousLifecycle: previous,
-      nextLifecycle: ExtensionLifecycleStatus.PAUSED,
-    });
+    await this.recordAudit(
+      ExtensionLifecycleAuditEventName.INSTALLATION_PAUSED,
+      {
+        clerkUserId,
+        installation,
+        connectionId: connection._id,
+        actor: ExtensionLifecycleActor.DASHBOARD,
+        previousLifecycle: previous,
+        nextLifecycle: ExtensionLifecycleStatus.PAUSED,
+      },
+    );
 
     return this.toConnectionState(connection, installation);
   }
 
   async resumeConnection(clerkUserId: string, connectionId: string) {
-    const connection = await this.requireOwnedConnection(clerkUserId, connectionId);
+    const connection = await this.requireOwnedConnection(
+      clerkUserId,
+      connectionId,
+    );
     const installation = await this.findBoundInstallation(connection);
     if (!installation)
       throw new ConflictException(
@@ -844,14 +1419,17 @@ export class ExtensionsService {
     installation.statusReason = undefined;
     await installation.save();
 
-    await this.recordAudit(ExtensionLifecycleAuditEventName.INSTALLATION_RESUMED, {
-      clerkUserId,
-      installation,
-      connectionId: connection._id,
-      actor: ExtensionLifecycleActor.DASHBOARD,
-      previousLifecycle: previous,
-      nextLifecycle: ExtensionLifecycleStatus.ACTIVE,
-    });
+    await this.recordAudit(
+      ExtensionLifecycleAuditEventName.INSTALLATION_RESUMED,
+      {
+        clerkUserId,
+        installation,
+        connectionId: connection._id,
+        actor: ExtensionLifecycleActor.DASHBOARD,
+        previousLifecycle: previous,
+        nextLifecycle: ExtensionLifecycleStatus.ACTIVE,
+      },
+    );
 
     return this.toConnectionState(connection, installation);
   }
@@ -861,7 +1439,10 @@ export class ExtensionsService {
     connectionId: string,
     force = false,
   ) {
-    const connection = await this.requireOwnedConnection(clerkUserId, connectionId);
+    const connection = await this.requireOwnedConnection(
+      clerkUserId,
+      connectionId,
+    );
     const installation = await this.findBoundInstallation(connection);
     if (!installation)
       throw new ConflictException(
@@ -906,10 +1487,16 @@ export class ExtensionsService {
   }
 
   async removeConnection(clerkUserId: string, connectionId: string) {
-    const connection = await this.requireOwnedConnection(clerkUserId, connectionId);
+    const connection = await this.requireOwnedConnection(
+      clerkUserId,
+      connectionId,
+    );
     const installation = await this.findBoundInstallation(connection);
 
-    if (installation && installation.status !== ExtensionLifecycleStatus.REVOKED) {
+    if (
+      installation &&
+      installation.status !== ExtensionLifecycleStatus.REVOKED
+    ) {
       await this.revokeInstallation(installation, {
         reason: ExtensionRevocationReason.REMOVED,
         byClerkUserId: clerkUserId,
@@ -923,20 +1510,26 @@ export class ExtensionsService {
       connection.archivedByClerkUserId = clerkUserId;
       connection.archiveReason = ExtensionRevocationReason.REMOVED;
       await connection.save();
-      await this.recordAudit(ExtensionLifecycleAuditEventName.CONNECTION_ARCHIVED, {
-        clerkUserId,
-        installation,
-        connectionId: connection._id,
-        actor: ExtensionLifecycleActor.DASHBOARD,
-        reason: ExtensionRevocationReason.REMOVED,
-      });
+      await this.recordAudit(
+        ExtensionLifecycleAuditEventName.CONNECTION_ARCHIVED,
+        {
+          clerkUserId,
+          installation,
+          connectionId: connection._id,
+          actor: ExtensionLifecycleActor.DASHBOARD,
+          reason: ExtensionRevocationReason.REMOVED,
+        },
+      );
     }
 
     return this.toConnectionState(connection, installation);
   }
 
   async issueReconnectApproval(clerkUserId: string, connectionId: string) {
-    const connection = await this.requireOwnedConnection(clerkUserId, connectionId);
+    const connection = await this.requireOwnedConnection(
+      clerkUserId,
+      connectionId,
+    );
     const token = generateInstallationCredential();
     const now = new Date();
     connection.reconnectApprovalTokenHash = hashInstallationCredential(token);
@@ -964,17 +1557,30 @@ export class ExtensionsService {
     connectionId: string,
     approvalToken: string,
   ) {
-    const connection = await this.requireOwnedConnection(clerkUserId, connectionId);
-    if (!connection.reconnectApprovalTokenHash || !connection.reconnectApprovalExpiresAt) {
+    const connection = await this.requireOwnedConnection(
+      clerkUserId,
+      connectionId,
+    );
+    if (
+      !connection.reconnectApprovalTokenHash ||
+      !connection.reconnectApprovalExpiresAt
+    ) {
       throw new ForbiddenException('No reconnect approval is pending.');
     }
     if (connection.reconnectApprovalUsedAt) {
-      throw new ForbiddenException('This reconnect approval has already been used.');
+      throw new ForbiddenException(
+        'This reconnect approval has already been used.',
+      );
     }
     if (connection.reconnectApprovalExpiresAt.getTime() < Date.now()) {
       throw new ForbiddenException('This reconnect approval has expired.');
     }
-    if (!verifyInstallationCredential(approvalToken, connection.reconnectApprovalTokenHash)) {
+    if (
+      !verifyInstallationCredential(
+        approvalToken,
+        connection.reconnectApprovalTokenHash,
+      )
+    ) {
       throw new ForbiddenException('This reconnect approval is invalid.');
     }
     connection.reconnectApprovalUsedAt = new Date();
@@ -1006,9 +1612,7 @@ export class ExtensionsService {
         ? String(connection.activeExtensionInstallationId)
         : null;
       const installation =
-        (boundId
-          ? installationByConnectionId.get(boundId)
-          : undefined) ??
+        (boundId ? installationByConnectionId.get(boundId) : undefined) ??
         installationByConnectionId.get(connection._id?.toString?.()) ??
         bestInstallationForConnection(
           (installations as LeanExtensionInstallation[]).filter(
@@ -1021,7 +1625,9 @@ export class ExtensionsService {
     });
   }
 
-  async listArchivedConnections(clerkUserId: string): Promise<ConnectionState[]> {
+  async listArchivedConnections(
+    clerkUserId: string,
+  ): Promise<ConnectionState[]> {
     const [connections, installations] = await Promise.all([
       this.connectionModel
         .find({ clerkUserId, archivedAt: { $ne: null } })
@@ -1043,9 +1649,7 @@ export class ExtensionsService {
         ? String(connection.activeExtensionInstallationId)
         : null;
       const installation =
-        (boundId
-          ? installationByConnectionId.get(boundId)
-          : undefined) ??
+        (boundId ? installationByConnectionId.get(boundId) : undefined) ??
         installationByConnectionId.get(connection._id?.toString?.()) ??
         bestInstallationForConnection(
           (installations as LeanExtensionInstallation[]).filter(
@@ -1062,13 +1666,14 @@ export class ExtensionsService {
     connection: ConnectionLike,
     installation?: InstallationLike | null,
   ): ConnectionState {
-    const instanceId = installation?.extensionInstanceId ?? connection.extensionInstanceId;
+    const instanceId =
+      installation?.extensionInstanceId ?? connection.extensionInstanceId;
     const connectivity = deriveConnectivity(installation?.lastHeartbeat);
     const approvalPending = Boolean(
       connection.reconnectApprovalTokenHash &&
-        connection.reconnectApprovalExpiresAt &&
-        !connection.reconnectApprovalUsedAt &&
-        connection.reconnectApprovalExpiresAt.getTime() >= Date.now(),
+      connection.reconnectApprovalExpiresAt &&
+      !connection.reconnectApprovalUsedAt &&
+      connection.reconnectApprovalExpiresAt.getTime() >= Date.now(),
     );
     return {
       _id: String(connection._id),
@@ -1081,7 +1686,9 @@ export class ExtensionsService {
       facebookSessionDetected: connection.facebookSessionDetected ?? false,
       lastSeenAt: connection.lastSeenAt,
       extensionInstanceId: instanceId ?? null,
-      extensionInstanceIdMasked: maskExtensionInstanceId(instanceId ?? undefined),
+      extensionInstanceIdMasked: maskExtensionInstanceId(
+        instanceId ?? undefined,
+      ),
       activeExtensionInstallationId: connection.activeExtensionInstallationId
         ? String(connection.activeExtensionInstallationId)
         : null,
@@ -1100,15 +1707,25 @@ export class ExtensionsService {
     };
   }
 
+  private toReconnectResult(
+    connection: ConnectionLike,
+    installation?: InstallationLike | null,
+  ): ConnectionState & { connectionId: string } {
+    return {
+      ...this.toConnectionState(connection, installation),
+      connectionId: String(connection._id),
+    };
+  }
+
   private sanitizeConnection(
     connection: FacebookConnectionDocument,
   ): Record<string, unknown> {
-    const document = connection.toObject ? connection.toObject() : connection;
-    const { reconnectApprovalTokenHash, reconnectApprovalUsedAt, ...safe } =
-      document as Record<string, unknown> & {
-        reconnectApprovalTokenHash?: string;
-        reconnectApprovalUsedAt?: Date;
-      };
+    const document = connection.toObject
+      ? (connection.toObject() as unknown)
+      : connection;
+    const safe = { ...(document as Record<string, unknown>) };
+    delete safe.reconnectApprovalTokenHash;
+    delete safe.reconnectApprovalUsedAt;
     return { ...safe, _id: String(connection._id) };
   }
 
@@ -1116,17 +1733,19 @@ export class ExtensionsService {
     installation: ExtensionInstallationDocument,
   ): Record<string, unknown> {
     const document = installation.toObject
-      ? installation.toObject()
+      ? (installation.toObject() as unknown)
       : installation;
-    const { credentialHash, ...safe } = document as Record<string, unknown> & {
-      credentialHash?: string;
-    };
+    const safe = { ...(document as Record<string, unknown>) };
+    delete safe.credentialHash;
     return { ...safe, _id: String(installation._id) };
   }
 
   // ── Internal helpers ──────────────────────────────────────────────────────
 
-  private async requireOwnedConnection(clerkUserId: string, connectionId: string) {
+  private async requireOwnedConnection(
+    clerkUserId: string,
+    connectionId: string,
+  ) {
     if (!Types.ObjectId.isValid(connectionId)) {
       throw new NotFoundException('Facebook connection not found.');
     }
@@ -1137,6 +1756,29 @@ export class ExtensionsService {
       throw new NotFoundException('Facebook connection not found.');
     }
     return connection;
+  }
+
+  private async runRecoveryTransaction<T>(
+    operation: (session?: ClientSession) => Promise<T>,
+  ): Promise<T> {
+    // Unit-test model doubles do not expose a Mongoose connection. Production
+    // models do, and recovery must commit the connection claim, old-worker
+    // revocation, new binding, and audits as one transaction.
+    const database = this.connectionModel.db;
+    if (!database?.startSession) return operation();
+
+    const session = await database.startSession();
+    try {
+      session.startTransaction();
+      const result = await operation(session);
+      await session.commitTransaction();
+      return result;
+    } catch (error) {
+      if (session.inTransaction()) await session.abortTransaction();
+      throw error;
+    } finally {
+      await session.endSession();
+    }
   }
 
   private async findBoundInstallation(
@@ -1153,7 +1795,9 @@ export class ExtensionsService {
       .sort({ statusChangedAt: -1, createdAt: -1 })
       .exec();
     return (
-      candidates.find((candidate) => candidate.status !== ExtensionLifecycleStatus.REVOKED) ??
+      candidates.find(
+        (candidate) => candidate.status !== ExtensionLifecycleStatus.REVOKED,
+      ) ??
       candidates[0] ??
       null
     );
@@ -1165,7 +1809,8 @@ export class ExtensionsService {
   ) {
     if (
       connection.activeExtensionInstallationId &&
-      String(connection.activeExtensionInstallationId) === String(installation._id)
+      String(connection.activeExtensionInstallationId) ===
+        String(installation._id)
     ) {
       await this.connectionModel.updateOne(
         { _id: connection._id },
@@ -1181,6 +1826,7 @@ export class ExtensionsService {
       reason: ExtensionRevocationReason;
       byClerkUserId?: string;
       actor: ExtensionLifecycleActor;
+      session?: ClientSession;
     },
   ) {
     const previous = installation.status;
@@ -1194,17 +1840,23 @@ export class ExtensionsService {
     installation.revocationReason = options.reason;
     installation.credentialRevokedAt = now;
     installation.credentialVersion = (installation.credentialVersion ?? 0) + 1;
-    await installation.save();
+    await installation.save(
+      options.session ? { session: options.session } : undefined,
+    );
 
-    await this.recordAudit(ExtensionLifecycleAuditEventName.INSTALLATION_REVOKED, {
-      clerkUserId: installation.clerkUserId,
-      installation,
-      connectionId: installation.facebookConnectionId,
-      actor: options.actor,
-      previousLifecycle: previous,
-      nextLifecycle: ExtensionLifecycleStatus.REVOKED,
-      reason: options.reason,
-    });
+    await this.recordAudit(
+      ExtensionLifecycleAuditEventName.INSTALLATION_REVOKED,
+      {
+        clerkUserId: installation.clerkUserId,
+        installation,
+        connectionId: installation.facebookConnectionId,
+        actor: options.actor,
+        previousLifecycle: previous,
+        nextLifecycle: ExtensionLifecycleStatus.REVOKED,
+        reason: options.reason,
+      },
+      options.session,
+    );
   }
 
   /**
@@ -1216,7 +1868,8 @@ export class ExtensionsService {
   private async maybeFinalizeRevocation(
     installation: ExtensionInstallationDocument,
   ): Promise<boolean> {
-    if (installation.status !== ExtensionLifecycleStatus.REVOKE_PENDING) return false;
+    if (installation.status !== ExtensionLifecycleStatus.REVOKE_PENDING)
+      return false;
     const instanceId = installation.extensionInstanceId;
     if (!instanceId) return false;
     const now = new Date();
@@ -1250,7 +1903,10 @@ export class ExtensionsService {
 
     if (installation.facebookConnectionId) {
       await this.connectionModel.updateOne(
-        { _id: installation.facebookConnectionId, activeExtensionInstallationId: installation._id },
+        {
+          _id: installation.facebookConnectionId,
+          activeExtensionInstallationId: installation._id,
+        },
         { $unset: { activeExtensionInstallationId: 1 } },
       );
     }
@@ -1290,7 +1946,9 @@ export class ExtensionsService {
       .select('_id')
       .lean()
       .exec();
-    if (!current) throw new NotFoundException('Facebook connection not found.');
+    // An unbound installation has no connection to name yet. The name is
+    // applied by the next heartbeat or rename once a connection exists.
+    if (!current) return;
 
     const duplicate = await this.connectionModel
       .findOne({
@@ -1302,7 +1960,9 @@ export class ExtensionsService {
       .lean()
       .exec();
     if (duplicate) {
-      throw new ConflictException('An extension with this name already exists.');
+      throw new ConflictException(
+        'An extension with this name already exists.',
+      );
     }
 
     try {
@@ -1313,14 +1973,23 @@ export class ExtensionsService {
         .exec();
     } catch (error) {
       if (isDuplicateKeyError(error)) {
-        throw new ConflictException('An extension with this name already exists.');
+        throw new ConflictException(
+          'An extension with this name already exists.',
+        );
       }
       throw error;
     }
   }
 
-  async renameConnection(clerkUserId: string, connectionId: string, name: unknown) {
-    const connection = await this.requireOwnedConnection(clerkUserId, connectionId);
+  async renameConnection(
+    clerkUserId: string,
+    connectionId: string,
+    name: unknown,
+  ) {
+    const connection = await this.requireOwnedConnection(
+      clerkUserId,
+      connectionId,
+    );
     if (name === undefined || name === null) {
       throw new BadRequestException('A connection name is required.');
     }
@@ -1348,7 +2017,9 @@ export class ExtensionsService {
       .lean()
       .exec();
     if (duplicate) {
-      throw new ConflictException('An extension with this name already exists.');
+      throw new ConflictException(
+        'An extension with this name already exists.',
+      );
     }
 
     try {
@@ -1357,7 +2028,9 @@ export class ExtensionsService {
       await connection.save();
     } catch (error) {
       if (isDuplicateKeyError(error)) {
-        throw new ConflictException('An extension with this name already exists.');
+        throw new ConflictException(
+          'An extension with this name already exists.',
+        );
       }
       throw error;
     }
@@ -1428,8 +2101,7 @@ function bestInstallationForConnection<T extends { status?: string | null }>(
 ): T | undefined {
   if (!candidates.length) return undefined;
   const active = candidates.filter(
-    (candidate) =>
-      candidate.status !== ExtensionLifecycleStatus.REVOKED,
+    (candidate) => candidate.status !== ExtensionLifecycleStatus.REVOKED,
   );
   return active[0] ?? candidates[0];
 }

@@ -15,6 +15,48 @@
       </div>
       <span class="page-status" id="status">Checking...</span>
     </header>
+    <section class="connection-progress" id="connection-progress" aria-live="polite">
+      <p class="eyebrow">Connection setup</p>
+      <div class="setup-steps" aria-label="Connection setup progress">
+        <div class="setup-step" id="setup-step-account">
+          <span class="setup-step-dot">1</span>
+          <span>PostFlow account</span>
+        </div>
+        <div class="setup-step" id="setup-step-installation">
+          <span class="setup-step-dot">2</span>
+          <span>Register extension</span>
+        </div>
+        <div class="setup-step" id="setup-step-facebook">
+          <span class="setup-step-dot">3</span>
+          <span>Verify Facebook</span>
+        </div>
+      </div>
+      <p class="connection-detail" id="connection-detail">Starting the PostFlow connection check…</p>
+      <p class="connection-account" id="connection-account"></p>
+      <p class="connection-updated" id="connection-updated">Waiting for the first status update</p>
+      <button class="secondary-button connection-action" id="refresh-connection" type="button" hidden>
+        Connect to PostFlow dashboard
+      </button>
+    </section>
+
+    <div id="lifecycle-dashboard-link" class="lifecycle-dashboard-link" hidden>
+      <a id="open-dashboard-for-recovery" class="secondary-button" href="#" target="_blank">
+        Open dashboard to manage connection
+      </a>
+    </div>
+
+    <section id="recovery-panel" class="recovery-panel" aria-labelledby="recovery-title" hidden>
+      <p class="eyebrow">Reinstall recovery</p>
+      <h2 id="recovery-title">Choose how to connect this installation</h2>
+      <p class="recovery-copy">A matching connection was found. Reconnect it to keep its name, groups, jobs, and history, or create a separate connection.</p>
+      <div id="recovery-candidates" class="recovery-candidates"></div>
+      <button id="create-new-connection" class="secondary-button recovery-create" type="button">
+        Create a new connection
+      </button>
+      <p id="recovery-status" class="name-status" aria-live="polite"></p>
+    </section>
+
+    <p class="facebook-health" id="facebook-health">Checking Facebook...</p>
 
     <div class="view-tabs" role="tablist" aria-label="PostFlow views">
       <button class="view-tab active" id="dashboard-tab" type="button" role="tab" aria-selected="true" aria-controls="dashboard-view" tabindex="0">Groups</button>
@@ -168,6 +210,6 @@
   </main>
   <script src="../libphonenumber-max.js"></script>
   <script src="../phone-collector/phone-normalizer.js"></script>
-  <script src="./popup.js"></script>
+  <script type="module" src="./popup.js"></script>
 </body>
 </html>

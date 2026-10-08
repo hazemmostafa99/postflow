@@ -71,10 +71,12 @@ PhoneContactSchema.index({
   clerkUserId: 1,
   qualificationStatus: 1,
   lastSeenAt: -1,
+  _id: -1,
 });
 PhoneContactSchema.index({
   clerkUserId: 1,
   group: 1,
   qualificationStatus: 1,
   lastSeenAt: -1,
+  _id: -1,
 });

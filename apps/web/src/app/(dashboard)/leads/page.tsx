@@ -17,11 +17,14 @@ interface ListResponse {
   contacts?: Lead[];
   categories?: string[];
   groups?: string[];
+  statusCounts?: Partial<Record<LeadQualificationStatus, number>>;
   pagination?: {
     page?: number;
     limit?: number;
     total?: number;
     totalPages?: number;
+    hasMore?: boolean;
+    nextCursor?: string | null;
   };
 }
 
@@ -33,12 +36,19 @@ async function fetchBoardSection(
   search: string,
   category: string,
   group: string,
-): Promise<{ seed: BoardSectionSeed; categories: string[]; groups: string[] }> {
+  includeMetadata: boolean,
+): Promise<{
+  seed: BoardSectionSeed;
+  categories: string[];
+  groups: string[];
+  statusCounts?: Partial<Record<LeadQualificationStatus, number>>;
+}> {
   try {
     const url = new URL(`${API_BASE}/api/phone-contacts`);
     url.searchParams.set("page", "1");
     url.searchParams.set("limit", String(LEADS_PER_PAGE));
     url.searchParams.set("qualificationStatus", qualificationStatus);
+    url.searchParams.set("includeMetadata", String(includeMetadata));
     if (search) url.searchParams.set("search", search);
     if (category) url.searchParams.set("category", category);
     if (group) url.searchParams.set("group", group);
@@ -62,6 +72,10 @@ async function fetchBoardSection(
         page: Math.max(1, pagination.page ?? 1),
         total: pagination.total ?? 0,
         totalPages: Math.max(1, pagination.totalPages ?? 1),
+        hasMore:
+          pagination.hasMore ??
+          (pagination.page ?? 1) < (pagination.totalPages ?? 1),
+        nextCursor: pagination.nextCursor ?? null,
         error: false,
       },
       categories: Array.isArray(data.categories)
@@ -74,6 +88,7 @@ async function fetchBoardSection(
             (value): value is string => typeof value === "string",
           )
         : [],
+      statusCounts: data.statusCounts,
     };
   } catch {
     return {
@@ -83,6 +98,8 @@ async function fetchBoardSection(
         page: 1,
         total: 0,
         totalPages: 1,
+        hasMore: false,
+        nextCursor: null,
         error: true,
       },
       categories: [],
@@ -99,7 +116,11 @@ export const metadata = {
 export default async function LeadsPage({
   searchParams,
 }: {
-  searchParams?: Promise<{ search?: string; category?: string; group?: string }>;
+  searchParams?: Promise<{
+    search?: string;
+    category?: string;
+    group?: string;
+  }>;
 }) {
   const { userId } = await auth();
   if (!userId) redirect("/sign-in");
@@ -111,10 +132,32 @@ export default async function LeadsPage({
   const hasFilters = Boolean(search || category || group);
 
   const [unreviewed, qualified, notQualified] = await Promise.all([
-    fetchBoardSection(userId, "UNREVIEWED", search, category, group),
-    fetchBoardSection(userId, "QUALIFIED", search, category, group),
-    fetchBoardSection(userId, "NOT_QUALIFIED", search, category, group),
+    fetchBoardSection(userId, "UNREVIEWED", search, category, group, true),
+    fetchBoardSection(userId, "QUALIFIED", search, category, group, false),
+    fetchBoardSection(userId, "NOT_QUALIFIED", search, category, group, false),
   ]);
+
+  const statusCounts = unreviewed.statusCounts;
+  const seeds = {
+    UNREVIEWED: {
+      ...unreviewed.seed,
+      total:
+        statusCounts?.UNREVIEWED ??
+        Math.max(unreviewed.seed.total, unreviewed.seed.items.length),
+    },
+    QUALIFIED: {
+      ...qualified.seed,
+      total:
+        statusCounts?.QUALIFIED ??
+        Math.max(qualified.seed.total, qualified.seed.items.length),
+    },
+    NOT_QUALIFIED: {
+      ...notQualified.seed,
+      total:
+        statusCounts?.NOT_QUALIFIED ??
+        Math.max(notQualified.seed.total, notQualified.seed.items.length),
+    },
+  } satisfies Record<LeadQualificationStatus, BoardSectionSeed>;
 
   const categories = Array.from(
     new Set([
@@ -160,7 +203,9 @@ export default async function LeadsPage({
           >
             <option value="">All categories</option>
             {categories.map((option) => (
-              <option key={option} value={option}>{option}</option>
+              <option key={option} value={option}>
+                {option}
+              </option>
             ))}
           </select>
           <select
@@ -171,7 +216,9 @@ export default async function LeadsPage({
           >
             <option value="">All groups</option>
             {groups.map((option) => (
-              <option key={option} value={option}>{option}</option>
+              <option key={option} value={option}>
+                {option}
+              </option>
             ))}
           </select>
           <button
@@ -198,11 +245,7 @@ export default async function LeadsPage({
         search={search}
         category={category}
         group={group}
-        initial={{
-          UNREVIEWED: unreviewed.seed,
-          QUALIFIED: qualified.seed,
-          NOT_QUALIFIED: notQualified.seed,
-        }}
+        initial={seeds}
       />
     </div>
   );

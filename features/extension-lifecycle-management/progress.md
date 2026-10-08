@@ -457,23 +457,67 @@ react to lifecycle commands in Phase 7.
 
 ### Checklist
 
-- [ ] Read desired lifecycle from registration and heartbeat responses.
-- [ ] Persist lifecycle state locally.
-- [ ] Stop new job checks immediately when PAUSED or REVOKE_PENDING.
-- [ ] Complete an existing job safely during graceful pause/disconnect.
-- [ ] Stop all worker APIs after REVOKED.
-- [ ] Clear or invalidate revoked local credentials.
-- [ ] Prevent a revoked stored instance ID from silently creating a new
+- [x] Read desired lifecycle from registration and heartbeat responses.
+- [x] Persist lifecycle state locally.
+- [x] Stop new job checks immediately when PAUSED or REVOKE_PENDING.
+- [x] Complete an existing job safely during graceful pause/disconnect.
+- [x] Stop all worker APIs after REVOKED.
+- [x] Clear or invalidate revoked local credentials.
+- [x] Prevent a revoked stored instance ID from silently creating a new
   connection.
-- [ ] Display distinct lifecycle and Facebook-health messages in the popup.
-- [ ] Add a dashboard link for paused/revoked recovery actions.
-- [ ] Keep status reporting free of cookies, credentials, and sensitive data.
-- [ ] Add extension unit tests for lifecycle messages and queue behavior.
+- [x] Display distinct lifecycle and Facebook-health messages in the popup.
+- [x] Add a dashboard link for paused/revoked recovery actions.
+- [x] Keep status reporting free of cookies, credentials, and sensitive data.
+- [x] Add extension unit tests for lifecycle messages and queue behavior.
 
 ### Review Notes
 
 ```text
-Status: NOT STARTED
+Status: IMPLEMENTED — review pending
+
+Files changed:
+
+- `apps/extension/src/background.ts` — lifecycle persistence, enforcement gates, revocation handling
+- `apps/extension/src/popup/popup.ts` — distinct lifecycle/health labels, recovery dashboard link
+- `apps/extension/src/popup/popup.html` — new lifecycle dashboard link and Facebook health display
+- `apps/extension/src/popup/popup.css` — styling for lifecycle states and health indicators
+- `apps/extension/tests/lifecycle-enforcement.test.cjs` (new) — 18 unit tests
+- `apps/extension/package.json` — added lifecycle test to test suite
+
+Behavior:
+
+- Registration and heartbeat responses include `status` (ACTIVE/PAUSED/REVOKE_PENDING/REVOKED).
+  The extension persists this locally in `chrome.storage.local` (`extensionLifecycleStatus`).
+- Before any new work claim (publishing, pending-approval maintenance, engagement maintenance),
+  the extension checks local lifecycle via `canClaimNewWork()`. PAUSED, REVOKE_PENDING, and REVOKED
+  all block new claims while allowing in-flight work to complete (backend enforces the same).
+- On REVOKED: `handleRevokedInstallation()` clears the installation credential, all maintenance
+  alarms (pending, engagement, manual), the heartbeat alarm, and the register-retry alarm.
+  Sets `extensionConnectionStage='revoked'` and `extensionWorkerStatus='OFFLINE'`.
+- Popup now shows **administrative lifecycle** separately from **Facebook health**:
+  - Lifecycle: "Connected and ready" / "Paused from PostFlow dashboard" /
+    "Disconnecting after current task" / "Disconnected from PostFlow"
+  - Health: "Facebook ready" / "Login required" / "Wrong Facebook account" /
+    "Facebook blocked or verification required" / etc.
+- Paused/Revoked states show a "Open dashboard to manage connection" link that opens the
+  dashboard connections page.
+- No sensitive data (credentials, cookies) exposed in UI.
+
+Tests in `lifecycle-enforcement.test.cjs` (18 tests):
+
+- `lifecycleLabel`: ACTIVE/PAUSED/REVOKE_PENDING/REVOKED/unknown → correct text, CSS class,
+  and dashboard-link visibility.
+- `facebookHealthLabel`: CONNECTED/LOGIN_REQUIRED/ACCOUNT_MISMATCH/BLOCKED/
+  CHECKPOINT_OR_VERIFICATION/CAPTCHA_OR_CHALLENGE/MANUAL_INTERVENTION_REQUIRED/unknown
+  → correct text and class.
+- `canClaimNewWork`: true for ACTIVE/none; false for PAUSED/REVOKE_PENDING/REVOKED.
+
+Verification on 2026-10-08:
+
+- `npm test` in `apps/api`: 20/20 suites, 185/185 tests pass.
+- `npm run build` in `apps/api`: passes.
+- `npm run build:dev` in `apps/extension`: passes (tsc clean).
+- `npm test` in `apps/extension`: 88/89 pass (1 pre-existing `graphql-spy` failure at base commit).
 ```
 
 ### Review Gate
@@ -487,29 +531,93 @@ the multi-profile reconnect flow.
 
 ### Checklist
 
-- [ ] Show administrative lifecycle separately from Online/Offline.
-- [ ] Show Facebook health separately from administrative lifecycle.
-- [ ] Show last heartbeat and masked current instance ID.
-- [ ] Add Rename action with unique-name conflict handling.
-- [ ] Add Pause and Resume actions.
-- [ ] Add graceful Disconnect confirmation.
-- [ ] Add separate Force disconnect warning.
-- [ ] Add Remove from Connections confirmation.
-- [ ] Explain active-job and queued-job effects in dialogs.
-- [ ] Add Archived Connections view.
-- [ ] Add restore/reconnect action for archived connections.
-- [ ] Auto-refresh pending lifecycle transitions without reloading the full
+- [x] Show administrative lifecycle separately from Online/Offline.
+- [x] Show Facebook health separately from administrative lifecycle.
+- [x] Show last heartbeat and masked current instance ID.
+- [x] Add Rename action with unique-name conflict handling.
+- [x] Add Pause and Resume actions.
+- [x] Add graceful Disconnect confirmation.
+- [x] Add separate Force disconnect warning.
+- [x] Add Remove from Connections confirmation.
+- [x] Explain active-job and queued-job effects in dialogs.
+- [x] Add Archived Connections view.
+- [x] Add restore/reconnect action for archived connections.
+- [x] Auto-refresh pending lifecycle transitions without reloading the full
   Clerk layout.
-- [ ] Add loading, success, conflict, and backend-unavailable states.
-- [ ] Add component-level tests where practical.
+- [x] Add loading, success, conflict, and backend-unavailable states.
+- [x] Add component-level tests where practical.
 
 ### Review Notes
 
 ```text
-Status: NOT STARTED
+Status: IMPLEMENTED — review pending
 
-The current dashboard already derives online/offline and presents operational
-health, but it has no lifecycle action menu or archived view.
+Files changed (new web proxy routes):
+
+- `apps/web/src/app/api/extensions/connections/archived/route.ts` (new) — GET archived list.
+- `apps/web/src/app/api/extensions/connections/[connectionId]/route.ts` (new) —
+  PATCH rename, DELETE remove.
+- `apps/web/src/app/api/extensions/connections/[connectionId]/[action]/route.ts`
+  (new) — POST pause/resume/disconnect/force-disconnect/reconnect-approval.
+  All forward `x-clerk-user-id` from the Clerk session to the backend.
+
+Files changed (UI):
+
+- `apps/web/src/app/(dashboard)/connections/connections-dashboard.tsx` (rewritten):
+  - `FacebookConnection` now carries the full backend ConnectionState contract
+    (`lifecycle`, `isOnline`, `connectivity`, `connectivityReason`,
+    `extensionInstanceIdMasked`, `archivedAt`, `archiveReason`,
+    `hasPendingReconnectApproval`).
+  - Every row shows two badges: administrative lifecycle
+    (Active / Paused / Disconnecting / Disconnected) and Facebook health
+    (Ready / Publishing / attention states / Offline), plus an
+    "Approval pending" badge when a reconnect approval is outstanding.
+  - REVOKED connections always render as "Disconnected" regardless of
+    Facebook health; the lifecycle message explains that worker APIs are
+    blocked.
+  - Last heartbeat, masked instance ID (backend-masked value preferred), and
+    connectivity reason appear in the expanded detail panel diagnostics.
+  - Per-row action menu (`ActionMenu`) gated by lifecycle:
+    ACTIVE → rename/pause/disconnect/force-disconnect/remove;
+    PAUSED → rename/resume/disconnect/force-disconnect/remove;
+    REVOKE_PENDING → rename/force-disconnect;
+    REVOKED → rename/remove; archived → rename/restore.
+  - `ConfirmDialog` states each action's effect on leased jobs, queued jobs,
+    and reconnection. Force disconnect requires typing FORCE (typed
+    confirmation); Remove states that the connection is archived, not
+    deleted, and is reversible.
+  - `RenameDialog` surfaces backend 409 conflicts (duplicate name) inline.
+  - Archived connections tab lists archived rows with archive reason/time and
+    a Restore/reconnect button that issues a short-lived single-use approval
+    (only the expiry is shown to the user; the token itself is never
+    displayed or logged).
+  - Error states: loading spinner, success notice banner (auto-dismiss),
+    inline conflict errors, and backend-unavailable fallback
+    ("Nothing changed — try again").
+  - Auto-refresh: list polls every 3s; polling continues past the 60s
+    cutoff while any connection is REVOKE_PENDING so the transition resolves
+    without reloading the Clerk layout.
+  - "Ready" summary/filter excludes PAUSED and REVOKE_PENDING connections
+    (they cannot claim new work) even when Facebook health is fine.
+
+Tests:
+
+- `apps/web/tests/connection-lifecycle.test.cjs` (new, 10 tests) — loads the
+  real dashboard module in a vm sandbox and covers: lifecycle mapping and
+  legacy fallback, distinct lifecycle labels/messages, REVOKED override,
+  offline derivation from backend connectivity, per-lifecycle action
+  availability, confirm-spec job/queue effect wording, typed FORCE
+  confirmation, and Ready-filter exclusion of paused/disconnecting.
+- `apps/web/package.json` — added `npm test` script.
+
+Verification on 2026-10-08:
+
+- `npx tsc --noEmit` in `apps/web`: passes.
+- `npx eslint` on the dashboard and new API routes: passes.
+- `npm test` in `apps/web`: 10/10 pass.
+- `npm run build` (next build) in `apps/web`: passes; all four
+  `/api/extensions/connections*` routes registered.
+- `npm test` in `apps/api`: 20/20 suites, 185/185 tests pass.
 ```
 
 ### Review Gate
@@ -523,32 +631,63 @@ Remove or Force disconnect.
 
 ### Checklist
 
-- [ ] Treat a reinstall as a new unbound installation.
-- [ ] Verify the new PostFlow user context.
-- [ ] Verify the detected Facebook account identity.
-- [ ] Find eligible offline/revoked recovery candidates for the same owner.
-- [ ] Never auto-bind based only on identity match.
-- [ ] Show Reconnect existing versus Create new choices.
-- [ ] Require stronger confirmation when the previous worker is still online.
-- [ ] Issue a short-lived, single-use reconnect approval.
-- [ ] Atomically revoke/replace the old installation and bind the new one.
-- [ ] Preserve connection ID, name, Groups, jobs, and history.
-- [ ] Keep archived connections out of normal suggestions.
-- [ ] Restore archived connections only through explicit archived recovery.
-- [ ] Make reconnect idempotent across network retries.
-- [ ] Prevent two concurrent reconnect attempts from both winning.
-- [ ] Add recovery and race-condition tests.
+- [x] Treat a reinstall as a new unbound installation.
+- [x] Verify the new PostFlow user context.
+- [x] Verify the detected Facebook account identity.
+- [x] Find eligible offline/revoked recovery candidates for the same owner.
+- [x] Never auto-bind based only on identity match.
+- [x] Show Reconnect existing versus Create new choices.
+- [x] Require stronger confirmation when the previous worker is still online.
+- [x] Issue a short-lived, single-use reconnect approval.
+- [x] Atomically revoke/replace the old installation and bind the new one.
+- [x] Preserve connection ID, name, Groups, jobs, and history.
+- [x] Keep archived connections out of normal suggestions.
+- [x] Restore archived connections only through explicit archived recovery.
+- [x] Make reconnect idempotent across network retries.
+- [x] Prevent two concurrent reconnect attempts from both winning.
+- [x] Add recovery and race-condition tests.
 
 ### Review Notes
 
 ```text
-Status: NOT STARTED
+Status: IMPLEMENTED — manual browser review pending
 
-Target example:
+Backend:
 
-Connection `conn_123` remains stable.
-Old installation `inst_A` becomes REVOKED with reason REPLACED.
-New installation `inst_B` becomes the only current worker for `conn_123`.
+- A new instance registers as an unbound installation with a one-time worker
+  credential. A verified Facebook session returns recovery candidates without
+  binding to any of them.
+- `POST /api/extensions/reconnect` supports explicit reconnect and explicit
+  create-new choices. It verifies the installation credential, owner, detected
+  Facebook identity, archive approval, replacement confirmation, and current
+  binding before changing ownership.
+- A guarded compare-and-swap selects one concurrent winner. The connection
+  claim, approval consumption/unarchive, old installation revocation, new
+  installation binding, and lifecycle audits commit in one Mongo transaction.
+- Successful recovery preserves the durable Facebook connection ID; Groups,
+  jobs, display name, and history therefore remain attached. The previous
+  installation becomes REVOKED with reason REPLACED and its credential fails.
+
+Extension and dashboard:
+
+- The popup persists and renders recovery candidates with explicit Reconnect
+  and Create a new connection actions. An online predecessor requires a second
+  confirmation.
+- Archived restore creates a ten-minute, single-use approval in the
+  authenticated dashboard and hands it directly to the extension in the same
+  Chrome Profile. The plaintext token is not displayed or stored by the page.
+- Revoked responses now shut down local alarms and clear the worker credential,
+  including 403 responses after force disconnect or remove.
+
+Automated evidence on 2026-10-08:
+
+- Focused extension API tests: 59/59 pass, including identity mismatch,
+  archived approval, idempotent retry, transactional rebind, and one-winner
+  reconnect conflict coverage.
+- Extension recovery helpers: 3/3 pass; lifecycle enforcement: 18/18 pass.
+- Web lifecycle tests: 10/10 pass.
+- API build, extension development and production builds, web type-check,
+  web lint, and web production build pass.
 ```
 
 ### Review Gate
@@ -579,15 +718,17 @@ Automated atomic-rebind tests must pass before manual reinstall testing.
 ### Review Notes
 
 ```text
-Status: PARTIAL — Phase 4–6 verification gates complete
+Status: PARTIAL — Phase 4–9 lifecycle/recovery gates complete
 
 API build (`npm run build`) passes.
 Development extension build (`npm run build:dev`, tsc) passes.
+Web type-check (`npx tsc --noEmit`), lint (`npx eslint`), and production
+build (`next build`) pass; `npm test` in `apps/web` reports 10/10 green.
 
-The previously known Jest/ESM configuration issue in the API test runner is
-resolved: `npm test` in `apps/api` reports 20/20 suites and 185/185 tests green.
-Remaining checklist items depend on Phases 7–9 work (extension lifecycle
-enforcement, dashboard UX, reinstall recovery).
+Focused lifecycle/recovery API tests report 59/59 green, including the
+transaction and concurrent-winner cases. The full API suite reports 19/20
+suites and 204/205 tests green; its only failure is an unrelated in-progress
+phone-contact board index expectation in the current worktree.
 
 Note: the extension Node test suite has one pre-existing failure,
 `graphql-spy.test.cjs` ("carries an encoded composer video id into its
@@ -681,10 +822,10 @@ rollout occurs.
 | 4. Installation credential and registration guard | Implemented | No |
 | 5. Backend lifecycle management API | Implemented | No |
 | 6. Worker claims and in-flight job safety | Implemented | No |
-| 7. Extension lifecycle enforcement | Not started | No |
-| 8. Connections dashboard UX | Not started | No |
-| 9. Reinstall detection and explicit recovery | Not started | No |
-| 10. Automated verification | Partial (Phase 4–6 gates green) | No |
+| 7. Extension lifecycle enforcement | Implemented | No |
+| 8. Connections dashboard UX | Implemented | No |
+| 9. Reinstall detection and explicit recovery | Implemented; manual review pending | No |
+| 10. Automated verification | Partial (lifecycle/recovery gates green; unrelated failures remain) | No |
 | 11. Manual browser and multi-profile validation | Not started | No |
 | 12. Rollout, monitoring, and cleanup | Not started | No |
 
@@ -693,21 +834,27 @@ rollout occurs.
 ## Current Status
 
 ```text
-Status: PHASES 4–6 IMPLEMENTED; USER REVIEW PENDING
-Current phase: Phase 4–6 — installation credential and registration guard,
-backend lifecycle API, and worker claim/in-flight safety.
-Next action: Review the Phase 4–6 evidence below, then start Phase 7
-(extension lifecycle enforcement) or address requested changes.
+Status: PHASES 4–9 IMPLEMENTED; MANUAL BROWSER REVIEW PENDING
+Current phase: Phase 10 — complete cross-suite verification, then perform the
+Phase 11 Chrome multi-profile validation.
+Next action: Resolve or explicitly baseline the unrelated phone-contact schema
+test failure, then run the manual reinstall/recovery matrix in two Chrome
+Profiles.
 
 Verification recap on 2026-10-08:
 
-- `npm test` in `apps/api`: 20/20 suites, 185/185 tests pass.
+- Focused extension lifecycle/recovery API tests: 59/59 pass.
+- Full `npm test` in `apps/api`: 19/20 suites and 204/205 tests pass. The only
+  failure is the unrelated in-progress phone-contact board index expectation.
 - `npm run build` in `apps/api`: passes.
-- `npm run build:dev` in `apps/extension`: passes (tsc clean).
+- `npm run build:dev` and `npm run build:prod` in `apps/extension`: pass.
+- Direct extension test-file run: 13/14 files pass, including lifecycle and
+  recovery. The known `graphql-spy.test.cjs` failure remains unchanged.
+- `npx tsc --noEmit` + `npx eslint` + `npm run build` (next build) in `apps/web`: pass.
+- `npm test` in `apps/web`: 10/10 pass.
 
 The Phase 3 database migration is still report-only, with the apply step
-pending review. The extension `graphql-spy.test.cjs` failure is pre-existing
-at the base commit `a5098d4` and unrelated to this feature.
+pending review.
 ```
 
 ---

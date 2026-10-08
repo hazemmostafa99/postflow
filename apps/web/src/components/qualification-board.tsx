@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   ExternalLink,
@@ -43,6 +43,8 @@ export interface BoardSectionSeed {
   page: number;
   total: number;
   totalPages: number;
+  hasMore: boolean;
+  nextCursor: string | null;
   error: boolean;
 }
 
@@ -52,6 +54,7 @@ interface SectionState {
   total: number;
   totalPages: number;
   hasMore: boolean;
+  nextCursor: string | null;
   failed: boolean;
   loadingMore: boolean;
   moreError: string;
@@ -62,8 +65,10 @@ interface SectionResponse {
   pagination: {
     page: number;
     limit: number;
-    total: number;
-    totalPages: number;
+    total?: number;
+    totalPages?: number;
+    hasMore: boolean;
+    nextCursor: string | null;
   };
 }
 
@@ -80,21 +85,26 @@ function fromSeed(seed: BoardSectionSeed): SectionState {
     page: Math.max(1, seed.page),
     total: seed.total,
     totalPages,
-    hasMore: seed.page < totalPages,
+    hasMore: seed.hasMore,
+    nextCursor: seed.nextCursor,
     failed: seed.error,
     loadingMore: false,
     moreError: "",
   };
 }
 
-function fromResponse(status: LeadQualificationStatus, data: SectionResponse): SectionState {
-  const totalPages = Math.max(1, data.pagination.totalPages);
+function fromResponse(
+  status: LeadQualificationStatus,
+  data: SectionResponse,
+): SectionState {
+  const totalPages = Math.max(1, data.pagination.totalPages ?? 1);
   return {
     items: data.contacts,
     page: data.pagination.page,
-    total: data.pagination.total,
+    total: data.pagination.total ?? data.contacts.length,
     totalPages,
-    hasMore: data.pagination.page < totalPages,
+    hasMore: data.pagination.hasMore,
+    nextCursor: data.pagination.nextCursor,
     failed: false,
     loadingMore: false,
     moreError: "",
@@ -188,7 +198,9 @@ function SectionHeader({
     <div className="flex items-start justify-between gap-3 border-b border-border px-4 py-3.5">
       <div className="min-w-0">
         <div className="flex items-center gap-2">
-          <span className={`h-2 w-2 shrink-0 rounded-full ${SECTION_META[status].dot}`} />
+          <span
+            className={`h-2 w-2 shrink-0 rounded-full ${SECTION_META[status].dot}`}
+          />
           <h2 id={id} className="text-sm font-semibold text-foreground">
             {leadStatusLabel(status)}
           </h2>
@@ -248,7 +260,12 @@ function LeadCard({
 
   async function remove() {
     if (deleting) return;
-    if (!window.confirm(`Delete ${lead.normalizedNumber}? This action cannot be undone.`)) return;
+    if (
+      !window.confirm(
+        `Delete ${lead.normalizedNumber}? This action cannot be undone.`,
+      )
+    )
+      return;
     setDeleting(true);
     setDeleteError("");
     try {
@@ -258,12 +275,16 @@ function LeadCard({
       );
       if (!response.ok) {
         const data = await response.json().catch(() => null);
-        throw new Error(responseMessage(data, "Could not delete this phone number."));
+        throw new Error(
+          responseMessage(data, "Could not delete this phone number."),
+        );
       }
       onDelete();
     } catch (error) {
       setDeleteError(
-        error instanceof Error ? error.message : "Could not delete this phone number.",
+        error instanceof Error
+          ? error.message
+          : "Could not delete this phone number.",
       );
     } finally {
       setDeleting(false);
@@ -294,15 +315,20 @@ function LeadCard({
       </div>
 
       {lead.notes ? (
-        <p className="line-clamp-2 text-sm leading-5 text-muted-foreground">{lead.notes}</p>
+        <p className="line-clamp-2 text-sm leading-5 text-muted-foreground">
+          {lead.notes}
+        </p>
       ) : null}
 
       <p className="truncate text-xs text-muted-foreground" title={category}>
-        Category: <span className="font-medium text-foreground">{category}</span>
+        Category:{" "}
+        <span className="font-medium text-foreground">{category}</span>
       </p>
 
       <div className="flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
-        <span className="font-medium text-foreground">{sourceLabel(lead.source.type)}</span>
+        <span className="font-medium text-foreground">
+          {sourceLabel(lead.source.type)}
+        </span>
         {lead.source.url ? (
           <a
             href={lead.source.url}
@@ -318,7 +344,9 @@ function LeadCard({
         <span className="text-muted-foreground/40">·</span>
         <span>
           Collected{" "}
-          <time dateTime={lead.lastSeenAt}>{mounted ? timeAgo(lead.lastSeenAt) : "—"}</time>
+          <time dateTime={lead.lastSeenAt}>
+            {mounted ? timeAgo(lead.lastSeenAt) : "—"}
+          </time>
         </span>
         <span className="text-muted-foreground/40">·</span>
         <span title={mounted ? formatDate(lead.createdAt) : undefined}>
@@ -410,6 +438,30 @@ function LeadSection({
   onSaved: (lead: Lead, data: unknown) => void;
   mounted: boolean;
 }) {
+  const loadTriggerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const target = loadTriggerRef.current;
+    if (!target || !section.hasMore || section.loadingMore || section.failed)
+      return;
+    if (typeof IntersectionObserver === "undefined") return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) onLoadMore(status);
+      },
+      { rootMargin: "400px 0px" },
+    );
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [
+    onLoadMore,
+    section.failed,
+    section.hasMore,
+    section.loadingMore,
+    status,
+  ]);
+
   if (section.failed) {
     return (
       <div
@@ -466,15 +518,22 @@ function LeadSection({
         ))}
       </ol>
       {section.hasMore && (
-        <button
-          type="button"
-          onClick={() => onLoadMore(status)}
-          disabled={section.loadingMore}
-          className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-border bg-background px-3 text-xs font-medium shadow-sm transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          {section.loadingMore && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-          {section.loadingMore ? "Loading…" : "Load more leads"}
-        </button>
+        <div ref={loadTriggerRef} className="grid gap-2">
+          <button
+            type="button"
+            onClick={() => onLoadMore(status)}
+            disabled={section.loadingMore}
+            className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-border bg-background px-3 text-xs font-medium shadow-sm transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {section.loadingMore && (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            )}
+            {section.loadingMore ? "Loading…" : "Load more leads"}
+          </button>
+          <span className="sr-only" aria-live="polite">
+            {section.loadingMore ? "Loading more leads" : ""}
+          </span>
+        </div>
       )}
       {section.moreError && (
         <p role="alert" className="text-xs text-red-600 dark:text-red-400">
@@ -504,6 +563,10 @@ export function QualificationBoard({
     NOT_QUALIFIED: fromSeed(initial.NOT_QUALIFIED),
   }));
   const [mounted, setMounted] = useState(false);
+  const loadingStatuses = useRef(new Set<LeadQualificationStatus>());
+  const requestControllers = useRef(
+    new Map<LeadQualificationStatus, AbortController>(),
+  );
 
   useEffect(() => {
     // schedule the mounted flag asynchronously so the server and first client
@@ -512,46 +575,73 @@ export function QualificationBoard({
     return () => window.cancelAnimationFrame(frame);
   }, []);
 
+  useEffect(
+    () => () => {
+      requestControllers.current.forEach((controller) => controller.abort());
+      requestControllers.current.clear();
+    },
+    [],
+  );
+
   async function fetchSectionPage(
     status: LeadQualificationStatus,
-    page: number,
+    cursor?: string,
+    includeMetadata = false,
   ): Promise<SectionResponse> {
     const params = new URLSearchParams({
-      page: String(page),
       limit: String(LEADS_PER_PAGE),
       qualificationStatus: status,
+      includeMetadata: String(includeMetadata),
     });
+    if (cursor) params.set("cursor", cursor);
     if (search) params.set("search", search);
     if (category) params.set("category", category);
     if (group) params.set("group", group);
-    const response = await fetch(`/api/phone-contacts?${params.toString()}`);
-    if (!response.ok) throw new Error("Could not load leads.");
-    return (await response.json()) as SectionResponse;
+    const controller = new AbortController();
+    requestControllers.current.get(status)?.abort();
+    requestControllers.current.set(status, controller);
+    try {
+      const response = await fetch(`/api/phone-contacts?${params.toString()}`, {
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error("Could not load leads.");
+      return (await response.json()) as SectionResponse;
+    } finally {
+      if (requestControllers.current.get(status) === controller) {
+        requestControllers.current.delete(status);
+      }
+    }
   }
 
   async function loadMore(status: LeadQualificationStatus) {
     const section = sections[status];
-    if (section.loadingMore || !section.hasMore || section.failed) return;
+    if (
+      section.loadingMore ||
+      !section.hasMore ||
+      !section.nextCursor ||
+      section.failed ||
+      loadingStatuses.current.has(status)
+    )
+      return;
+    loadingStatuses.current.add(status);
     setSections((prev) => ({
       ...prev,
       [status]: { ...prev[status], loadingMore: true, moreError: "" },
     }));
     try {
-      const data = await fetchSectionPage(status, section.page + 1);
+      const data = await fetchSectionPage(status, section.nextCursor);
       setSections((prev) => {
         const current = prev[status];
         const known = new Set(current.items.map((lead) => lead._id));
         const fresh = data.contacts.filter((lead) => !known.has(lead._id));
-        const totalPages = Math.max(1, data.pagination.totalPages);
         return {
           ...prev,
           [status]: {
             ...current,
             items: [...current.items, ...fresh],
-            page: data.pagination.page,
-            total: data.pagination.total,
-            totalPages,
-            hasMore: data.pagination.page < totalPages,
+            page: current.page + 1,
+            hasMore: data.pagination.hasMore,
+            nextCursor: data.pagination.nextCursor,
             loadingMore: false,
           },
         };
@@ -565,6 +655,8 @@ export function QualificationBoard({
           moreError: "Could not load more leads.",
         },
       }));
+    } finally {
+      loadingStatuses.current.delete(status);
     }
   }
 
@@ -574,7 +666,7 @@ export function QualificationBoard({
       [status]: { ...prev[status], loadingMore: true, moreError: "" },
     }));
     try {
-      const data = await fetchSectionPage(status, 1);
+      const data = await fetchSectionPage(status, undefined, true);
       setSections((prev) => ({
         ...prev,
         [status]: fromResponse(status, data),
@@ -697,7 +789,10 @@ export function QualificationBoard({
         [status]: {
           ...target,
           failed: false,
-          items: [lead, ...target.items.filter((item) => item._id !== lead._id)],
+          items: [
+            lead,
+            ...target.items.filter((item) => item._id !== lead._id),
+          ],
           total,
           totalPages: pageCount(total),
           hasMore: target.page < pageCount(total),
@@ -720,7 +815,9 @@ export function QualificationBoard({
     );
     const data = await response.json().catch(() => null);
     if (!response.ok) {
-      throw new Error(responseMessage(data, "Could not update this lead's status."));
+      throw new Error(
+        responseMessage(data, "Could not update this lead's status."),
+      );
     }
     moveLead(lead, next);
   }
@@ -768,9 +865,12 @@ export function QualificationBoard({
             <AlertTriangle className="h-6 w-6 text-red-600 dark:text-red-400" />
           </div>
           <div>
-            <h2 className="font-semibold text-foreground">Leads could not be loaded</h2>
+            <h2 className="font-semibold text-foreground">
+              Leads could not be loaded
+            </h2>
             <p className="mx-auto mt-1 max-w-md text-sm leading-6 text-muted-foreground">
-              iPostFlow could not reach the leads service. Your leads have not been removed.
+              iPostFlow could not reach the leads service. Your leads have not
+              been removed.
             </p>
           </div>
           <button
@@ -830,7 +930,11 @@ export function QualificationBoard({
               count={sections.QUALIFIED.total}
             />
             <div className="p-3">
-              <LeadSection status="QUALIFIED" section={sections.QUALIFIED} {...sectionProps} />
+              <LeadSection
+                status="QUALIFIED"
+                section={sections.QUALIFIED}
+                {...sectionProps}
+              />
             </div>
           </section>
           <section

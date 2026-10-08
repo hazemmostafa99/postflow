@@ -1,3 +1,9 @@
+import {
+  reconnectNeedsConfirmation,
+  recoveryCandidateLabel,
+  type RecoveryCandidate,
+} from "../extension-recovery.js";
+
 const statusElement = document.getElementById("status")!;
 const refreshButton = document.getElementById("refresh")!;
 const openDashboardButton = document.getElementById("open-dashboard")!;
@@ -42,6 +48,18 @@ const confirmSelectedCount = document.getElementById("confirm-selected-count")!;
 const confirmPhoneSyncButton = document.getElementById("confirm-phone-sync") as HTMLButtonElement;
 const cancelPhoneSyncButton = document.getElementById("cancel-phone-sync") as HTMLButtonElement;
 const phoneSyncCategoryInput = document.getElementById("phone-sync-category") as HTMLInputElement;
+const recoveryPanel = document.getElementById("recovery-panel")!;
+const recoveryCandidatesElement = document.getElementById("recovery-candidates")!;
+const recoveryStatusElement = document.getElementById("recovery-status")!;
+const createNewConnectionButton = document.getElementById("create-new-connection") as HTMLButtonElement;
+const connectionDetailElement = document.getElementById("connection-detail")!;
+const connectionAccountElement = document.getElementById("connection-account")!;
+const connectionUpdatedElement = document.getElementById("connection-updated")!;
+const refreshConnectionButton = document.getElementById("refresh-connection") as HTMLButtonElement;
+const connectionProgressElement = document.getElementById("connection-progress")!;
+const setupStepAccount = document.getElementById("setup-step-account")!;
+const setupStepInstallation = document.getElementById("setup-step-installation")!;
+const setupStepFacebook = document.getElementById("setup-step-facebook")!;
 
 let currentExtensionName = "";
 let phoneCollectorState = createEmptyPhoneCollectorState();
@@ -537,6 +555,165 @@ function setIndicator(dotId: string, textId: string, text: string, state: string
   if (label) label.textContent = text;
 }
 
+function lifecycleLabel(status: string): { text: string; className: string; showDashboardLink: boolean } {
+  switch (status) {
+    case 'ACTIVE':
+      return { text: 'Connected and ready', className: 'ready', showDashboardLink: false };
+    case 'PAUSED':
+      return { text: 'Paused from PostFlow dashboard', className: 'paused', showDashboardLink: true };
+    case 'REVOKE_PENDING':
+      return { text: 'Disconnecting after current task', className: 'disconnecting', showDashboardLink: true };
+    case 'REVOKED':
+      return { text: 'Disconnected from PostFlow', className: 'revoked', showDashboardLink: true };
+    default:
+      return { text: 'Checking...', className: '', showDashboardLink: false };
+  }
+}
+
+function facebookHealthLabel(status: string): { text: string; className: string } {
+  switch (status) {
+    case 'CONNECTED':
+      return { text: 'Facebook ready', className: 'ready' };
+    case 'LOGIN_REQUIRED':
+      return { text: 'Login required', className: 'attention' };
+    case 'ACCOUNT_MISMATCH':
+      return { text: 'Wrong Facebook account', className: 'attention' };
+    case 'BLOCKED':
+      return { text: 'Facebook blocked or verification required', className: 'attention' };
+    case 'CHECKPOINT_OR_VERIFICATION':
+      return { text: 'Facebook checkpoint or verification required', className: 'attention' };
+    case 'CAPTCHA_OR_CHALLENGE':
+      return { text: 'Facebook captcha or challenge', className: 'attention' };
+    case 'MANUAL_INTERVENTION_REQUIRED':
+      return { text: 'Manual intervention required', className: 'attention' };
+    default:
+      return { text: 'Facebook status unknown', className: 'attention' };
+  }
+}
+
+function setRecoveryBusy(busy: boolean) {
+  createNewConnectionButton.disabled = busy;
+  recoveryCandidatesElement
+    .querySelectorAll<HTMLButtonElement>("button")
+    .forEach((button) => { button.disabled = busy; });
+}
+
+async function requestExtensionRecovery(options: {
+  connectionId?: string;
+  createNewConnection?: boolean;
+  confirmReplacement?: boolean;
+}) {
+  return chrome.runtime.sendMessage({
+    type: "COMPLETE_EXTENSION_RECOVERY",
+    ...options,
+  }) as Promise<{
+    ok?: boolean;
+    error?: string;
+    confirmationRequired?: boolean;
+  }>;
+}
+
+async function reconnectCandidate(candidate: RecoveryCandidate) {
+  let confirmReplacement = false;
+  if (reconnectNeedsConfirmation(candidate)) {
+    confirmReplacement = window.confirm(
+      `“${recoveryCandidateLabel(candidate)}” still appears online. Replace that installation with this one?`,
+    );
+    if (!confirmReplacement) return;
+  }
+
+  setRecoveryBusy(true);
+  recoveryStatusElement.textContent = "Reconnecting...";
+  try {
+    let result = await requestExtensionRecovery({
+      connectionId: candidate.connectionId,
+      confirmReplacement,
+    });
+    if (result.confirmationRequired && !confirmReplacement) {
+      const confirmed = window.confirm(
+        `“${recoveryCandidateLabel(candidate)}” is still online. Replace that installation with this one?`,
+      );
+      if (!confirmed) {
+        recoveryStatusElement.textContent = "Replacement canceled.";
+        return;
+      }
+      result = await requestExtensionRecovery({
+        connectionId: candidate.connectionId,
+        confirmReplacement: true,
+      });
+    }
+    if (!result?.ok) {
+      recoveryStatusElement.textContent = result?.error ?? "Could not reconnect.";
+      return;
+    }
+    recoveryStatusElement.textContent = "Reconnected.";
+    await loadExtensionName();
+    await loadConnectionStatus();
+  } catch {
+    recoveryStatusElement.textContent = "Could not contact the extension worker.";
+  } finally {
+    setRecoveryBusy(false);
+  }
+}
+
+function renderRecoveryCandidates(candidates: RecoveryCandidate[]) {
+  recoveryCandidatesElement.replaceChildren();
+  if (candidates.length === 0) {
+    const empty = document.createElement("small");
+    empty.textContent = "No previous connection details are available yet. You can create a new connection.";
+    recoveryCandidatesElement.append(empty);
+    return;
+  }
+  for (const candidate of candidates) {
+    const row = document.createElement("div");
+    row.className = "recovery-candidate";
+    const copy = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = recoveryCandidateLabel(candidate);
+    const detail = document.createElement("small");
+    detail.textContent = candidate.activeInstallationOnline
+      ? "Previous installation is online — confirmation required"
+      : "Keeps the existing name, groups, jobs, and history";
+    copy.append(title, detail);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "Reconnect";
+    button.addEventListener("click", () => void reconnectCandidate(candidate));
+    row.append(copy, button);
+    recoveryCandidatesElement.append(row);
+  }
+}
+
+function renderSetupProgress(connectionStage: string, hasUserId: boolean) {
+  const setupStages = new Set([
+    "waiting-for-dashboard",
+    "user-found",
+    "connecting",
+    "verifying-facebook",
+    "facebook-required",
+    "backend-unavailable",
+    "recovery-required",
+  ]);
+  connectionProgressElement.hidden = !setupStages.has(connectionStage);
+
+  const setStep = (element: HTMLElement, state: "pending" | "active" | "complete", label: string) => {
+    element.classList.toggle("active", state === "active");
+    element.classList.toggle("complete", state === "complete");
+    const dot = element.querySelector<HTMLElement>(".setup-step-dot");
+    if (dot) dot.textContent = state === "complete" ? "✓" : label;
+  };
+
+  setStep(setupStepAccount, hasUserId ? "complete" : "active", "1");
+  if (!hasUserId) {
+    setStep(setupStepInstallation, "pending", "2");
+    setStep(setupStepFacebook, "pending", "3");
+    return;
+  }
+  const installationReady = ["verifying-facebook", "facebook-required", "recovery-required", "connected"].includes(connectionStage);
+  setStep(setupStepInstallation, installationReady ? "complete" : "active", "2");
+  setStep(setupStepFacebook, installationReady ? "active" : "pending", "3");
+}
+
 async function loadConnectionStatus() {
   const result = await chrome.storage.local.get([
     "clerkUserId",
@@ -547,20 +724,98 @@ async function loadConnectionStatus() {
     "groupsLastSyncedAt",
     "facebookIdentityVerified",
     "facebookConnectionStatus",
+    "extensionLifecycleStatus",
+    "extensionWorkerStatus",
+    "extensionRecoveryCandidates",
+    "detectedFacebookUserId",
   ]);
   const facebookStatus = typeof result.facebookConnectionStatus === "string"
     ? result.facebookConnectionStatus
     : "UNKNOWN";
   const identityVerified = result.facebookIdentityVerified === true;
+  const lifecycleStatus = typeof result.extensionLifecycleStatus === "string"
+    ? result.extensionLifecycleStatus
+    : "ACTIVE";
+  const workerStatus = typeof result.extensionWorkerStatus === "string"
+    ? result.extensionWorkerStatus
+    : "UNKNOWN";
   const connectionStage = typeof result.extensionConnectionStage === "string"
     ? result.extensionConnectionStage
     : result.clerkUserId
       ? "connecting"
       : "waiting-for-dashboard";
-  statusElement.textContent = identityVerified
-    ? "Ready"
-    : statusLabelForConnection(connectionStage, facebookStatus);
-  statusElement.className = `page-status ${identityVerified ? "ready" : "attention"}`;
+  const recoveryCandidates = Array.isArray(result.extensionRecoveryCandidates)
+    ? result.extensionRecoveryCandidates as RecoveryCandidate[]
+    : [];
+  // The worker can know recovery is required before the candidate payload has
+  // arrived (for example while the session check is still in flight). Keep the
+  // recovery panel visible in that state so the user can still choose
+  // “Create new connection” instead of being stranded on “Checking…”.
+  const recoveryRequired = connectionStage === "recovery-required";
+  const detectedFacebookUserId = typeof result.detectedFacebookUserId === "string"
+    ? result.detectedFacebookUserId
+    : "";
+  renderSetupProgress(connectionStage, typeof result.clerkUserId === "string" && Boolean(result.clerkUserId));
+
+  // Determine the primary lifecycle message (administrative lifecycle)
+  const lifecycle = lifecycleLabel(lifecycleStatus);
+  // Determine the Facebook health message (separate from administrative lifecycle)
+  const health = facebookHealthLabel(facebookStatus);
+
+  const stageLabels: Record<string, { text: string; className: string }> = {
+    "waiting-for-dashboard": { text: "Open PostFlow dashboard to connect", className: "attention" },
+    "user-found": { text: "PostFlow account found — connecting…", className: "" },
+    connecting: { text: "Connecting to PostFlow…", className: "" },
+    "verifying-facebook": { text: "Checking Facebook session…", className: "" },
+    "facebook-required": { text: "Facebook login required", className: "attention" },
+    "backend-unavailable": { text: "API unavailable — retrying…", className: "attention" },
+    connected: { text: "Connected", className: "ready" },
+  };
+  const stageLabel = stageLabels[connectionStage];
+  // Primary status describes the actual handshake step, rather than showing
+  // ACTIVE while the installation is still unbound or waiting for auth.
+  statusElement.textContent = recoveryRequired
+    ? "Choose a connection to continue"
+    : stageLabel?.text ?? lifecycle.text;
+  statusElement.className = `page-status ${recoveryRequired ? "paused" : stageLabel?.className ?? lifecycle.className}`;
+
+  const stageDetails: Record<string, string> = {
+    "waiting-for-dashboard": "The extension has not received your PostFlow user ID yet. Keep the signed-in dashboard open and click Connect below.",
+    "user-found": "Your PostFlow account was found. Registering this browser installation.",
+    connecting: "Authenticating this installation with the PostFlow API.",
+    "verifying-facebook": "Facebook is detected. Matching it to your PostFlow connection.",
+    "facebook-required": "Your PostFlow account is connected. Open Facebook and sign in so we can verify the Facebook identity.",
+    "backend-unavailable": "The API cannot be reached. We will retry automatically.",
+    connected: "Ready to claim publishing and maintenance work.",
+    "recovery-required": "A previous connection matches this Facebook account. Choose what to restore.",
+  };
+  connectionDetailElement.textContent = recoveryRequired
+    ? stageDetails["recovery-required"]
+    : stageDetails[connectionStage] ?? `Lifecycle: ${lifecycle.text}`;
+  connectionAccountElement.textContent = detectedFacebookUserId
+    ? `Facebook account detected ••••${detectedFacebookUserId.slice(-4)}`
+    : "Facebook account not detected yet";
+  connectionUpdatedElement.textContent = `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
+  refreshConnectionButton.hidden = !["waiting-for-dashboard", "backend-unavailable"].includes(connectionStage);
+  refreshConnectionButton.disabled = false;
+
+  recoveryPanel.toggleAttribute("hidden", !recoveryRequired);
+  if (recoveryRequired) renderRecoveryCandidates(recoveryCandidates);
+
+  // Show Facebook health separately
+  const healthElement = document.getElementById("facebook-health");
+  if (healthElement) {
+    healthElement.textContent = recoveryRequired
+      ? "Facebook detected — choose Reconnect or Create new connection"
+      : health.text;
+    healthElement.className = `facebook-health ${recoveryRequired ? "attention" : health.className}`;
+  }
+
+  // Show/hide dashboard link for paused/revoked states
+  const dashboardLinkContainer = document.getElementById("lifecycle-dashboard-link");
+  if (dashboardLinkContainer) {
+    dashboardLinkContainer.toggleAttribute("hidden", !lifecycle.showDashboardLink);
+  }
 
   const webAppOnline = typeof result.webAppLastSeenAt === "number" &&
     Date.now() - result.webAppLastSeenAt < 90_000;
@@ -584,21 +839,6 @@ async function loadConnectionStatus() {
     : undefined;
   const lastSyncLabel = document.getElementById("last-sync-status");
   if (lastSyncLabel) lastSyncLabel.textContent = lastSyncedAt ? timeAgo(lastSyncedAt) : "Never";
-}
-
-function statusLabelForConnection(stage: string, facebookStatus: string): string {
-  if (stage === "waiting-for-dashboard") return "Open dashboard";
-  if (stage === "user-found" || stage === "connecting") return "Connecting...";
-  if (stage === "verifying-facebook") return "Verifying Facebook...";
-  if (stage === "backend-unavailable") return "Connection failed";
-  return statusLabelForFacebook(facebookStatus);
-}
-
-function statusLabelForFacebook(status: string): string {
-  if (status === "LOGIN_REQUIRED") return "Login needed";
-  if (status === "ACCOUNT_MISMATCH") return "Wrong account";
-  if (status === "BLOCKED") return "Blocked";
-  return "Not ready";
 }
 
 function timeAgo(timestamp: number): string {
@@ -671,7 +911,7 @@ function renderGroupSummary(
   notSyncedCountElement.textContent = String(notSyncedCount);
 
   if (!identityVerified) {
-    groupsSummaryElement.textContent = statusLabelForFacebook(facebookStatus);
+    groupsSummaryElement.textContent = facebookHealthLabel(facebookStatus).text;
   } else if (detectedCount === 0) {
     groupsSummaryElement.textContent = "Open Facebook and refresh.";
   } else if (syncStatus === "syncing") {
@@ -726,8 +966,60 @@ openDashboardButton.addEventListener("click", async () => {
   await chrome.tabs.create({ url: dashboardUrl });
 });
 
+const recoveryDashboardLink = document.getElementById("open-dashboard-for-recovery");
+if (recoveryDashboardLink) {
+  recoveryDashboardLink.addEventListener("click", async (event) => {
+    event.preventDefault();
+    const existingTabs = await chrome.tabs.query({
+      url: [
+        "http://localhost:3001/*",
+        "http://127.0.0.1:3001/*",
+        "https://fitcure.online/*",
+      ],
+    });
+    const existingTab = existingTabs.find((tab) => tab.id !== undefined);
+    if (existingTab?.id !== undefined) {
+      await chrome.tabs.update(existingTab.id, { active: true });
+      if (existingTab.windowId !== undefined) {
+        await chrome.windows.update(existingTab.windowId, { focused: true });
+      }
+      return;
+    }
+    const result = await chrome.storage.local.get(["webAppLastDashboardUrl", "webAppLastUrl"]);
+    const dashboardUrl = typeof result.webAppLastDashboardUrl === "string" && result.webAppLastDashboardUrl.trim()
+      ? result.webAppLastDashboardUrl.trim()
+      : typeof result.webAppLastUrl === "string" && result.webAppLastUrl.trim()
+        ? result.webAppLastUrl.trim()
+        : "http://localhost:3001";
+    await chrome.tabs.create({ url: dashboardUrl });
+  });
+}
+
 openFacebookGroupsButton.addEventListener("click", async () => {
   await chrome.tabs.create({ url: "https://www.facebook.com/groups/joins/?nav_source=tab" });
+});
+
+createNewConnectionButton.addEventListener("click", async () => {
+  const confirmed = window.confirm(
+    "Create a separate connection? The previous connection and its history will stay unchanged.",
+  );
+  if (!confirmed) return;
+  setRecoveryBusy(true);
+  recoveryStatusElement.textContent = "Creating connection...";
+  try {
+    const result = await requestExtensionRecovery({ createNewConnection: true });
+    if (!result?.ok) {
+      recoveryStatusElement.textContent = result?.error ?? "Could not create the connection.";
+      return;
+    }
+    recoveryStatusElement.textContent = "Connection created.";
+    await loadExtensionName();
+    await loadConnectionStatus();
+  } catch {
+    recoveryStatusElement.textContent = "Could not contact the extension worker.";
+  } finally {
+    setRecoveryBusy(false);
+  }
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
@@ -742,6 +1034,9 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     "webAppLastSeenAt",
     "facebookIdentityVerified",
     "facebookConnectionStatus",
+    "extensionLifecycleStatus",
+    "extensionWorkerStatus",
+    "extensionRecoveryCandidates",
   ]);
   if (!Object.keys(changes).some((key) => relevantKeys.has(key))) return;
   void loadConnectionStatus();
@@ -786,3 +1081,20 @@ loadGroups();
 loadConnectionStatus();
 loadExtensionName();
 loadPhoneCollectorState();
+
+refreshConnectionButton.addEventListener("click", async () => {
+  refreshConnectionButton.disabled = true;
+  refreshConnectionButton.textContent = "Requesting dashboard identity…";
+  connectionDetailElement.textContent = "Asking the signed-in PostFlow dashboard for your user ID…";
+  try {
+    const result = await chrome.runtime.sendMessage({ type: "REFRESH_AUTH_CONTEXT" });
+    if (!result?.ok) {
+      connectionDetailElement.textContent = result?.error ?? "Open the signed-in PostFlow dashboard, then try again.";
+    }
+  } catch {
+    connectionDetailElement.textContent = "Could not contact the extension worker. Reload the extension and try again.";
+  } finally {
+    refreshConnectionButton.textContent = "Connect to PostFlow dashboard";
+    await loadConnectionStatus();
+  }
+});

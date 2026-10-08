@@ -33,6 +33,10 @@ import {
   type MaintenanceMetricName,
   type MaintenanceWorkType,
 } from './maintenance-diagnostics.js';
+import {
+  normalizeRecoveryCandidates,
+  type RecoveryCandidate,
+} from './extension-recovery.js';
 
 console.info(
   `[PostFlow] ${BUILD_ENV === 'production' ? 'PROD' : 'DEV'} environment | API: ${API_BASE_URL} | Automatic analytics: ${AUTOMATIC_ANALYTICS_ENABLED ? 'ON' : 'OFF'}`,
@@ -41,7 +45,10 @@ console.info(
 const HEARTBEAT_ALARM = 'postflow-heartbeat';
 const HEARTBEAT_INTERVAL_MINUTES = 1;
 const REGISTER_RETRY_ALARM = 'postflow-register-retry';
-const REGISTER_RETRY_DELAY_MINUTES = 1;
+// Chrome clamps alarm delays to its minimum interval, but keeping this below a
+// minute makes a missing dashboard handshake recover quickly instead of
+// leaving the popup on “Checking…” for a full minute.
+const REGISTER_RETRY_DELAY_MINUTES = 0.5;
 const PENDING_POST_SYNC_ALARM = 'postflow-pending-post-sync';
 const PENDING_POST_SYNC_INTERVAL_MINUTES =
   PENDING_MAINTENANCE_WAKE_INTERVAL_MINUTES;
@@ -59,6 +66,8 @@ const EXTENSION_INSTANCE_ID_KEY = 'extensionInstanceId';
 const EXTENSION_NAME_KEY = 'extensionName';
 const EXTENSION_CREDENTIAL_KEY = 'extensionCredential';
 const EXTENSION_CREDENTIAL_ISSUED_AT_KEY = 'credentialIssuedAt';
+const EXTENSION_LIFECYCLE_STATUS_KEY = 'extensionLifecycleStatus';
+const RECOVERY_CANDIDATES_KEY = 'extensionRecoveryCandidates';
 const TAB_ACTION_RETRY_COUNT = 6;
 const TAB_ACTION_RETRY_DELAY_MS = 500;
 const FACEBOOK_NOTIFICATIONS_URL = 'https://www.facebook.com/notifications/';
@@ -84,6 +93,16 @@ interface ApiFetchFailure {
   apiFetchError: true;
   status: number;
   message?: string;
+}
+
+async function persistRecoveryCandidates(value: unknown): Promise<RecoveryCandidate[]> {
+  const candidates = normalizeRecoveryCandidates(value);
+  if (candidates.length) {
+    await chrome.storage.local.set({ [RECOVERY_CANDIDATES_KEY]: candidates });
+  } else {
+    await chrome.storage.local.remove(RECOVERY_CANDIDATES_KEY);
+  }
+  return candidates;
 }
 
 // Identifies structured API failures returned only to callers that request details.
@@ -122,6 +141,20 @@ function createExtensionInstanceId(): string {
   const randomId = globalThis.crypto?.randomUUID?.()
     ?? `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
   return `pfi_${randomId}`;
+}
+
+function isPostFlowDashboardUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (
+      (url.protocol === 'https:' && url.hostname === 'fitcure.online') ||
+      (url.protocol === 'http:' &&
+        (url.hostname === 'localhost' || url.hostname === '127.0.0.1') &&
+        url.port === '3001')
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function getExtensionInstanceId(): Promise<string> {
@@ -262,12 +295,48 @@ async function persistExtensionCredential(credential?: string): Promise<void> {
   console.log('[PostFlow] Installation credential stored');
 }
 
+async function getExtensionLifecycleStatus(): Promise<string | null> {
+  const result = await chrome.storage.local.get(EXTENSION_LIFECYCLE_STATUS_KEY);
+  const status = result[EXTENSION_LIFECYCLE_STATUS_KEY];
+  return typeof status === 'string' && status.trim() ? status.trim() : null;
+}
+
+async function persistExtensionLifecycleStatus(status?: string): Promise<void> {
+  if (typeof status !== 'string' || !status.trim()) return;
+  await chrome.storage.local.set({ [EXTENSION_LIFECYCLE_STATUS_KEY]: status.trim() });
+  console.log('[PostFlow] Installation lifecycle status stored:', status);
+}
+
+async function clearExtensionLifecycleStatus(): Promise<void> {
+  await chrome.storage.local.remove(EXTENSION_LIFECYCLE_STATUS_KEY);
+  console.log('[PostFlow] Installation lifecycle status cleared');
+}
+
+/**
+ * The credential is intentionally not recoverable from the API. If local
+ * extension storage lost it while the server installation is still active,
+ * treat this as a fresh reinstall instead of retrying the same ID forever.
+ */
+async function resetInstallationIdentityAfterCredentialLoss(): Promise<void> {
+  await chrome.storage.local.remove([
+    EXTENSION_INSTANCE_ID_KEY,
+    EXTENSION_CREDENTIAL_KEY,
+    EXTENSION_CREDENTIAL_ISSUED_AT_KEY,
+    EXTENSION_LIFECYCLE_STATUS_KEY,
+    RECOVERY_CANDIDATES_KEY,
+    'extensionConnectionStage',
+  ]);
+  extensionInstanceIdPromise = null;
+  console.warn('[PostFlow] Installation credential is unavailable; starting a fresh installation registration');
+}
+
 // Uses shared authentication and URL fallback; detailed failures are opt-in for UI workflows.
 async function apiFetch(
   path: string,
   body?: Record<string, unknown>,
   method?: string,
   includeFailureDetails = false,
+  allowCredentialReset = true,
 ) {
   if (!path || !path.startsWith('/')) {
     console.warn('[PostFlow] Refusing API call with invalid path:', path);
@@ -331,6 +400,23 @@ async function apiFetch(
           message = typeof parsed.message === 'string' ? parsed.message : undefined;
         } catch {
           // Keep the compact status-only error for non-JSON responses.
+        }
+        if (
+          response.status === 403 &&
+          allowCredentialReset &&
+          (path === '/api/extensions/register' || path === '/api/extensions/heartbeat') &&
+          message &&
+          /x-extension-credential header is required|installation credential is invalid/i.test(message)
+        ) {
+          await resetInstallationIdentityAfterCredentialLoss();
+          return apiFetch(path, body, httpMethod, includeFailureDetails, false);
+        }
+        if (
+          response.status === 403 &&
+          message &&
+          /revoked|credential has been revoked|installation has been revoked/i.test(message)
+        ) {
+          await handleRevokedInstallation();
         }
         const maintenanceWorkType = getMaintenanceWorkTypeForRequest(
           path,
@@ -605,12 +691,30 @@ function registerExtension(): Promise<boolean> {
             ? 'revoked'
             : 'revoke-pending',
         });
+        await persistExtensionLifecycleStatus(registrationStatus);
+        if (registrationStatus === 'REVOKED') {
+          await handleRevokedInstallation();
+        }
         return false;
       }
       // The backend issues a fresh credential on first registration and when a
       // legacy installation is upgraded; persist it for future requests.
       if (typeof result.credentialIssued === 'string' && result.credentialIssued) {
         await persistExtensionCredential(result.credentialIssued);
+      }
+      const recoveryCandidates = await persistRecoveryCandidates(
+        result.candidates,
+      );
+      await persistExtensionLifecycleStatus(
+        registrationStatus === 'RECOVERY_AVAILABLE' ||
+          registrationStatus === 'NEW_INSTALLATION'
+          ? 'ACTIVE'
+          : registrationStatus,
+      );
+      if (registrationStatus === 'RECOVERY_AVAILABLE' || recoveryCandidates.length) {
+        await chrome.storage.local.set({ extensionConnectionStage: 'recovery-required' });
+        console.log('[PostFlow] Recovery choice required before binding this installation');
+        return true;
       }
       await chrome.storage.local.set({ extensionConnectionStage: 'verifying-facebook' });
       console.log('[PostFlow] Registered with backend:', registrationStatus);
@@ -648,18 +752,59 @@ async function sendHeartbeat() {
     if (result.status === 'REVOKE_PENDING') {
       console.warn('[PostFlow] Extension is disconnecting; finishing in-flight work');
     }
+    await persistExtensionLifecycleStatus(result.status);
+    // If the backend says REVOKED, we must stop all worker activity immediately.
+    if (result.status === 'REVOKED') {
+      await handleRevokedInstallation();
+    }
   }
+}
+
+async function handleRevokedInstallation(): Promise<void> {
+  console.warn('[PostFlow] Installation revoked — stopping all worker activity');
+  // Clear the credential so no further authenticated requests can be made.
+  await chrome.storage.local.remove(EXTENSION_CREDENTIAL_KEY);
+  await chrome.storage.local.remove(EXTENSION_CREDENTIAL_ISSUED_AT_KEY);
+  // Clear all maintenance alarms so no new work is attempted.
+  await chrome.alarms.clear(PENDING_POST_SYNC_ALARM);
+  await chrome.alarms.clear(ENGAGEMENT_SYNC_ALARM);
+  await chrome.alarms.clear(MANUAL_MAINTENANCE_ALARM);
+  // Clear the heartbeat alarm so no more heartbeats are sent.
+  await chrome.alarms.clear(HEARTBEAT_ALARM);
+  // Clear the register retry alarm.
+  await chrome.alarms.clear(REGISTER_RETRY_ALARM);
+  // Update local state.
+  await chrome.storage.local.set({
+    extensionConnectionStage: 'revoked',
+    [EXTENSION_LIFECYCLE_STATUS_KEY]: 'REVOKED',
+    extensionWorkerStatus: 'OFFLINE',
+  });
+  // Notify any open popups.
+  chrome.runtime.sendMessage({ type: 'LIFECYCLE_REVOKED' }).catch(() => undefined);
+}
+
+// Returns true if the local lifecycle status allows claiming new work.
+async function canClaimNewWork(): Promise<boolean> {
+  const lifecycle = await getExtensionLifecycleStatus();
+  if (!lifecycle) return true; // No status yet (first register), allow.
+  if (lifecycle === 'PAUSED' || lifecycle === 'REVOKE_PENDING' || lifecycle === 'REVOKED') {
+    console.log('[PostFlow] Skipping new work claim — lifecycle:', lifecycle);
+    return false;
+  }
+  return true;
 }
 
 // ── Session reporting ──
 
 type FacebookConnectionSessionResponse = {
   connection?: {
+    displayName?: string | null;
     status?: string;
     workerStatus?: string;
     facebookUserId?: string;
     detectedFacebookUserId?: string;
   };
+  recoveryCandidates?: RecoveryCandidate[];
 };
 
 let facebookIdentityVerified = false;
@@ -676,6 +821,26 @@ async function reportSession(sessionDetected: boolean, facebookUserId?: string |
       ...(normalizedFacebookUserId ? { facebookUserId: normalizedFacebookUserId } : {}),
     }) as FacebookConnectionSessionResponse | null;
     const connection = result?.connection;
+    if (connection) {
+      const connectionDisplayName = typeof connection.displayName === 'string'
+        ? connection.displayName.trim()
+        : '';
+      if (connectionDisplayName) {
+        await chrome.storage.local.set({ [EXTENSION_NAME_KEY]: connectionDisplayName });
+      } else {
+        await chrome.storage.local.remove(EXTENSION_NAME_KEY);
+      }
+    }
+    const recoveryCandidates = await persistRecoveryCandidates(
+      result?.recoveryCandidates,
+    );
+    if (recoveryCandidates.length > 0 && !connection) {
+      await chrome.storage.local.set({
+        extensionConnectionStage: 'recovery-required',
+      });
+    } else if (connection) {
+      await chrome.storage.local.set({ extensionConnectionStage: 'connected' });
+    }
     facebookConnectionStatus = connection?.status ?? 'UNKNOWN';
     facebookIdentityVerified = Boolean(
       sessionDetected &&
@@ -729,6 +894,50 @@ async function refreshFacebookSession() {
     console.warn('[PostFlow] Could not read Facebook session cookie', error);
     return false;
   }
+}
+
+async function completeExtensionRecovery(options: {
+  connectionId?: string;
+  createNewConnection?: boolean;
+  confirmReplacement?: boolean;
+  approvalToken?: string;
+}): Promise<{ ok: boolean; error?: string; confirmationRequired?: boolean }> {
+  const result = await apiFetch(
+    '/api/extensions/reconnect',
+    options,
+    'POST',
+    true,
+  );
+  if (isApiFetchFailure(result)) {
+    const confirmationRequired = Boolean(
+      result.status === 409 &&
+      result.message?.includes('REPLACEMENT_CONFIRMATION_REQUIRED'),
+    );
+    return {
+      ok: false,
+      confirmationRequired,
+      error: confirmationRequired
+        ? 'The previous extension is still online. Confirm that you want this installation to replace it.'
+        : result.message ?? 'Could not reconnect this installation.',
+    };
+  }
+
+  // Reconnect keeps the selected connection record and its display name. Make
+  // the local popup identity follow that recovered connection instead of
+  // continuing to show the temporary name from this fresh installation.
+  const recoveredDisplayName = typeof result?.displayName === 'string'
+    ? result.displayName.trim()
+    : '';
+  if (recoveredDisplayName) {
+    await chrome.storage.local.set({ [EXTENSION_NAME_KEY]: recoveredDisplayName });
+  } else {
+    await chrome.storage.local.remove(EXTENSION_NAME_KEY);
+  }
+  await persistRecoveryCandidates([]);
+  await persistExtensionLifecycleStatus('ACTIVE');
+  await chrome.storage.local.set({ extensionConnectionStage: 'connected' });
+  await refreshFacebookSession();
+  return { ok: true };
 }
 
 chrome.cookies.onChanged.addListener((changeInfo) => {
@@ -912,6 +1121,46 @@ chrome.runtime.onConnect.addListener((port) => {
 // ── Session + sync messages ──
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'COMPLETE_EXTENSION_RECOVERY') {
+    void completeExtensionRecovery({
+      ...(typeof message.connectionId === 'string'
+        ? { connectionId: message.connectionId }
+        : {}),
+      createNewConnection: message.createNewConnection === true,
+      confirmReplacement: message.confirmReplacement === true,
+    })
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Could not reconnect this installation.',
+      }));
+    return true;
+  }
+
+  if (message.type === 'RECONNECT_WITH_APPROVAL') {
+    // Approval codes originate from the authenticated dashboard content
+    // script, never from a Facebook page.
+    if (!sender.tab?.url || !isPostFlowDashboardUrl(sender.tab.url)) {
+      sendResponse({ ok: false, error: 'Reconnect approval must come from the PostFlow dashboard.' });
+      return;
+    }
+    void completeExtensionRecovery({
+      ...(typeof message.connectionId === 'string'
+        ? { connectionId: message.connectionId }
+        : {}),
+      ...(typeof message.approvalToken === 'string'
+        ? { approvalToken: message.approvalToken }
+        : {}),
+      confirmReplacement: message.confirmReplacement === true,
+    })
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Could not restore this connection.',
+      }));
+    return true;
+  }
+
   if (message.type === 'AUTH_CONTEXT_READY') {
     void (async () => {
       let registered = await registerExtension();
@@ -926,6 +1175,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .catch((error) => sendResponse({
         ok: false,
         error: error instanceof Error ? error.message : 'Could not connect extension',
+      }));
+    return true;
+  }
+
+  if (message.type === 'REFRESH_AUTH_CONTEXT') {
+    void requestDashboardAuthContext()
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Could not request dashboard identity',
       }));
     return true;
   }
@@ -1114,7 +1373,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message.type === 'TRIGGER_JOB_CHECK') {
-    checkPendingJobs();
+    // A post can be created immediately after recovery while the worker's
+    // in-memory Facebook identity flag is still warming up. Refresh first so
+    // the one-shot dashboard signal is not lost behind the identity gate.
+    void (async () => {
+      if (!facebookIdentityVerified) {
+        await refreshFacebookSession();
+      }
+      await checkPendingJobs();
+    })();
   }
   if (message.type === 'GET_JOB_STATUS' && typeof message.jobId === 'string') {
     void apiFetch(`/api/jobs/${message.jobId}`)
@@ -1180,6 +1447,9 @@ async function checkPendingJobs() {
     console.log('[PostFlow] Publishing blocked until Facebook identity is verified', {
       status: facebookConnectionStatus,
     });
+    return;
+  }
+  if (!(await canClaimNewWork())) {
     return;
   }
   if (publishQueuePaused) {
@@ -2444,6 +2714,7 @@ async function syncPendingPostsBatch(
   manualOnly = false,
   maxItems = MAINTENANCE_BATCH_LIMIT,
 ): Promise<Array<{ postId: string; result: PendingPostSyncResult; updated: boolean }>> {
+  if (!(await canClaimNewWork())) return [];
   if (isPendingBatchRunning || isFacebookSyncBusy || isProcessingJob) return [];
   isPendingBatchRunning = true;
   isFacebookSyncBusy = true;
@@ -2665,6 +2936,7 @@ async function syncPublishedEngagementBatch(
   maxItems = MAINTENANCE_BATCH_LIMIT,
   mode: EngagementSyncMode = 'AUTOMATIC',
 ) {
+  if (!(await canClaimNewWork())) return [];
   if (isEngagementBatchRunning || isFacebookSyncBusy || isProcessingJob) return [];
   isEngagementBatchRunning = true;
   isFacebookSyncBusy = true;
@@ -2751,6 +3023,7 @@ async function yieldMaintenanceToPublishing(deadline: number): Promise<boolean> 
 async function runMaintenanceCoordinator(
   options: MaintenanceCoordinatorOptions = {},
 ) {
+  if (!(await canClaimNewWork())) return [];
   if (
     isMaintenanceCoordinatorRunning ||
     isProcessingJob ||
@@ -2897,10 +3170,18 @@ async function ensureMaintenanceAlarms(): Promise<void> {
   }
 }
 
-chrome.alarms.create(HEARTBEAT_ALARM, {
-  periodInMinutes: HEARTBEAT_INTERVAL_MINUTES,
-});
-void ensureMaintenanceAlarms();
+async function initializeWorkerAlarms(): Promise<void> {
+  if ((await getExtensionLifecycleStatus()) === 'REVOKED') {
+    await handleRevokedInstallation();
+    return;
+  }
+  chrome.alarms.create(HEARTBEAT_ALARM, {
+    periodInMinutes: HEARTBEAT_INTERVAL_MINUTES,
+  });
+  await ensureMaintenanceAlarms();
+}
+
+void initializeWorkerAlarms();
 // Remove state left by the retired English-video retry experiment. The
 // finalized flow performs one fresh-tab reconciliation immediately.
 void chrome.alarms.clear('postflow-english-video-link-sync');
@@ -2936,6 +3217,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 // ── Startup ──
 
+// A service-worker restart does not reinject content scripts into dashboard
+// tabs that were already open. Do this on every worker startup so the Clerk
+// user ID handshake is immediate instead of waiting for a dashboard refresh.
+void injectPostflowBridgeIntoOpenDashboardTabs();
 void registerExtension();
 
 chrome.runtime.onStartup.addListener(() => {
@@ -2955,6 +3240,11 @@ chrome.runtime.onInstalled.addListener((details) => {
 });
 
 async function injectPostflowBridgeIntoOpenDashboardTabs(): Promise<void> {
+  const stored = await chrome.storage.local.get('clerkUserId');
+  // Avoid installing duplicate observers into already-connected dashboard
+  // tabs on every service-worker wake-up. We only need the bridge when the
+  // user ID has not reached extension storage yet.
+  if (typeof stored.clerkUserId === 'string' && stored.clerkUserId.trim()) return;
   const tabs = await chrome.tabs.query({
     url: [
       'http://localhost:3001/*',
@@ -2977,4 +3267,56 @@ async function injectPostflowBridgeIntoOpenDashboardTabs(): Promise<void> {
       });
     }
   }));
+}
+
+async function requestDashboardAuthContext(): Promise<{ ok: boolean; error?: string }> {
+  const dashboardTabs = await chrome.tabs.query({
+    url: [
+      'http://localhost:3001/*',
+      'http://127.0.0.1:3001/*',
+      'https://fitcure.online/*',
+    ],
+  });
+  if (!dashboardTabs.length) {
+    return {
+      ok: false,
+      error: 'Open the signed-in PostFlow dashboard in this browser, then try again.',
+    };
+  }
+
+  // Ensure an already-open dashboard has the bridge after an extension reload,
+  // then explicitly ask it to publish its current Clerk user ID.
+  await injectPostflowBridgeIntoOpenDashboardTabs();
+  let requested = false;
+  for (const tab of dashboardTabs) {
+    if (tab.id === undefined) continue;
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, {
+        type: 'REFRESH_AUTH_CONTEXT',
+      });
+      requested = requested || response?.ok === true;
+    } catch {
+      // A tab may have navigated between query and send; try the remaining tabs.
+    }
+  }
+  if (!requested) {
+    return {
+      ok: false,
+      error: 'The dashboard tab is not ready. Refresh it once, then try again.',
+    };
+  }
+
+  // The content bridge writes storage asynchronously. Give it a short window
+  // to complete before retrying registration immediately.
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    if (await getClerkUserId()) {
+      await registerExtension();
+      return { ok: true };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return {
+    ok: false,
+    error: 'The dashboard did not provide a user ID. Confirm that you are signed in and refresh the dashboard.',
+  };
 }

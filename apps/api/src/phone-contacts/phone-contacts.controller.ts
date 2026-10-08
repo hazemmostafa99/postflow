@@ -29,6 +29,8 @@ export class PhoneContactsController {
     @Query('qualificationStatus') qualificationStatus?: string,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
+    @Query('cursor') cursor?: string,
+    @Query('includeMetadata') includeMetadata?: string,
   ) {
     const normalizedUserId = clerkUserId?.trim();
     if (!normalizedUserId) {
@@ -41,6 +43,8 @@ export class PhoneContactsController {
       qualificationStatus,
       page: page ? Number(page) : undefined,
       limit: limit ? Number(limit) : undefined,
+      cursor,
+      includeMetadata: includeMetadata !== 'false',
     });
   }
 

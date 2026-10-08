@@ -6,6 +6,16 @@
  * This enables the background service worker to authenticate API calls.
  */
 
+// The background worker may reinject this bridge into an already-open
+// dashboard tab after a service-worker restart. Keep the script idempotent so
+// a second injection does not redeclare top-level constants or duplicate
+// observers/listeners.
+var postflowBridgeGlobal = globalThis as typeof globalThis & {
+  __postflowContentBridgeInstalled?: boolean;
+};
+if (!postflowBridgeGlobal.__postflowContentBridgeInstalled) {
+postflowBridgeGlobal.__postflowContentBridgeInstalled = true;
+
 const USER_ID_ATTR = 'data-postflow-user-id';
 const PENDING_SYNC_KEY = 'postflow:pending-sync-groups';
 const PENDING_JOB_CHECK_KEY = 'postflow:pending-job-check';
@@ -156,7 +166,15 @@ consumePendingGroupSync();
 consumePendingJobCheck();
 
 const observer = new MutationObserver(() => extractAndStore());
-observer.observe(document.body, { childList: true, subtree: true });
+// Clerk may hydrate/update the user metadata attribute after the initial DOM
+// render. Observe attributes as well as inserted nodes so the ID is captured
+// immediately instead of waiting for an alarm or a full page refresh.
+observer.observe(document.body, {
+  childList: true,
+  subtree: true,
+  attributes: true,
+  attributeFilter: [USER_ID_ATTR],
+});
 
 const pendingSyncInterval = window.setInterval(() => {
   if (!isExtensionAlive()) {
@@ -179,6 +197,15 @@ const webAppPresenceInterval = window.setInterval(() => {
   });
 }, 30_000);
 
+// The popup can request an auth refresh directly instead of waiting for a
+// dashboard reload or the registration retry alarm.
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type !== 'REFRESH_AUTH_CONTEXT') return;
+  extractAndStore();
+  notifyAuthContextReady();
+  sendResponse({ ok: true });
+});
+
 // Listen for manual sync requests dispatched by the Web App dashboard
 window.addEventListener('postflow:sync-groups', () => {
   try {
@@ -194,3 +221,38 @@ window.addEventListener('postflow:check-jobs', () => {
   console.log('[PostFlow] Job check requested from Web App');
   safeSend({ type: 'TRIGGER_JOB_CHECK' });
 });
+
+// Carries a short-lived reconnect approval directly from the authenticated
+// dashboard to this browser profile's extension worker. The token is never
+// rendered into the page or written to local/session storage.
+window.addEventListener('postflow:reconnect-approval', (event) => {
+  if (!isExtensionAlive()) return;
+  const detail = (event as CustomEvent).detail as Record<string, unknown> | null;
+  const connectionId = typeof detail?.connectionId === 'string'
+    ? detail.connectionId
+    : '';
+  const approvalToken = typeof detail?.approvalToken === 'string'
+    ? detail.approvalToken
+    : '';
+  const requestId = typeof detail?.requestId === 'string' ? detail.requestId : '';
+  if (!connectionId || !approvalToken || !requestId) return;
+
+  chrome.runtime.sendMessage(
+    {
+      type: 'RECONNECT_WITH_APPROVAL',
+      connectionId,
+      approvalToken,
+    },
+    (response) => {
+      const error = chrome.runtime.lastError?.message;
+      window.dispatchEvent(new CustomEvent('postflow:reconnect-result', {
+        detail: {
+          requestId,
+          ok: !error && response?.ok === true,
+          error: error || response?.error,
+        },
+      }));
+    },
+  );
+});
+}

@@ -392,6 +392,61 @@ describe('PhoneContactsService', () => {
       });
     });
 
+    it('uses a stable cursor and skips shared metadata work for load-more requests', async () => {
+      const cursor = Buffer.from(
+        JSON.stringify({
+          lastSeenAt: '2026-10-06T12:00:00.000Z',
+          id: '68e64b80a7f14ad8f0678a01',
+        }),
+      ).toString('base64url');
+      const { model, query, countDocuments } = listModel({ contacts: [] });
+      const service = new PhoneContactsService(model as never);
+
+      const result = await service.listPhoneContacts('user-1', {
+        qualificationStatus: 'QUALIFIED',
+        cursor,
+        includeMetadata: false,
+      });
+
+      expect(countDocuments).not.toHaveBeenCalled();
+      expect(model.distinct).not.toHaveBeenCalled();
+      expect(query.skip).toHaveBeenCalledWith(0);
+      expect(query.limit).toHaveBeenCalledWith(21);
+      expect(model.find).toHaveBeenCalledWith({
+        clerkUserId: 'user-1',
+        $and: [
+          { qualificationStatus: 'QUALIFIED' },
+          {
+            $or: [
+              { lastSeenAt: { $lt: new Date('2026-10-06T12:00:00.000Z') } },
+              {
+                lastSeenAt: new Date('2026-10-06T12:00:00.000Z'),
+                _id: { $lt: expect.anything() },
+              },
+            ],
+          },
+        ],
+      });
+      expect(result).not.toHaveProperty('categories');
+      expect(result).not.toHaveProperty('statusCounts');
+      expect(result.pagination).toMatchObject({
+        hasMore: false,
+        nextCursor: null,
+      });
+      expect(result.pagination).not.toHaveProperty('total');
+    });
+
+    it('rejects a malformed lead cursor before querying the database', async () => {
+      const { model, countDocuments } = listModel({ contacts: [] });
+      const service = new PhoneContactsService(model as never);
+
+      await expect(
+        service.listPhoneContacts('user-1', { cursor: 'not-a-cursor' }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(countDocuments).not.toHaveBeenCalled();
+      expect(model.find).not.toHaveBeenCalled();
+    });
+
     it('rejects an unsupported qualification status filter', async () => {
       const { model, countDocuments } = listModel({ countResponses: [] });
       const service = new PhoneContactsService(model as never);
