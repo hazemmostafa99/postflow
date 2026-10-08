@@ -4,6 +4,7 @@ import {
   ConnectionsDashboard,
   type FacebookConnection,
 } from "./connections-dashboard";
+import { PlatformConnectionsPanel } from "./platform-connections-panel";
 
 const API_BASE = process.env.API_URL || "http://localhost:8000";
 
@@ -42,10 +43,13 @@ export default async function ConnectionsPage() {
   const result = await fetchConnections(userId);
 
   return (
-    <ConnectionsDashboard
-      connections={result.connections}
-      unavailable={result.unavailable}
-      refreshedAt={new Date().toISOString()}
-    />
+    <>
+      <PlatformConnectionsPanel />
+      <ConnectionsDashboard
+        connections={result.connections}
+        unavailable={result.unavailable}
+        refreshedAt={new Date().toISOString()}
+      />
+    </>
   );
 }

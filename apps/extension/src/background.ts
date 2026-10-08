@@ -481,6 +481,7 @@ export async function apiFetch(
 }
 
 registerInstagramSessionWorker(apiFetch);
+console.info('[PostFlow][Instagram] Background bridge ready');
 
 // Reads persisted review state and submits only selected, valid normalized numbers.
 async function syncPhoneNumbersToBackend(): Promise<PhoneSyncResponse> {

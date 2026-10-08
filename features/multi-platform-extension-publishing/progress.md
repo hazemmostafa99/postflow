@@ -304,15 +304,22 @@ Status: `IN PROGRESS - SESSION DETECTION FOUNDATION`
 
 ## Checklist
 
-- [x] Add narrowly scoped Instagram manifest permission.
+- [x] Add narrowly scoped Instagram manifest permissions for both root and
+      `www` hosts.
 - [x] Add an independent Instagram content-script bundle.
 - [x] Detect whether an Instagram session exists.
 - [x] Detect the strongest reliable Instagram account identity available to
       the sanitized DOM detector.
 - [x] Report expected and detected identity separately for bound connections.
+- [x] Auto-create a first-time Instagram connection from a verified session;
+      keep existing-account recovery explicit and fail closed.
+- [x] Keep an explicit Instagram connection-creation API and owned-installation
+      listing as a manual/recovery fallback.
+- [x] Add authenticated web proxy routes for installations and platform
+      connection creation.
 - [ ] Add Instagram connection/reconnection backend flows.
-- [ ] Add Instagram connection state to the extension popup.
-- [ ] Add Instagram connection state to the web dashboard.
+- [x] Add Instagram connection state to the extension popup.
+- [x] Add Instagram connection state to the web dashboard.
 - [x] Block Instagram claims for logout, mismatch, pause, or archive states
       when a generic Instagram connection exists.
 - [ ] Confirm an Instagram interruption does not block Facebook jobs.
@@ -327,7 +334,7 @@ English UI with dedicated test accounts before enabling Instagram publishing.
 ## Review Notes
 
 ```text
-Status: IN PROGRESS - session reporting only; no connection binding
+Status: IN PROGRESS - automatic first-time connection binding
 
 Files changed:
 - apps/api/src/extensions/extensions.controller.ts
@@ -340,6 +347,13 @@ Files changed:
 - apps/extension/src/platforms/instagram/identity.ts
 - apps/extension/src/platforms/instagram/content.ts
 - apps/extension/src/platforms/instagram/worker.ts
+- apps/web/src/app/api/extensions/installations/route.ts
+- apps/web/src/app/api/extensions/platform-connections/route.ts
+- apps/web/src/app/(dashboard)/connections/platform-connections-panel.tsx
+- apps/web/src/app/(dashboard)/connections/page.tsx
+- apps/extension/src/platforms/instagram/popup.ts
+- apps/extension/src/popup/popup.html
+- apps/extension/src/popup/popup.ts
 
 Implementation:
 - Added a narrowly scoped Instagram host permission and independent content
@@ -347,26 +361,49 @@ Implementation:
   evidence and falls back to a normalized profile pathname.
 - Added a small worker bridge that accepts only messages from Instagram tabs
   and reports session state to the credential-authenticated API endpoint.
-- Added `POST /api/extensions/platform-session`. It updates only an existing,
-  installation-owned generic connection, keeps expected/detected identities
-  separate, and marks logout or mismatch without automatic rebinding.
+- Added `POST /api/extensions/platform-session`. A first-time Instagram
+  identity now creates an installation-owned generic connection automatically;
+  repeated reports update that connection, keep expected/detected identities
+  separate, and mark logout or mismatch without automatic rebinding.
+- Kept dashboard-authenticated `GET /api/extensions/installations` and
+  `POST /api/extensions/platform-connections` as a manual/recovery fallback.
+  The normal first-time flow no longer requires a display name or username
+  form; the backend derives `Instagram @username` from the detected session.
+- Added authenticated Next.js proxy routes for those dashboard calls; no
+  publishing selector is enabled yet.
+- Added an independent dashboard panel that polls and displays automatically
+  detected Instagram connections. The existing Facebook connections dashboard
+  was not refactored.
+- Added a small Instagram status card to the extension popup. It reads only
+  redacted session/status state persisted by the Instagram worker bridge and
+  does not add publishing controls.
+- Added Instagram diagnostics at content-script load, identity detection,
+  worker message receipt/API response, and backend session handling so a
+  missing session report is distinguishable from a rejected connection.
+- Made the Facebook network-spy asset path layout-aware so both the project
+  root and the self-contained `apps/extension/dist` folder can be loaded as
+  an unpacked extension without requesting `dist/dist/graphql-spy.js`.
 - Instagram publishing remains disabled; no Instagram job creation or DOM
   composer automation was enabled.
 
 Tests/checks:
 - API build passes.
 - Extension development build passes.
-- Extension/API controller and service tests pass: 61 tests.
-- Four sanitized identity fixture tests pass when run directly; the managed
+- Web production build passes.
+- Focused API regression tests pass: six suites, 119 tests.
+- Five sanitized identity fixture tests pass when run directly; the managed
   multi-file Node test runner still reports `spawn EPERM`, and live account
-  validation is pending.
+  validation is no longer pending for the Instagram session bridge: a real
+  logged-in Instagram tab reported a normalized username and the API returned
+  `CONNECTED` / `IDLE` with an automatically created connection.
 
 Known limitations / next work:
-- A dashboard/reconnect flow must explicitly create or bind an Instagram
-  `PlatformConnection`; session reports intentionally return no connection for
-  an unbound installation.
-- Add popup/dashboard connection state and sanitized identity fixtures before
-  enabling Instagram publishing.
+- Existing-account reconnect/restore still needs a dedicated explicit action;
+  automatic first-time setup intentionally stops if the same username already
+  belongs to another active installation. The manual creation endpoint remains
+  available as a controlled fallback.
+- Add sanitized session fixture coverage for automatic creation and recovery
+  blocking, then complete live validation before enabling Instagram publishing.
 ```
 
 ---

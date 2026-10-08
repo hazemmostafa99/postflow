@@ -39,6 +39,13 @@ test('uses a visible profile link when canonical metadata is unavailable', () =>
   );
 });
 
+test('finds the profile link on the div-based Instagram home sidebar', () => {
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(loadDetector('<div><a href="/brand.account/"><span>Profile</span></a></div>'))),
+    { sessionDetected: true, externalUsername: 'brand.account', source: 'profile-link' },
+  );
+});
+
 test('does not infer the viewer from another user post URL', () => {
   assert.deepEqual(
     JSON.parse(JSON.stringify(loadDetector('', 'https://www.instagram.com/other.user/p/ABC123/'))),

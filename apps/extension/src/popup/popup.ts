@@ -3,6 +3,7 @@ import {
   recoveryCandidateLabel,
   type RecoveryCandidate,
 } from "../extension-recovery.js";
+import { initInstagramPopup } from "../platforms/instagram/popup.js";
 
 const statusElement = document.getElementById("status")!;
 const refreshButton = document.getElementById("refresh")!;
@@ -1081,6 +1082,7 @@ loadGroups();
 loadConnectionStatus();
 loadExtensionName();
 loadPhoneCollectorState();
+initInstagramPopup();
 
 refreshConnectionButton.addEventListener("click", async () => {
   refreshConnectionButton.disabled = true;

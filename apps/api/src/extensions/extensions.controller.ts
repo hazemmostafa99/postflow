@@ -38,6 +38,13 @@ class PlatformSessionDto {
   externalUsername?: string;
 }
 
+class PlatformConnectionCreateDto {
+  platform: 'INSTAGRAM' | 'TIKTOK';
+  installationId: string;
+  displayName: string;
+  externalUsername: string;
+}
+
 class ExtensionIdentityDto {
   extensionName?: unknown;
 }
@@ -75,6 +82,33 @@ export class ExtensionsController {
   async connections(@Headers('x-clerk-user-id') clerkUserId?: string) {
     return this.extensionsService.listConnections(
       this.requireClerkUserId(clerkUserId),
+    );
+  }
+
+  @Get('installations')
+  async installations(@Headers('x-clerk-user-id') clerkUserId?: string) {
+    return this.extensionsService.listInstallations(
+      this.requireClerkUserId(clerkUserId),
+    );
+  }
+
+  @Get('platform-connections')
+  async platformConnections(@Headers('x-clerk-user-id') clerkUserId?: string) {
+    return this.extensionsService.listPlatformConnections(
+      this.requireClerkUserId(clerkUserId),
+      'INSTAGRAM',
+    );
+  }
+
+  @Post('platform-connections')
+  @HttpCode(HttpStatus.OK)
+  async createPlatformConnection(
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+    @Body() body: PlatformConnectionCreateDto = new PlatformConnectionCreateDto(),
+  ) {
+    return this.extensionsService.createPlatformConnection(
+      this.requireClerkUserId(clerkUserId),
+      body,
     );
   }
 

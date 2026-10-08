@@ -487,8 +487,12 @@ supports it.
 4. The corresponding content script detects the active account using the
    strongest reliable identity available.
 5. The extension reports the detected platform identity to the backend.
-6. The user explicitly creates or reconnects a platform connection.
-7. The backend binds that connection to the installation.
+6. For a first-time Instagram/TikTok session, the backend creates a new
+   connection from the verified detected identity automatically. If that
+   identity already belongs to another installation, the backend returns a
+   recovery-required state instead of moving the binding silently.
+7. An explicit dashboard/reconnect action is used only for recovery, account
+   replacement, or a deliberate new connection choice.
 8. Before every final publish action, the content script detects the account
    again and compares it with the job's expected connection identity.
 
@@ -515,13 +519,33 @@ message. It must not receive PostFlow credentials or call the API directly.
 
 The worker validates that the message originated from an Instagram tab, then
 reports it to `POST /api/extensions/platform-session`. The backend verifies
-the installation credential and updates only the matching, already-bound
-Instagram `PlatformConnection`. It stores detected identity separately from
-expected identity, marks a mismatch as `ACCOUNT_MISMATCH`, and never creates
-or rebinds a connection from a session report. Connection creation remains an
-explicit dashboard/reconnect action.
+the installation credential and updates the matching Instagram
+`PlatformConnection`. When the installation has no Instagram connection and
+the session includes a normalized username, the backend creates the first
+connection automatically (`CONNECTED`/`IDLE`) using `Instagram @username` as
+the default display name. It stores detected identity separately from expected
+identity, marks a mismatch as `ACCOUNT_MISMATCH`, and never moves an existing
+connection from another installation automatically. Existing-account recovery
+and deliberate replacement remain explicit dashboard actions.
 
-The manifest may add only `https://www.instagram.com/*` for this phase. The
+The first explicit connection API is intentionally narrow:
+
+```text
+GET  /api/extensions/installations
+POST /api/extensions/platform-connections
+     { platform, installationId, displayName, externalUsername }
+```
+
+Only an authenticated PostFlow user may use these routes. The API currently
+accepts `INSTAGRAM` only, rejects duplicate active installation/account
+bindings, and keeps the explicit create route as a recovery/manual fallback.
+Normal first-time setup does not require this route: opening Instagram in the
+same profile lets the worker create the connection automatically. The web app
+and popup show the resulting state, while the Instagram publishing selector
+remains disabled until live verification is complete.
+
+The manifest may add only `https://instagram.com/*` and
+`https://www.instagram.com/*` for this phase. The
 Instagram feature flag remains disabled for publishing until connection
 creation, popup/dashboard state, and sanitized identity fixtures are complete.
 

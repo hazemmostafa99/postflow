@@ -43,6 +43,26 @@ function usernameFromUrl(value: string | null | undefined): string | undefined {
 }
 
 function findFromLinks(documentRef: Document): string | undefined {
+  // Instagram's authenticated home page often renders the sidebar as divs
+  // instead of a semantic <nav>. Prefer an explicitly labelled Profile link
+  // anywhere in the document before considering generic navigation links.
+  const labelledLinks = Array.from(
+    documentRef.querySelectorAll<HTMLAnchorElement>('a[href]'),
+  );
+  for (const link of labelledLinks) {
+    const username = usernameFromUrl(link.href);
+    if (!username) continue;
+    const label = [
+      link.getAttribute('aria-label'),
+      link.title,
+      link.textContent,
+    ].filter(Boolean).join(' ').toLowerCase();
+    if (/\b(profile|your profile|account)\b/.test(label)) return username;
+
+    const profileImage = link.querySelector('img[alt*="profile" i]');
+    if (profileImage) return username;
+  }
+
   const links = Array.from(
     documentRef.querySelectorAll<HTMLAnchorElement>(
       'header a[href], nav a[href], [role="navigation"] a[href]',

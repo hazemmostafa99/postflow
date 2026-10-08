@@ -31,6 +31,8 @@ describe('ExtensionsController', () => {
     updateWorkerStatus: jest.fn(),
     updatePlatformConnectionWorkerStatus: jest.fn(),
     updatePlatformSession: jest.fn(),
+    listInstallations: jest.fn(),
+    createPlatformConnection: jest.fn(),
   };
 
   type Service = typeof service;
@@ -151,6 +153,23 @@ describe('ExtensionsController', () => {
       true,
       undefined,
       'brand.account',
+    );
+  });
+
+  it('forwards explicit Instagram connection creation to the service', async () => {
+    const controller = createController();
+    const internal = controller as unknown as { extensionsService: Service };
+
+    await controller.createPlatformConnection('user-1', {
+      platform: 'INSTAGRAM',
+      installationId: '507f1f77bcf86cd799439011',
+      displayName: 'Brand Instagram',
+      externalUsername: '@brand.account',
+    });
+
+    expect(internal.extensionsService.createPlatformConnection).toHaveBeenCalledWith(
+      'user-1',
+      expect.objectContaining({ platform: 'INSTAGRAM', externalUsername: '@brand.account' }),
     );
   });
 

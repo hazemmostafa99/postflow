@@ -464,7 +464,14 @@ function getBestNetworkPendingPostUrl(session: PublishTrackingSession): string |
 
 function injectFacebookResponseSpy(): void {
   const script = document.createElement('script');
-  script.src = chrome.runtime.getURL('dist/graphql-spy.js');
+  const background = chrome.runtime.getManifest().background;
+  const serviceWorkerPath = background && 'service_worker' in background
+    ? background.service_worker
+    : '';
+  const directory = serviceWorkerPath.includes('/')
+    ? serviceWorkerPath.slice(0, serviceWorkerPath.lastIndexOf('/') + 1)
+    : '';
+  script.src = chrome.runtime.getURL(`${directory}graphql-spy.js`);
   script.onload = () => script.remove();
   (document.head || document.documentElement).appendChild(script);
 }

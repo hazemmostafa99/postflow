@@ -26,6 +26,10 @@ export function reportInstagramSession(
   apiFetch: ApiFetch,
   message: PlatformSessionMessage,
 ): Promise<unknown> {
+  console.info('[PostFlow][Instagram] Reporting session to API', {
+    sessionDetected: message.sessionDetected === true,
+    externalUsername: message.externalUsername || null,
+  });
   return apiFetch(
     '/api/extensions/platform-session',
     {
@@ -44,20 +48,63 @@ export function reportInstagramSession(
 }
 
 export function registerInstagramSessionWorker(apiFetch: ApiFetch): void {
+  console.info('[PostFlow][Instagram] Session worker registered');
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type !== 'PLATFORM_SESSION_STATUS' || message.platform !== 'INSTAGRAM') {
       return;
     }
+    console.info('[PostFlow][Instagram] Session message received', {
+      tabId: sender.tab?.id ?? null,
+      tabUrl: sender.tab?.url ?? null,
+      sessionDetected: message.sessionDetected === true,
+      externalUsername: message.externalUsername || null,
+    });
     if (!isInstagramPage(sender.tab?.url)) {
+      console.warn('[PostFlow][Instagram] Ignoring message from non-Instagram tab', {
+        tabUrl: sender.tab?.url ?? null,
+      });
       sendResponse({ ok: false, error: 'Instagram session reports must come from instagram.com.' });
       return;
     }
     void reportInstagramSession(apiFetch, message)
-      .then(sendResponse)
-      .catch((error) => sendResponse({
-        ok: false,
-        error: error instanceof Error ? error.message : 'Could not report Instagram session.',
-      }));
+      .then(async (result) => {
+        const response = result as {
+          connection?: {
+            status?: string;
+            workerStatus?: string;
+            detectedExternalUsername?: string;
+          };
+          status?: string;
+          workerStatus?: string;
+          detectedExternalUsername?: string;
+        } | null;
+        const connection = response?.connection ?? response;
+        if (response && 'apiFetchError' in response) {
+          console.error('[PostFlow][Instagram] API rejected session report', response);
+        } else {
+          console.info('[PostFlow][Instagram] API accepted session report', {
+            connected: Boolean(connection),
+            status: connection?.status || 'UNKNOWN',
+            workerStatus: connection?.workerStatus || 'UNKNOWN',
+            detectedExternalUsername: connection?.detectedExternalUsername || message.externalUsername || null,
+          });
+        }
+        await chrome.storage.local.set({
+          instagramSessionDetected: message.sessionDetected === true,
+          instagramDetectedUsername:
+            connection?.detectedExternalUsername || message.externalUsername || null,
+          instagramConnectionStatus: connection?.status || 'UNKNOWN',
+          instagramWorkerStatus: connection?.workerStatus || 'UNKNOWN',
+        });
+        sendResponse(result);
+      })
+      .catch((error) => {
+        console.error('[PostFlow][Instagram] Session report failed', error);
+        sendResponse({
+          ok: false,
+          error: error instanceof Error ? error.message : 'Could not report Instagram session.',
+        });
+      });
     return true;
   });
 }

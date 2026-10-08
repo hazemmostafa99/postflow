@@ -752,6 +752,98 @@ describe('ExtensionsService.updateSession recovery', () => {
 });
 
 describe('ExtensionsService.updatePlatformSession', () => {
+  it('auto-creates a first-time Instagram connection from the detected session', async () => {
+    const harness = createHarness();
+    const createdConnection = {
+      _id: new Types.ObjectId(),
+      clerkUserId: 'clerk-user-1',
+      platform: 'INSTAGRAM',
+      activeExtensionInstallationId: harness.installation._id,
+      displayName: 'Instagram @brand.account',
+      displayNameKey: 'instagram @brand.account',
+      externalUsername: 'brand.account',
+      detectedExternalUsername: 'brand.account',
+      status: PlatformConnectionStatus.CONNECTED,
+      workerStatus: PlatformConnectionWorkerStatus.IDLE,
+      sessionDetected: true,
+      lastSeenAt: new Date(),
+    };
+    const platformConnectionModel = {
+      findOne: jest
+        .fn()
+        .mockReturnValueOnce({ exec: jest.fn().mockResolvedValue(null) })
+        .mockReturnValueOnce({ exec: jest.fn().mockResolvedValue(null) }),
+      create: jest.fn().mockResolvedValue(createdConnection),
+    };
+    const service = new ExtensionsService(
+      harness.extensionModel as never,
+      harness.connectionModel as never,
+      harness.jobModel as never,
+      harness.auditModel as never,
+      platformConnectionModel as never,
+    );
+
+    const result = await service.updatePlatformSession(
+      'INSTAGRAM',
+      'clerk-user-1',
+      'extension-1',
+      undefined,
+      true,
+      undefined,
+      '@Brand.Account',
+    );
+
+    expect(platformConnectionModel.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        platform: 'INSTAGRAM',
+        activeExtensionInstallationId: harness.installation._id,
+        displayName: 'Instagram @brand.account',
+        externalUsername: 'brand.account',
+        status: PlatformConnectionStatus.CONNECTED,
+        workerStatus: PlatformConnectionWorkerStatus.IDLE,
+      }),
+    );
+    expect(result).toEqual(expect.objectContaining({
+      platform: 'INSTAGRAM',
+      externalUsername: 'brand.account',
+      status: PlatformConnectionStatus.CONNECTED,
+    }));
+    expect(harness.installation.save).toHaveBeenCalled();
+  });
+
+  it('does not auto-rebind an Instagram account already owned elsewhere', async () => {
+    const harness = createHarness();
+    const existingConnection = { _id: new Types.ObjectId() };
+    const platformConnectionModel = {
+      findOne: jest
+        .fn()
+        .mockReturnValueOnce({ exec: jest.fn().mockResolvedValue(null) })
+        .mockReturnValueOnce({ exec: jest.fn().mockResolvedValue(existingConnection) }),
+      create: jest.fn(),
+    };
+    const service = new ExtensionsService(
+      harness.extensionModel as never,
+      harness.connectionModel as never,
+      harness.jobModel as never,
+      harness.auditModel as never,
+      platformConnectionModel as never,
+    );
+
+    const result = await service.updatePlatformSession(
+      'INSTAGRAM',
+      'clerk-user-1',
+      'extension-1',
+      undefined,
+      true,
+      undefined,
+      'brand.account',
+    );
+
+    expect(result).toBeNull();
+    expect(platformConnectionModel.create).not.toHaveBeenCalled();
+    expect(harness.installation.save).toHaveBeenCalled();
+  });
+
   it('marks an owned Instagram connection mismatched without rebinding it', async () => {
     const harness = createHarness();
     const platformConnection = {
@@ -805,6 +897,56 @@ describe('ExtensionsService.updatePlatformSession', () => {
     expect(result).toEqual(expect.objectContaining({
       platform: 'INSTAGRAM',
       status: PlatformConnectionStatus.ACCOUNT_MISMATCH,
+    }));
+  });
+});
+
+describe('ExtensionsService.createPlatformConnection', () => {
+  it('creates an explicit Instagram binding for an owned active installation', async () => {
+    const harness = createHarness();
+    const createdConnection = {
+      _id: new Types.ObjectId(),
+      clerkUserId: 'clerk-user-1',
+      platform: 'INSTAGRAM',
+      activeExtensionInstallationId: harness.installation._id,
+      displayName: 'Brand Instagram',
+      externalUsername: 'brand.account',
+      status: PlatformConnectionStatus.PENDING,
+      workerStatus: PlatformConnectionWorkerStatus.OFFLINE,
+      sessionDetected: false,
+      lastSeenAt: new Date(),
+    };
+    const platformConnectionModel = {
+      findOne: jest.fn(() => ({
+        exec: jest.fn().mockResolvedValue(null),
+      })),
+      create: jest.fn().mockResolvedValue(createdConnection),
+    };
+    const service = new ExtensionsService(
+      harness.extensionModel as never,
+      harness.connectionModel as never,
+      harness.jobModel as never,
+      harness.auditModel as never,
+      platformConnectionModel as never,
+    );
+
+    const result = await service.createPlatformConnection('clerk-user-1', {
+      platform: 'INSTAGRAM',
+      installationId: String(harness.installation._id),
+      displayName: 'Brand Instagram',
+      externalUsername: '@brand.account',
+    });
+
+    expect(platformConnectionModel.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        platform: 'INSTAGRAM',
+        externalUsername: 'brand.account',
+        status: PlatformConnectionStatus.PENDING,
+      }),
+    );
+    expect(result).toEqual(expect.objectContaining({
+      platform: 'INSTAGRAM',
+      externalUsername: 'brand.account',
     }));
   });
 });
