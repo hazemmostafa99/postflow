@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "test": "node --test tests/engagement-sync-policy.test.cjs tests/engagement.test.cjs tests/graphql-spy.test.cjs tests/instagram-identity.test.cjs tests/instagram-composer.test.cjs tests/maintenance-diagnostics.test.cjs tests/maintenance-schedule.test.cjs tests/phone-normalizer.test.cjs tests/publishing-detection.test.cjs tests/publishing-target.test.cjs tests/profile-composer.test.cjs tests/profile-tracking.test.cjs tests/profile-video-notification.test.cjs tests/publish-response.test.cjs tests/lifecycle-enforcement.test.cjs tests/extension-recovery.test.cjs",
+    "test": "node --test tests/engagement-sync-policy.test.cjs tests/engagement.test.cjs tests/graphql-spy.test.cjs tests/instagram-identity.test.cjs tests/instagram-composer.test.cjs tests/instagram-engagement.test.cjs tests/maintenance-diagnostics.test.cjs tests/maintenance-schedule.test.cjs tests/phone-normalizer.test.cjs tests/publishing-detection.test.cjs tests/publishing-target.test.cjs tests/profile-composer.test.cjs tests/profile-tracking.test.cjs tests/profile-video-notification.test.cjs tests/publish-response.test.cjs tests/lifecycle-enforcement.test.cjs tests/extension-recovery.test.cjs",
     "build": "npm run build:dev",
     "build:dev": "tsc && node scripts/copy-static.mjs development",
     "build:prod": "tsc && node scripts/copy-static.mjs production",

@@ -92,14 +92,17 @@ type PendingPostSyncResult =
       reason?: string;
     };
 
-interface PublishedFacebookPost {
+interface PublishedPlatformPost {
   id: string;
   status: "PUBLISHED";
-  targetType?: "GROUP" | "PROFILE_FEED";
+  platform?: "FACEBOOK" | "INSTAGRAM" | "TIKTOK";
+  targetType?: "GROUP" | "PROFILE_FEED" | "INSTAGRAM_FEED" | "INSTAGRAM_REEL" | "TIKTOK_VIDEO";
   postUrl: string;
   lastEngagementSyncAt?: string;
   claimToken?: string;
 }
+
+type PublishedFacebookPost = PublishedPlatformPost;
 
 interface FacebookPostEngagement {
   reactionCount: number;

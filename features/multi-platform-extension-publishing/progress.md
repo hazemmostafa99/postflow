@@ -430,6 +430,13 @@ Status: `IN PROGRESS - QUEUE AND COMPOSER FOUNDATION`
 - [ ] Enable the Instagram feature flag after live review.
 - [x] Detect published, failed, interrupted, and unknown outcomes.
 - [x] Normalize and store reliable Instagram post/Reel URLs.
+- [x] Add an isolated Instagram post-detail engagement extractor for likes and
+      comments, including explicit `No comments yet` zero evidence.
+- [x] Add an Instagram engagement message and background-tab worker path.
+- [x] Make the engagement claim queue and result endpoint accept verified
+      Instagram platform connections without changing the Facebook path.
+- [ ] Validate Instagram analytics against live likes/comments and challenge
+      or login variants.
 - [x] Treat accepted/unknown outcomes as terminal after the composer response;
       crash-window recovery still requires live validation.
 - [x] Add sanitized DOM fixtures for Instagram selectors/composer flow and
@@ -478,25 +485,133 @@ Implementation added:
   preserving the legacy Facebook path.
 - Added `tests/instagram-composer.test.cjs` with sanitized Feed/Reel fixtures
   covering control discovery, media/caption insertion, pre-Share checks, and
-  the no-click-on-cancel safety path. The direct fixture run passes all five
+  the no-click-on-cancel safety path. The direct fixture run passes all six
   tests, including the current sidebar `a[role="link"]` + nested `New post`
   SVG shape captured from the dedicated test account.
 - Updated Instagram control discovery to support the current sidebar link
   structure and added background logs around composer command/response
   handoff.
+- Dedicated-account DOM captures confirmed the current composer sequence:
+  `Create new post` dialog, native file input, `Next`/Edit step, then a
+  `role="button"` Share control and Lexical caption textbox. Added stage logs
+  and API error details to identify any remaining pre-Share failure without
+  clicking blindly.
 - Instagram outcome handling now detects a visible share confirmation or a
   canonical `/p/`/`/reel/` URL, normalizes the permalink on the extension and
   API paths, and persists `PUBLISHED` versus terminal `UNKNOWN` without an
   automatic retry after the response is received.
+- A dedicated-account run confirmed Instagram rendered `aria-label="Post
+  shared"` with `Your post has been shared.` after the Share click. The
+  detector now checks success dialog labels/text (not only body text), waits
+  up to 15 seconds for slower uploads, and dismisses the modal's `Done`
+  control after confirmation so a successful publish is reported as
+  `PUBLISHED` instead of being misclassified as `UNKNOWN`.
+- Instagram's success modal does not include a permalink and the tab remains
+  on the profile URL. The composer now snapshots existing `/p/` and `/reel/`
+  links before Share, waits for the newly rendered profile tile after the
+  confirmation, and returns the new canonical permalink as `postUrl` when it
+  is available. Focused fixtures verify both URL discovery and the no-URL
+  success fallback.
+- Added adapter recovery for Chrome's "message channel closed" error during
+  Instagram SPA navigation. The adapter now recovers a canonical tab URL as
+  `PUBLISHED`, or records terminal `UNKNOWN` without automatic retry when the
+  publish state cannot be proven, preventing duplicate posts after a context
+  reload.
+- The adapter now independently probes the Instagram tab DOM with the
+  extension `scripting` permission before sending the composer command and
+  compares `/p/`/`/reel/` links after a response or channel closure. This
+  catches a newly rendered profile tile even when Instagram returns to the
+  profile URL and destroys the content-script message port.
+- The adapter also observes `chrome.tabs.onUpdated` for canonical Instagram
+  permalink transitions during the job. A transient `/p/...` or `/reel/...`
+  navigation is treated as strong publish evidence and preserved even if the
+  page later returns to the profile URL.
+- The composer no longer clicks the success modal's `Done` control before
+  returning its async response; closing that modal can reload Instagram and
+  destroy the content-script message port. The modal remains visible until
+  the publishing response and permalink probes finish.
+- The independent permalink probe now scans both anchors and serialized page
+  markup for `/p/...` and `/reel/...` references, not only `a[href]` nodes.
+- Dedicated-account profile captures showed Instagram uses username-prefixed
+  tile paths such as `/ema.d1852/p/<shortcode>/` and
+  `/ema.d1852/reel/<shortcode>/`. Extension and API normalizers now accept
+  both prefixed and canonical paths, so before/after snapshots can identify
+  the newly inserted first tile and persist a canonical `https://www.instagram.com/p/.../`
+  or `/reel/.../` URL.
+- If the new tile is not rendered immediately, the adapter performs one
+  controlled profile refresh after publish confirmation, then repeats the
+  before/after comparison. It never opens the first tile blindly, avoiding a
+  false permalink from an older post.
+- Baseline collection now waits briefly for the Instagram profile grid to
+  render before sending Create/Share. This prevents a valid loaded tab with
+  an asynchronously empty DOM from producing a false `baselineCount: 0`.
+- Dedicated-account validation confirmed the full recovery path: after
+  `PUBLISHED`, the first probe found no new tile, one controlled profile
+  refresh exposed the new profile-prefixed link, and the API-bound canonical
+  permalink was recovered as `https://www.instagram.com/p/DeOaDcwHEsk/`.
+  The expected first-probe miss is now informational; only failure after the
+  refresh is logged as a warning.
 - Development-only Instagram publishing flags were enabled for the dedicated
   test account on 2026-10-08. Production flags remain disabled until the live
   review gate is approved.
+- The post-details page now reads the job `platform`/target type and labels
+  Instagram jobs as `Instagram - Feed` or `Instagram - Reel` instead of the
+  legacy `Facebook group` fallback. Engagement refresh controls now appear for
+  supported Facebook and Instagram permalinks, while TikTok remains disabled;
+  Instagram URLs no longer go through the Facebook-only analytics endpoint.
+  Stale sync errors are scoped to supported analytics rows and an unsynced
+  Instagram row shows `Instagram analytics pending`.
+- The supplied Instagram post-detail DOM confirms the post permalink and
+  `No comments yet.` state, so comment zero can be extracted safely. It does
+  not expose a numeric Like count in this capture; the extractor keeps likes
+  unknown until a numeric Instagram Like count becomes visible.
+- Follow-up dedicated-account captures showed two supported layouts: a
+  full-page post with controls but no numeric Like count, and a details view
+  with standalone numeric spans (`Unlike 1`, `Comment 1`). The extractor now
+  matches the target permalink without relying on CSS visibility, chooses the
+  containing post scope instead of stopping at the toolbar, and returns
+  `SUCCESS` with `reactionCount: 0` and `commentCount: 0` for the first layout
+  or `SUCCESS` with both counters for the second. This follows the product
+  policy that a rendered Like/Unlike control with no numeric Like counter is
+  treated as zero likes.
+- Explicit Instagram copy such as `Be the first to like this` is now treated
+  as verified `reactionCount: 0` as well. A missing post scope still fails
+  separately instead of being converted to zero.
+- Added `platforms/instagram/engagement.ts`, which scopes extraction to the
+  target `/p/` or `/reel/` permalink and returns `SUCCESS`, `PARTIAL`, or
+  `CHECK_FAILED` without guessing a missing Like count.
+- Added `CHECK_INSTAGRAM_POST_ENGAGEMENT` handling, background-tab navigation,
+  platform-aware engagement claims, and Instagram result persistence. The
+  queue now routes Instagram jobs to the Instagram extractor while retaining
+  the existing Facebook extractor and ownership checks.
+- Refactored Instagram permalink probing into `platforms/instagram/permalink.ts`
+  so the adapter remains a thin publish coordinator. Removed the unused
+  success-notice export from `result.ts`; all Instagram modules remain under
+  the platform boundary and stay below the 300-line module budget.
+- Updated the Instagram composer for the current Reel flow: it supports the
+  extra `Next` transition from Edit to New reel and now targets the labelled
+  Lexical `Add a caption...` textbox. Caption insertion uses a native text
+  transaction with a DOM fallback and verifies the caption before Share, so
+  Feed images and Reels cannot silently publish without their caption.
+- Caption verification now normalizes zero-width characters, non-breaking
+  spaces, and Lexical whitespace, and logs the observed text when a retry is
+  needed. This avoids rejecting a caption that Instagram visibly inserted with
+  equivalent DOM formatting.
 
 Checks:
 - API build passes.
+- Focused API jobs-controller tests pass: 30 tests.
 - Web production build passes after the Instagram UI/UX update.
 - Focused target, payload, and posts-service tests pass: 31 tests.
+- Direct Instagram composer fixture run passes: 8 tests, including Lexical
+  caption selection and Reel caption insertion.
+- Added `tests/instagram-engagement.test.cjs` with numeric-counter and
+  explicit-zero-comment fixtures. The managed Windows test runner currently
+  fails before execution with `spawn EPERM`; the TypeScript extension build
+  remains green.
 - Extension development build passes.
+- Instagram adapter/permalink refactor compiles with the development build.
+- API engagement eligibility and jobs-controller tests pass: 48 tests.
 
 Remaining before enabling jobs:
 - Complete real browser validation for current Instagram Feed/Reel UI variants.

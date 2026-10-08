@@ -88,7 +88,12 @@ export function registerInstagramSessionWorker(apiFetch: ApiFetch): void {
           };
         }
 
-        const latestJob = await apiFetch(`/api/jobs/${encodeURIComponent(request.jobId!)}`) as {
+        const latestJob = await apiFetch(
+          `/api/jobs/${encodeURIComponent(request.jobId!)}`,
+          undefined,
+          'GET',
+          true,
+        ) as {
           status?: string;
           apiFetchError?: boolean;
         } | null;

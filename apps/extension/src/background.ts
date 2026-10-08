@@ -2764,6 +2764,95 @@ async function checkSinglePostEngagement(
   }
 }
 
+function normalizeInstagramEngagementPermalink(value: string): string | null {
+  const markdownMatch = value.trim().match(/^\[[^\]]+\]\((https?:\/\/[^)]+)\)$/i);
+  const candidate = markdownMatch?.[1] ?? value.trim();
+  try {
+    const url = new URL(candidate);
+    const hostname = url.hostname.toLowerCase();
+    if (hostname !== 'instagram.com' && !hostname.endsWith('.instagram.com')) return null;
+    const match = url.pathname.match(/^(?:\/[^/]+)?\/(p|reel)\/([A-Za-z0-9_-]+)\/?$/i);
+    if (!match) return null;
+    return `https://www.instagram.com/${match[1].toLowerCase()}/${match[2]}/`;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForInstagramTabAfterNavigation(tabId: number, targetUrl: string, timeoutMs: number): Promise<boolean> {
+  const startedAt = Date.now();
+  let targetPath = '';
+  let targetIdentity = '';
+  try {
+    targetPath = new URL(targetUrl).pathname.replace(/\/+$/, '').toLowerCase();
+    targetIdentity = targetPath.match(/\/(?:p|reel)\/([a-z0-9_-]+)/i)?.[1] ?? '';
+  } catch {
+    return false;
+  }
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      const currentPath = tab.url ? new URL(tab.url).pathname.replace(/\/+$/, '').toLowerCase() : '';
+      const currentIdentity = currentPath.match(/\/(?:p|reel)\/([a-z0-9_-]+)/i)?.[1] ?? '';
+      const landedOnTarget = currentPath === targetPath ||
+        Boolean(targetIdentity && currentIdentity && targetIdentity === currentIdentity);
+      if (tab.status === 'complete' && landedOnTarget && Date.now() - startedAt >= 1200) return true;
+    } catch {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return false;
+}
+
+async function checkSingleInstagramPostEngagement(
+  post: PublishedPlatformPost,
+): Promise<PostEngagementSyncResult> {
+  const postUrl = normalizeInstagramEngagementPermalink(post.postUrl);
+  if (!postUrl) return { status: 'CHECK_FAILED', reason: 'Stored Instagram post URL is invalid' };
+  let tabId: number | undefined;
+  try {
+    console.log('[PostAnalytics][Instagram] Opening published post', { postId: post.id, postUrl });
+    const tab = await chrome.tabs.create({ url: postUrl, active: false });
+    tabId = tab.id;
+    const ready = Boolean(tabId && await waitForInstagramTabAfterNavigation(
+      tabId,
+      postUrl,
+      POSTING_TIMING.facebookTabReadyTimeoutMs,
+    ));
+    if (!tabId || !ready) {
+      return { status: 'CHECK_FAILED', reason: 'Target Instagram post did not finish loading' };
+    }
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < POSTING_TIMING.facebookTabReadyTimeoutMs) {
+      try {
+        const response = await chrome.tabs.sendMessage(tabId, {
+          type: 'CHECK_INSTAGRAM_POST_ENGAGEMENT',
+          postUrl,
+        });
+        if (response?.ok && response.result) {
+          console.log('[PostAnalytics][Instagram] Engagement result received', {
+            postId: post.id,
+            result: response.result,
+          });
+          return response.result as PostEngagementSyncResult;
+        }
+      } catch (error) {
+        console.debug('[PostAnalytics][Instagram] Content script not ready; retrying', {
+          postId: post.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      await new Promise((resolve) => setTimeout(resolve, POSTING_TIMING.facebookMessageRetryIntervalMs));
+    }
+    return { status: 'CHECK_FAILED', reason: 'Timed out waiting for Instagram engagement counters' };
+  } catch (error) {
+    return { status: 'CHECK_FAILED', reason: error instanceof Error ? error.message : 'Instagram engagement check failed' };
+  } finally {
+    if (tabId !== undefined) await chrome.tabs.remove(tabId).catch(() => undefined);
+  }
+}
+
 async function syncPublishedEngagementBatch(
   manualOnly = false,
   maxItems = MAINTENANCE_BATCH_LIMIT,
@@ -2796,14 +2885,16 @@ async function syncPublishedEngagementBatch(
       );
     }
     const results = [];
-    for (const post of posts as PublishedFacebookPost[]) {
+    for (const post of posts as PublishedPlatformPost[]) {
       await recordMaintenanceDiagnostic(
         'claim.created',
         'ENGAGEMENT',
         'claimsCreated',
         { jobId: post.id, manualOnly },
       );
-      const result = await checkSinglePostEngagement(post, true, mode);
+      const result = post.platform === 'INSTAGRAM' || post.targetType === 'INSTAGRAM_FEED' || post.targetType === 'INSTAGRAM_REEL'
+        ? await checkSingleInstagramPostEngagement(post)
+        : await checkSinglePostEngagement(post, true, mode);
       const updated = Boolean(await apiFetch(`/api/jobs/${post.id}/engagement`, {
         ...result,
         ...(post.claimToken ? { claimToken: post.claimToken } : {}),
@@ -2852,6 +2943,16 @@ async function yieldMaintenanceToPublishing(deadline: number): Promise<boolean> 
   }
 }
 
+async function hasVerifiedMaintenanceSession(): Promise<boolean> {
+  if (facebookIdentityVerified) return true;
+  const stored = await chrome.storage.local.get([
+    'instagramSessionDetected',
+    'instagramConnectionStatus',
+  ]);
+  return stored.instagramSessionDetected === true &&
+    stored.instagramConnectionStatus === 'CONNECTED';
+}
+
 /** Run maintenance in priority order with one navigation at a time. */
 async function runMaintenanceCoordinator(
   options: MaintenanceCoordinatorOptions = {},
@@ -2861,7 +2962,7 @@ async function runMaintenanceCoordinator(
     isMaintenanceCoordinatorRunning ||
     isProcessingJob ||
     isFacebookSyncBusy ||
-    !facebookIdentityVerified
+    !(await hasVerifiedMaintenanceSession())
   ) {
     return [];
   }

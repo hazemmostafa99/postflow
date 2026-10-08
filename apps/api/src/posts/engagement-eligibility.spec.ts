@@ -1,6 +1,8 @@
 import {
   getEngagementQueueFilter,
+  getPlatformEngagementQueueFilter,
   isFacebookEngagementPermalink,
+  isInstagramEngagementPermalink,
   isEligibleForEngagementSync,
 } from './engagement-eligibility';
 
@@ -80,5 +82,33 @@ describe('engagement eligibility', () => {
     'not-a-url',
   ])('rejects a non-post URL: %s', (postUrl) => {
     expect(isFacebookEngagementPermalink(postUrl)).toBe(false);
+  });
+
+  it.each([
+    'https://www.instagram.com/p/DeOaDcwHEsk/',
+    'https://www.instagram.com/ema.d1852/p/DeOaDcwHEsk/',
+    'https://instagram.com/ema.d1852/reel/ABC_123/',
+  ])('accepts a supported Instagram permalink: %s', (postUrl) => {
+    expect(isInstagramEngagementPermalink(postUrl)).toBe(true);
+  });
+
+  it('builds an Instagram-specific engagement queue filter', () => {
+    const filter = getPlatformEngagementQueueFilter('INSTAGRAM', now);
+    expect(filter.postUrl.$regex).toBeDefined();
+    expect(filter.$or).toHaveLength(3);
+  });
+
+  it('accepts an Instagram candidate when its platform is explicit', () => {
+    expect(
+      isEligibleForEngagementSync(
+        {
+          platform: 'INSTAGRAM',
+          status: 'SUCCESS',
+          submissionStatus: 'PUBLISHED',
+          postUrl: 'https://www.instagram.com/p/DeOaDcwHEsk/',
+        },
+        now,
+      ),
+    ).toBe(true);
   });
 });

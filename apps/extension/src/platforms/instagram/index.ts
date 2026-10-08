@@ -1,2 +1,2 @@
 export { InstagramAdapter, instagramAdapter } from './adapter.js';
-export { isInstagramSuccessNotice, normalizeInstagramPostUrl } from './result.js';
+export { normalizeInstagramPostUrl } from './result.js';

@@ -6,11 +6,22 @@ import type {
 } from '../../platform-adapter.js';
 import type { PublishJob } from '../../publishing-target.js';
 import { normalizeInstagramPostUrl } from './result.js';
+import {
+  refreshAndResolveInstagramPostUrl,
+  resolveInstagramPostUrl,
+  waitForInstagramBaselineProbe,
+  type InstagramPostProbe,
+} from './permalink.js';
 
 type InstagramTarget = Extract<PublishJob['target'], { type: 'INSTAGRAM_FEED' | 'INSTAGRAM_REEL' }>;
 
 function isInstagramTarget(target: PublishJob['target']): target is InstagramTarget {
   return target.type === 'INSTAGRAM_FEED' || target.type === 'INSTAGRAM_REEL';
+}
+
+function isComposerChannelClosed(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /message channel closed|asynchronous response.*channel closed|returning true/i.test(message);
 }
 
 export class InstagramAdapter implements PlatformPublisherAdapter {
@@ -77,12 +88,34 @@ export class InstagramAdapter implements PlatformPublisherAdapter {
     if (!isInstagramTarget(job.target)) {
       return { success: false, status: 'FAILED', reason: `Unsupported Instagram target: ${job.target.type}` };
     }
+    let existingPostProbe: InstagramPostProbe = { urls: [], available: false };
+    let observedPostUrl: string | undefined;
+    let navigationListener: ((updatedTabId: number, changeInfo: { url?: string }) => void) | undefined;
     try {
       console.info('[PostFlow][Instagram] Sending composer command', {
         tabId,
         jobId: job.id,
         targetType: job.target.type,
+        captionLength: typeof job.post.content === 'string' ? job.post.content.trim().length : 0,
       });
+      existingPostProbe = await waitForInstagramBaselineProbe(tabId);
+      console.info('[PostFlow][Instagram] Permalink probe armed', {
+        tabId,
+        baselineAvailable: existingPostProbe.available,
+        baselineCount: existingPostProbe.urls.length,
+      });
+      navigationListener = (updatedTabId, changeInfo) => {
+        if (updatedTabId !== tabId || !changeInfo.url) return;
+        const normalized = normalizeInstagramPostUrl(changeInfo.url);
+        if (!normalized) return;
+        observedPostUrl = normalized;
+        console.info('[PostFlow][Instagram] Post permalink observed during navigation', {
+          tabId,
+          jobId: job.id,
+          postUrl: normalized,
+        });
+      };
+      chrome.tabs.onUpdated.addListener(navigationListener as any);
       const response = await chrome.tabs.sendMessage(tabId, {
         type: 'INSTAGRAM_EXECUTE_JOB',
         jobId: job.id,
@@ -96,15 +129,62 @@ export class InstagramAdapter implements PlatformPublisherAdapter {
         status: response?.status || 'NO_RESPONSE',
         success: response?.success === true,
         canceled: response?.canceled === true,
+        reason: response?.reason,
       });
+      if (observedPostUrl) {
+        return {
+          ...(response ?? {}),
+          success: true,
+          status: 'PUBLISHED',
+          postUrl: response?.postUrl ?? observedPostUrl,
+          reason: 'Instagram post permalink was observed during tab navigation.',
+        };
+      }
+      if (response?.success === true && response.status === 'PUBLISHED' && !response.postUrl) {
+        const recoveredPostUrl = await resolveInstagramPostUrl(tabId, existingPostProbe)
+          ?? await refreshAndResolveInstagramPostUrl(tabId, existingPostProbe);
+        if (recoveredPostUrl) {
+          console.info('[PostFlow][Instagram] Recovered permalink after composer response', {
+            tabId,
+            jobId: job.id,
+            postUrl: recoveredPostUrl,
+          });
+          return { ...response, postUrl: recoveredPostUrl };
+        }
+      }
       return response ?? { success: false, status: 'FAILED', reason: 'Instagram composer returned no result' };
     } catch (error) {
+      if (isComposerChannelClosed(error)) {
+        const recoveredPostUrl = observedPostUrl
+          ?? await resolveInstagramPostUrl(tabId, existingPostProbe)
+          ?? await refreshAndResolveInstagramPostUrl(tabId, existingPostProbe);
+        const recoveryReason = recoveredPostUrl
+          ? 'Instagram navigated while confirming the publish; the post permalink was recovered from the tab URL.'
+          : 'Instagram closed the composer response channel after Share; publish state is uncertain and will not be retried automatically.';
+        console.warn('[PostFlow][Instagram] Composer response channel closed; recovered terminal result', {
+          tabId,
+          jobId: job.id,
+          currentUrl: (await chrome.tabs.get(tabId).catch(() => null))?.url,
+          postUrl: recoveredPostUrl,
+          status: recoveredPostUrl ? 'PUBLISHED' : 'UNKNOWN',
+        });
+        return {
+          success: true,
+          status: recoveredPostUrl ? 'PUBLISHED' : 'UNKNOWN',
+          ...(recoveredPostUrl ? { postUrl: recoveredPostUrl } : {}),
+          reason: recoveryReason,
+        };
+      }
       console.error('[PostFlow][Instagram] Composer command failed', {
         tabId,
         jobId: job.id,
         reason: error instanceof Error ? error.message : String(error),
       });
       return { success: false, status: 'FAILED', reason: error instanceof Error ? error.message : String(error) };
+    } finally {
+      if (navigationListener) {
+        chrome.tabs.onUpdated.removeListener(navigationListener as any);
+      }
     }
   }
 

@@ -32,7 +32,10 @@ import { getNextPendingPostCheckAt } from './pending-sync-schedule';
 import { getNextEngagementSyncAt } from './engagement-sync-schedule';
 import {
   FACEBOOK_ENGAGEMENT_PERMALINK_PATTERN,
+  INSTAGRAM_ENGAGEMENT_PERMALINK_PATTERN,
   getEngagementQueueFilter,
+  getPlatformEngagementQueueFilter,
+  isInstagramEngagementPermalink,
 } from './engagement-eligibility';
 import {
   FacebookConnection,
@@ -95,6 +98,8 @@ type PendingJobLean = {
 
 type EngagementJobLean = {
   _id: { toString(): string };
+  platform?: PublishingPlatform;
+  platformConnectionId?: { toString(): string };
   targetType?: PublishingTargetType;
   postUrl?: string;
   lastEngagementSyncAt?: Date;
@@ -194,8 +199,9 @@ function normalizeInstagramPostUrl(value?: string): string | undefined {
     const url = new URL(value);
     const host = url.hostname.toLowerCase();
     if (host !== 'instagram.com' && !host.endsWith('.instagram.com')) return undefined;
-    if (!/^\/(p|reel)\/[^/]+\/?$/i.test(url.pathname)) return undefined;
-    return `https://www.instagram.com${url.pathname.replace(/\/$/, '')}/`;
+    const match = url.pathname.match(/^\/(?:[^/]+\/)?(p|reel)\/([^/]+)\/?$/i);
+    if (!match) return undefined;
+    return `https://www.instagram.com/${match[1].toLowerCase()}/${match[2]}/`;
   } catch {
     return undefined;
   }
@@ -626,6 +632,9 @@ export class JobsController {
       job,
     );
     const now = new Date();
+    const instagramJob = job.platform === PublishingPlatform.INSTAGRAM ||
+      job.targetType === PublishingTargetType.INSTAGRAM_FEED ||
+      job.targetType === PublishingTargetType.INSTAGRAM_REEL;
     const eligibility =
       claimType === MaintenanceClaimType.PENDING_APPROVAL
         ? {
@@ -653,14 +662,21 @@ export class JobsController {
         : {
             status: PublishingJobStatus.SUCCESS,
             submissionStatus: FacebookSubmissionStatus.PUBLISHED,
-            postUrl: { $regex: FACEBOOK_ENGAGEMENT_PERMALINK_PATTERN },
+            postUrl: {
+              $regex: instagramJob
+                ? INSTAGRAM_ENGAGEMENT_PERMALINK_PATTERN
+                : FACEBOOK_ENGAGEMENT_PERMALINK_PATTERN,
+            },
           };
+    const ownershipFilter = job.platformConnectionId && this.platformConnectionModel
+      ? { platformConnectionId: job.platformConnectionId }
+      : { facebookConnectionId: connection._id };
     const maintenanceClaimToken = randomUUID();
     const claimedJob = await this.jobModel
       .findOneAndUpdate(
         {
           _id: job._id,
-          facebookConnectionId: connection._id,
+          ...ownershipFilter,
           ...eligibility,
           $and: [
             ...(Array.isArray(eligibility.$and) ? eligibility.$and : []),
@@ -714,6 +730,7 @@ export class JobsController {
       return {
         id: claimedJob._id.toString(),
         status: FacebookSubmissionStatus.PUBLISHED,
+        ...(claimedJob.platform ? { platform: claimedJob.platform } : {}),
         targetType: claimedJob.targetType ?? PublishingTargetType.GROUP,
         postUrl: claimedJob.postUrl!,
         claimToken: maintenanceClaimToken,
@@ -1159,12 +1176,46 @@ export class JobsController {
     const normalizedInstanceId = this.requireExtensionInstanceId(
       extensionInstanceId,
     );
-    const connection = await this.getVerifiedWorkerConnection(
-      clerkUserId,
-      normalizedInstanceId,
-      credential,
-    );
-    if (!connection) {
+    let connection: FacebookConnectionDocument | null = null;
+    type PlatformConnectionSummary = {
+      _id: Types.ObjectId;
+      platform: PublishingPlatform;
+      legacyFacebookConnectionId?: Types.ObjectId;
+    };
+    let installationPlatformConnections: PlatformConnectionSummary[] = [];
+    if (this.platformConnectionModel) {
+      const installation = await this.extensionsService.verifyWorkerIdentity(
+        clerkUserId,
+        normalizedInstanceId,
+        credential,
+      );
+      this.extensionsService.assertInstallationActive(installation);
+      installationPlatformConnections = await this.platformConnectionModel
+        .find({
+          activeExtensionInstallationId: installation._id,
+          archivedAt: { $exists: false },
+          status: PlatformConnectionStatus.CONNECTED,
+          workerStatus: { $ne: PlatformConnectionWorkerStatus.PUBLISHING },
+          platform: { $in: [PublishingPlatform.FACEBOOK, PublishingPlatform.INSTAGRAM] },
+        })
+        .select('_id platform legacyFacebookConnectionId')
+        .lean()
+        .exec() as PlatformConnectionSummary[];
+      if (installationPlatformConnections.length === 0) {
+        connection = await this.getVerifiedWorkerConnection(
+          clerkUserId,
+          normalizedInstanceId,
+          credential,
+        );
+      }
+    } else {
+      connection = await this.getVerifiedWorkerConnection(
+        clerkUserId,
+        normalizedInstanceId,
+        credential,
+      );
+    }
+    if (!connection && installationPlatformConnections.length === 0) {
       this.logMaintenanceEvent(
         'maintenance.ownership.rejected',
         {
@@ -1191,13 +1242,44 @@ export class JobsController {
     if (!postIds.length) return [];
     const manualOnlyRequested = manualOnly === 'true';
     const engagementQueueFilter = getEngagementQueueFilter(now);
+    const instagramQueueFilter = getPlatformEngagementQueueFilter('INSTAGRAM', now);
+    const platformConnectionIds = installationPlatformConnections.map((item) => item._id);
+    const facebookPlatformConnectionIds = installationPlatformConnections
+      .filter((item) => item.platform === PublishingPlatform.FACEBOOK)
+      .map((item) => item._id);
+    const instagramPlatformConnectionIds = installationPlatformConnections
+      .filter((item) => item.platform === PublishingPlatform.INSTAGRAM)
+      .map((item) => item._id);
+    const legacyFacebookConnectionIds = installationPlatformConnections
+      .filter((item) => item.platform === PublishingPlatform.FACEBOOK && item.legacyFacebookConnectionId)
+      .map((item) => item.legacyFacebookConnectionId!);
+    const usePlatformConnections = Boolean(
+      this.platformConnectionModel && installationPlatformConnections.length > 0,
+    );
+    const ownershipAndUrlFilter = usePlatformConnections
+      ? {
+          $or: [
+            ...(facebookPlatformConnectionIds.length
+              ? [{ platform: PublishingPlatform.FACEBOOK, platformConnectionId: { $in: facebookPlatformConnectionIds }, postUrl: engagementQueueFilter.postUrl }]
+              : []),
+            ...(instagramPlatformConnectionIds.length
+              ? [{ platform: PublishingPlatform.INSTAGRAM, platformConnectionId: { $in: instagramPlatformConnectionIds }, postUrl: instagramQueueFilter.postUrl }]
+              : []),
+            ...(legacyFacebookConnectionIds.length
+              ? [{ facebookConnectionId: { $in: legacyFacebookConnectionIds }, postUrl: engagementQueueFilter.postUrl }]
+              : []),
+          ],
+        }
+      : {
+          facebookConnectionId: connection!._id,
+          postUrl: engagementQueueFilter.postUrl,
+        };
     const engagementFilter = {
       status: 'SUCCESS',
       submissionStatus: FacebookSubmissionStatus.PUBLISHED,
-      postUrl: engagementQueueFilter.postUrl,
-      facebookConnectionId: connection._id,
+      ...ownershipAndUrlFilter,
       $and: [
-        publishableTargetFilter,
+        usePlatformConnections ? platformPublishableTargetFilter : publishableTargetFilter,
         manualOnlyRequested
           ? this.manualMaintenanceRequestFilter(MaintenanceClaimType.ENGAGEMENT)
           : {
@@ -1242,7 +1324,9 @@ export class JobsController {
       this.logMaintenanceEvent('maintenance.claim.created', {
         jobId: claimedJob._id.toString(),
         workType: MaintenanceClaimType.ENGAGEMENT,
-        connectionId: String(connection._id),
+        connectionId: connection
+          ? String(connection._id)
+          : platformConnectionIds.map((id) => String(id)).join(','),
         extensionInstanceId: maskExtensionInstanceId(normalizedInstanceId),
         manualOnly: manualOnlyRequested,
       });
@@ -1251,7 +1335,9 @@ export class JobsController {
     if (jobs.length === 0) {
       this.logMaintenanceEvent('maintenance.claim.empty', {
         workType: MaintenanceClaimType.ENGAGEMENT,
-        connectionId: String(connection._id),
+        connectionId: connection
+          ? String(connection._id)
+          : platformConnectionIds.map((id) => String(id)).join(','),
         extensionInstanceId: maskExtensionInstanceId(normalizedInstanceId),
         manualOnly: manualOnlyRequested,
       });
@@ -1260,6 +1346,7 @@ export class JobsController {
     return jobs.map((job) => ({
       id: job._id.toString(),
       status: FacebookSubmissionStatus.PUBLISHED,
+      ...(job.platform ? { platform: job.platform } : {}),
       targetType: job.targetType ?? PublishingTargetType.GROUP,
       postUrl: job.postUrl!,
       ...(job.lastEngagementSyncAt
@@ -1297,10 +1384,11 @@ export class JobsController {
     if (post.clerkUserId !== clerkUserId) {
       throw new UnauthorizedException('Not your job');
     }
-    if (!job.facebookConnectionId) {
-      throw new BadRequestException(
-        'Job is not assigned to a Facebook connection',
-      );
+    const instagramJob = job.platform === PublishingPlatform.INSTAGRAM ||
+      job.targetType === PublishingTargetType.INSTAGRAM_FEED ||
+      job.targetType === PublishingTargetType.INSTAGRAM_REEL;
+    if (!job.facebookConnectionId && !job.platformConnectionId) {
+      throw new BadRequestException('Job is not assigned to a platform connection');
     }
     if (job.status !== PublishingJobStatus.SUCCESS) {
       throw new BadRequestException('Job is not ready for maintenance refresh');
@@ -1308,6 +1396,9 @@ export class JobsController {
 
     const requestedAt = new Date();
     if (body.type === MaintenanceClaimType.PENDING_APPROVAL) {
+      if (instagramJob) {
+        throw new BadRequestException('Instagram jobs do not use approval refresh');
+      }
       const pendingEligible =
         job.targetType !== PublishingTargetType.PROFILE_FEED &&
         Boolean(job.groupId) &&
@@ -1323,9 +1414,12 @@ export class JobsController {
     } else {
       if (
         job.submissionStatus !== FacebookSubmissionStatus.PUBLISHED ||
-        !job.postUrl
+        !job.postUrl ||
+        (instagramJob
+          ? !isInstagramEngagementPermalink(job.postUrl)
+          : !job.postUrl)
       ) {
-        throw new BadRequestException('Job is not a published Facebook post');
+        throw new BadRequestException('Job is not a published post with a supported permalink');
       }
       job.manualEngagementSyncRequestedAt = requestedAt;
     }
@@ -1427,7 +1521,7 @@ export class JobsController {
       job.submissionStatus !== FacebookSubmissionStatus.PUBLISHED ||
       !job.postUrl
     ) {
-      throw new BadRequestException('Job is not a published Facebook post');
+      throw new BadRequestException('Job is not a published post');
     }
 
     const syncedAt = new Date();

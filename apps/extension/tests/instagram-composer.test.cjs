@@ -16,6 +16,7 @@ function createContext(html, preShareResponse = { ok: true }) {
   const runtimeMessages = [];
   const context = vm.createContext({
     document,
+    URL,
     window: {
       ...window,
       location: new URL('https://www.instagram.com/'),
@@ -53,15 +54,16 @@ function createContext(html, preShareResponse = { ok: true }) {
   return context;
 }
 
-function loadComposer(context) {
+function loadComposer(context, captionSelector = 'textarea') {
   context.PostFlowInstagramSelectors = {
     findCreateTrigger: (documentRef) => documentRef.querySelector('#create'),
     findDialog: (documentRef) => documentRef.querySelector('[role="dialog"]'),
     findMediaInput: (root) => root.querySelector('input[type="file"]'),
-    findCaptionField: (root) => root.querySelector('textarea'),
+    findCaptionField: (root) => root.querySelector(captionSelector),
     findNextButton: () => null,
     findShareButton: (root) => root.querySelector('#share'),
   };
+  loadScript(context, '../src/platforms/instagram/caption.ts');
   loadScript(context, '../src/platforms/instagram/composer.ts');
 }
 
@@ -85,6 +87,21 @@ test('Instagram selectors identify the safe create, media, caption, next, and sh
   assert.ok(selectors.findCaptionField(dialog));
   assert.ok(selectors.findNextButton(dialog));
   assert.ok(selectors.findShareButton(dialog));
+});
+
+test('Instagram selectors prefer the Lexical caption textbox', () => {
+  const context = createContext(`
+    <div role="dialog">
+      <div contenteditable="true" role="textbox" aria-label="Add a caption..."></div>
+      <div contenteditable="true" aria-label="Other editor"></div>
+    </div>
+  `);
+  loadScript(context, '../src/platforms/instagram/selectors.ts');
+
+  const field = context.PostFlowInstagramSelectors.findCaptionField(
+    context.document.querySelector('[role="dialog"]'),
+  );
+  assert.equal(field?.getAttribute('aria-label'), 'Add a caption...');
 });
 
 test('Instagram selectors support the current sidebar link with a nested New post SVG', () => {
@@ -133,6 +150,30 @@ test('Instagram composer attaches one image, inserts caption, and checks before 
   assert.equal(context.__runtimeMessages[0].jobId, 'job-instagram-1');
 });
 
+test('Instagram composer inserts captions into a contenteditable Reel field', async () => {
+  const context = createContext(`
+    <button id="create">Create</button>
+    <div role="dialog">
+      <input type="file" />
+      <div contenteditable="true" role="textbox" aria-label="Add a caption..."></div>
+      <button id="share">Share</button>
+    </div>
+  `);
+  const share = context.document.querySelector('#share');
+  share.click = () => {};
+  loadComposer(context, '[contenteditable="true"]');
+
+  const result = await context.PostFlowInstagramComposer.execute({
+    jobId: 'job-instagram-reel-caption',
+    expectedUsername: 'ema.d1852',
+    targetType: 'INSTAGRAM_REEL',
+    post: { content: 'Reel caption', mediaUrls: ['data:video/mp4;base64,AA=='] },
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(context.document.querySelector('[contenteditable="true"]').textContent, 'Reel caption');
+});
+
 test('Instagram composer does not click Share when the final check rejects the job', async () => {
   const context = createContext(`
     <button id="create">Create</button>
@@ -171,7 +212,11 @@ test('Instagram composer reports a visible share confirmation as published', asy
     <div>Your post has been shared</div>
   `);
   const share = context.document.querySelector('#share');
-  share.click = () => {};
+  share.click = () => {
+    const postLink = context.document.createElement('a');
+    postLink.setAttribute('href', '/ema.d1852/p/new-feed-post/');
+    context.document.body.appendChild(postLink);
+  };
   loadComposer(context);
 
   const result = await context.PostFlowInstagramComposer.execute({
@@ -183,4 +228,42 @@ test('Instagram composer reports a visible share confirmation as published', asy
 
   assert.equal(result.success, true);
   assert.equal(result.status, 'PUBLISHED');
+  assert.equal(result.postUrl, 'https://www.instagram.com/p/new-feed-post/');
+});
+
+test('Instagram composer detects the Post shared dialog without closing the page context', async () => {
+  const context = createContext(`
+    <button id="create">Create</button>
+    <div role="dialog">
+      <input type="file" />
+      <button id="share">Share</button>
+    </div>
+  `);
+  const share = context.document.querySelector('#share');
+  let doneClicks = 0;
+  share.click = () => {
+    const successDialog = context.document.createElement('div');
+    successDialog.setAttribute('aria-label', 'Post shared');
+    successDialog.setAttribute('aria-modal', 'true');
+    successDialog.setAttribute('role', 'dialog');
+    successDialog.innerHTML = '<h3>Your post has been shared.</h3><div role="button">Done</div>';
+    successDialog.querySelector('[role="button"]').click = () => { doneClicks += 1; };
+    context.document.body.appendChild(successDialog);
+    const postLink = context.document.createElement('a');
+    postLink.setAttribute('href', '/ema.d1852/reel/dialog-success-post/');
+    context.document.body.appendChild(postLink);
+  };
+  loadComposer(context);
+
+  const result = await context.PostFlowInstagramComposer.execute({
+    jobId: 'job-instagram-dialog-success',
+    expectedUsername: 'ema.d1852',
+    targetType: 'INSTAGRAM_FEED',
+    post: { mediaUrls: ['data:image/png;base64,AA=='] },
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.status, 'PUBLISHED');
+  assert.equal(result.postUrl, 'https://www.instagram.com/reel/dialog-success-post/');
+  assert.equal(doneClicks, 0);
 });

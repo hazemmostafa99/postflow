@@ -63,7 +63,10 @@ const instagramSelectors: InstagramElementFinder = {
     const candidates = Array.from(
       root.querySelectorAll<HTMLElement>('textarea, [contenteditable="true"]'),
     );
-    return candidates.find(visible) ?? null;
+    const captionCandidates = candidates.filter((candidate) =>
+      /caption/i.test(labelFor(candidate)),
+    );
+    return captionCandidates.find(visible) ?? candidates.find(visible) ?? null;
   },
   findNextButton(root) {
     return findButton(root, NEXT_LABEL);
