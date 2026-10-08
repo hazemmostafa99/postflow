@@ -17,9 +17,11 @@ import { UserRole } from '../schemas/user.schema';
 import { PostsService } from './posts.service';
 
 type InsertedJob = {
+  platform?: string;
   targetType: PublishingTargetType;
   groupId?: unknown;
   facebookConnectionId?: unknown;
+  platformConnectionId?: unknown;
   scheduledFor?: Date;
 };
 
@@ -32,9 +34,11 @@ describe('PostsService.createPost', () => {
   function createHarness(options?: {
     groups?: Record<string, unknown>[];
     connections?: Record<string, unknown>[];
+    platformConnections?: Record<string, unknown>[];
   }) {
     const groups = options?.groups ?? [];
     const connections = options?.connections ?? [];
+    const platformConnections = options?.platformConnections ?? [];
     const postDocument = {
       _id: { toString: () => postId },
       toObject: () => ({ clerkUserId: userId, content: 'Hello' }),
@@ -58,6 +62,11 @@ describe('PostsService.createPost', () => {
         exec: jest.fn().mockResolvedValue(connections),
       }),
     };
+    const platformConnectionModel = {
+      find: jest.fn().mockReturnValue({
+        exec: jest.fn().mockResolvedValue(platformConnections),
+      }),
+    };
     const service = new PostsService(
       postModel as never,
       jobModel as never,
@@ -65,9 +74,10 @@ describe('PostsService.createPost', () => {
       connectionModel as never,
       {} as never,
       {} as never,
+      platformConnectionModel as never,
     );
 
-    return { service, postModel, jobModel, insertedJobs };
+    return { service, postModel, jobModel, insertedJobs, platformConnectionModel };
   }
 
   function verifiedConnection() {
@@ -125,6 +135,40 @@ describe('PostsService.createPost', () => {
       expect.objectContaining({
         targetType: PublishingTargetType.PROFILE_FEED,
         targetId: connectionId,
+      }),
+    ]);
+  });
+
+  it('creates a verified Instagram Feed job with one image', async () => {
+    const platformConnection = {
+      _id: { toString: () => connectionId },
+      clerkUserId: userId,
+      platform: 'INSTAGRAM',
+      status: 'CONNECTED',
+      sessionDetected: true,
+      externalUsername: 'brand.account',
+      detectedExternalUsername: 'brand.account',
+    };
+    const { service, insertedJobs } = createHarness({
+      platformConnections: [platformConnection],
+    });
+
+    await service.createPost(userId, {
+      content: 'Instagram launch',
+      mediaUrls: ['data:image/png;base64,AAAA'],
+      targets: [
+        {
+          type: PublishingTargetType.INSTAGRAM_FEED,
+          platformConnectionId: connectionId,
+        },
+      ],
+    });
+
+    expect(insertedJobs[0]).toEqual([
+      expect.objectContaining({
+        platform: 'INSTAGRAM',
+        targetType: PublishingTargetType.INSTAGRAM_FEED,
+        platformConnectionId: platformConnection._id,
       }),
     ]);
   });

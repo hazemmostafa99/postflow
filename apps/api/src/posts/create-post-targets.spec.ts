@@ -1,5 +1,6 @@
 import { PublishingTargetType } from '../schemas/publishing-target';
 import {
+  isVerifiedInstagramConnection,
   isVerifiedProfileConnection,
   normalizeCreatePostTargets,
 } from './create-post-targets';
@@ -23,6 +24,21 @@ describe('normalizeCreatePostTargets', () => {
         facebookConnectionId: connectionId,
       },
       { type: PublishingTargetType.GROUP, groupId },
+    ]);
+  });
+
+  it('normalizes Instagram Feed and Reel targets', () => {
+    expect(
+      normalizeCreatePostTargets(
+        [
+          { type: 'INSTAGRAM_FEED', platformConnectionId: connectionId },
+          { type: 'INSTAGRAM_REEL', platformConnectionId: '64b000000000000000000003' },
+        ],
+        undefined,
+      ),
+    ).toEqual([
+      { type: PublishingTargetType.INSTAGRAM_FEED, platformConnectionId: connectionId },
+      { type: PublishingTargetType.INSTAGRAM_REEL, platformConnectionId: '64b000000000000000000003' },
     ]);
   });
 
@@ -111,6 +127,18 @@ describe('normalizeCreatePostTargets', () => {
         facebookSessionDetected: true,
         facebookUserId: 'facebook-user-1',
         detectedFacebookUserId: 'facebook-user-1',
+      }),
+    ).toBe(true);
+  });
+
+  it('accepts an identity-matched connected Instagram session by username', () => {
+    expect(
+      isVerifiedInstagramConnection({
+        platform: 'INSTAGRAM',
+        status: 'CONNECTED',
+        sessionDetected: true,
+        externalUsername: 'brand.account',
+        detectedExternalUsername: 'Brand.Account',
       }),
     ).toBe(true);
   });

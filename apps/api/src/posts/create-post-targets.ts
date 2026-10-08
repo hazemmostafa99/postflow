@@ -8,6 +8,10 @@ export type CreatePostTarget =
   | {
       type: PublishingTargetType.PROFILE_FEED;
       facebookConnectionId: string;
+    }
+  | {
+      type: PublishingTargetType.INSTAGRAM_FEED | PublishingTargetType.INSTAGRAM_REEL;
+      platformConnectionId: string;
     };
 
 export type VerifiableFacebookConnection = {
@@ -15,6 +19,14 @@ export type VerifiableFacebookConnection = {
   facebookSessionDetected: boolean;
   facebookUserId?: string;
   detectedFacebookUserId?: string;
+};
+
+export type VerifiablePlatformConnection = {
+  platform: string;
+  status: string;
+  sessionDetected: boolean;
+  externalUsername?: string;
+  detectedExternalUsername?: string;
 };
 
 const MONGODB_OBJECT_ID_PATTERN = /^[a-f\d]{24}$/i;
@@ -62,6 +74,23 @@ export function normalizeCreatePostTargets(
       continue;
     }
 
+    if (
+      candidate.type === PublishingTargetType.INSTAGRAM_FEED ||
+      candidate.type === PublishingTargetType.INSTAGRAM_REEL
+    ) {
+      if (candidate.groupId !== undefined || candidate.facebookConnectionId !== undefined) {
+        throw new Error('Instagram targets must not include Facebook destinations');
+      }
+      normalizedTargets.push({
+        type: candidate.type,
+        platformConnectionId: normalizeObjectId(
+          candidate.platformConnectionId,
+          'platform connection',
+        ),
+      });
+      continue;
+    }
+
     throw new Error('Unsupported publishing target type');
   }
 
@@ -81,7 +110,9 @@ export function normalizeCreatePostTargets(
     const targetId =
       target.type === PublishingTargetType.GROUP
         ? target.groupId
-        : target.facebookConnectionId;
+        : target.type === PublishingTargetType.PROFILE_FEED
+          ? target.facebookConnectionId
+          : target.platformConnectionId;
     const key = `${target.type}:${targetId}`;
     if (targetKeys.has(key)) {
       throw new Error('Duplicate publishing targets are not allowed');
@@ -101,6 +132,20 @@ export function isVerifiedProfileConnection(
     connection.facebookUserId &&
     connection.detectedFacebookUserId &&
     connection.facebookUserId === connection.detectedFacebookUserId,
+  );
+}
+
+export function isVerifiedInstagramConnection(
+  connection: VerifiablePlatformConnection,
+): boolean {
+  return Boolean(
+    connection.platform === 'INSTAGRAM' &&
+    connection.status === 'CONNECTED' &&
+    connection.sessionDetected &&
+    connection.externalUsername &&
+    connection.detectedExternalUsername &&
+    connection.externalUsername.toLowerCase() ===
+      connection.detectedExternalUsername.toLowerCase(),
   );
 }
 

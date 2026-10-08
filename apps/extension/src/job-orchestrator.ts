@@ -206,6 +206,12 @@ async function executeJob(job: PublishJob): Promise<void> {
       },
     });
   } else {
+    if (result.canceled) {
+      console.warn(`[PostFlow] ${platform} job canceled before submit`, { jobId: job.id });
+      await updateJobStatus(job.id, { status: 'CANCELED' });
+      return;
+    }
+
     // Check if we should pause this platform's queue
     if (result.shouldPauseQueue) {
       pausePlatformQueue(platform, result.reason || 'Platform error', result.detector, job.id);

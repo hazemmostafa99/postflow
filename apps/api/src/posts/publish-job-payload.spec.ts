@@ -119,6 +119,26 @@ describe('toPublishJobPayload', () => {
       }),
     ).toBeNull();
   });
+
+  it('maps an Instagram Feed job using the username identity fallback', () => {
+    const payload = toPublishJobPayload({
+      _id: id('job-instagram-1'),
+      targetType: PublishingTargetType.INSTAGRAM_FEED,
+      postId: { content: 'Hello Instagram', mediaUrls: ['data:image/png;base64,AAAA'] },
+      platformConnectionId: {
+        _id: id('platform-connection-1'),
+        platform: PublishingPlatform.INSTAGRAM,
+        externalUsername: 'brand.account',
+      },
+    });
+
+    expect(payload?.target).toEqual({
+      type: PublishingTargetType.INSTAGRAM_FEED,
+      platformConnectionId: 'platform-connection-1',
+      instagramUsername: 'brand.account',
+      url: 'https://www.instagram.com/brand.account/',
+    });
+  });
 });
 
 describe('getFacebookProfileUrl', () => {

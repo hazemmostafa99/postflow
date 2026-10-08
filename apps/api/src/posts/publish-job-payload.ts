@@ -101,8 +101,8 @@ function isPopulatedPlatformConnection(
   return Boolean(
     value &&
     typeof value === 'object' &&
-    'externalAccountId' in value &&
-    '_id' in value,
+    '_id' in value &&
+    ('externalAccountId' in value || 'externalUsername' in value),
   );
 }
 
@@ -229,7 +229,10 @@ export function toPublishJobPayload(
 
   if (targetType === PublishingTargetType.INSTAGRAM_FEED) {
     const pc = platformConnection;
-    if (!isPopulatedPlatformConnection(pc) || !pc.externalAccountId) {
+    if (
+      !isPopulatedPlatformConnection(pc) ||
+      (!pc.externalAccountId && !pc.externalUsername)
+    ) {
       return null;
     }
 
@@ -254,7 +257,10 @@ export function toPublishJobPayload(
 
   if (targetType === PublishingTargetType.INSTAGRAM_REEL) {
     const pc = platformConnection;
-    if (!isPopulatedPlatformConnection(pc) || !pc.externalAccountId) {
+    if (
+      !isPopulatedPlatformConnection(pc) ||
+      (!pc.externalAccountId && !pc.externalUsername)
+    ) {
       return null;
     }
 

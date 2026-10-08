@@ -5,6 +5,11 @@ type PlatformSessionMessage = {
   externalUsername?: string;
 };
 
+type InstagramPreShareCheckMessage = {
+  jobId?: string;
+  expectedUsername?: string;
+};
+
 type ApiFetch = (
   path: string,
   body?: Record<string, unknown>,
@@ -50,6 +55,74 @@ export function reportInstagramSession(
 export function registerInstagramSessionWorker(apiFetch: ApiFetch): void {
   console.info('[PostFlow][Instagram] Session worker registered');
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === 'INSTAGRAM_PRE_SHARE_CHECK') {
+      if (!isInstagramPage(sender.tab?.url)) {
+        sendResponse({ ok: false, reason: 'Pre-share checks must come from instagram.com.' });
+        return;
+      }
+
+      const request = message as InstagramPreShareCheckMessage;
+      const expectedUsername = request.expectedUsername?.trim().toLowerCase();
+      if (!request.jobId || !expectedUsername) {
+        sendResponse({ ok: false, reason: 'Instagram pre-share identity data is incomplete.' });
+        return;
+      }
+
+      void (async () => {
+        const stored = await chrome.storage.local.get([
+          'instagramSessionDetected',
+          'instagramDetectedUsername',
+        ]);
+        const detectedUsername = typeof stored.instagramDetectedUsername === 'string'
+          ? stored.instagramDetectedUsername.trim().toLowerCase()
+          : '';
+        if (stored.instagramSessionDetected !== true || detectedUsername !== expectedUsername) {
+          console.warn('[PostFlow][Instagram] Pre-share identity rejected', {
+            jobId: request.jobId,
+            expectedUsername,
+            detectedUsername: detectedUsername || null,
+          });
+          return {
+            ok: false,
+            reason: 'Instagram account changed or is no longer verified before Share.',
+          };
+        }
+
+        const latestJob = await apiFetch(`/api/jobs/${encodeURIComponent(request.jobId!)}`) as {
+          status?: string;
+          apiFetchError?: boolean;
+        } | null;
+        if (!latestJob || latestJob.apiFetchError || latestJob.status !== 'RUNNING') {
+          console.warn('[PostFlow][Instagram] Pre-share job-status check rejected', {
+            jobId: request.jobId,
+            status: latestJob?.status || 'UNAVAILABLE',
+          });
+          return {
+            ok: false,
+            canceled: latestJob?.status === 'CANCEL_REQUESTED' || latestJob?.status === 'CANCELED',
+            reason: latestJob?.status === 'CANCEL_REQUESTED' || latestJob?.status === 'CANCELED'
+              ? 'Instagram job was canceled before Share.'
+              : 'Instagram job is no longer eligible for Share.',
+          };
+        }
+
+        console.info('[PostFlow][Instagram] Pre-share checks passed', {
+          jobId: request.jobId,
+          expectedUsername,
+        });
+        return { ok: true };
+      })()
+        .then(sendResponse)
+        .catch((error) => {
+          console.error('[PostFlow][Instagram] Pre-share check failed', error);
+          sendResponse({
+            ok: false,
+            reason: 'Could not verify the Instagram job before Share.',
+          });
+        });
+      return true;
+    }
+
     if (message?.type !== 'PLATFORM_SESSION_STATUS' || message.platform !== 'INSTAGRAM') {
       return;
     }

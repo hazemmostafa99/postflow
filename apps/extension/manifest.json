@@ -58,6 +58,8 @@
       "matches": ["https://instagram.com/*", "https://www.instagram.com/*"],
       "js": [
         "dist/platforms/instagram/identity.js",
+        "dist/platforms/instagram/selectors.js",
+        "dist/platforms/instagram/composer.js",
         "dist/platforms/instagram/content.js"
       ],
       "run_at": "document_idle"

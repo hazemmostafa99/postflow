@@ -15,6 +15,7 @@ export interface AccountVerificationResult {
 export interface PublishResult {
   success: boolean;
   status: 'PUBLISHED' | 'PENDING_APPROVAL' | 'UNKNOWN' | 'FAILED';
+  canceled?: boolean;
   postUrl?: string;
   externalPostId?: string;
   externalPublishId?: string;

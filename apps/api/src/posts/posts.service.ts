@@ -18,6 +18,11 @@ import {
   FacebookConnectionDocument,
 } from '../schemas/facebook-connection.schema';
 import {
+  PlatformConnection,
+  PlatformConnectionDocument,
+} from '../schemas/platform-connection.schema';
+import { PublishingPlatform } from '../schemas/publishing-platform';
+import {
   User,
   UserDocument,
   UserRole,
@@ -30,6 +35,7 @@ import {
 } from './post-flow-time-spacing';
 import {
   CreatePostTarget,
+  isVerifiedInstagramConnection,
   isVerifiedProfileConnection,
   normalizeCreatePostTargets,
 } from './create-post-targets';
@@ -100,6 +106,11 @@ type ResolvedCreatePostTarget =
       type: PublishingTargetType.PROFILE_FEED;
       connection: FacebookConnectionDocument;
       order: number;
+    }
+  | {
+      type: PublishingTargetType.INSTAGRAM_FEED | PublishingTargetType.INSTAGRAM_REEL;
+      connection: PlatformConnectionDocument;
+      order: number;
     };
 
 @Injectable()
@@ -116,6 +127,8 @@ export class PostsService {
     @InjectModel(User.name)
     private readonly userModel: Model<UserDocument>,
     private readonly authorization: AuthorizationService,
+    @InjectModel(PlatformConnection.name)
+    private readonly platformConnectionModel?: Model<PlatformConnectionDocument>,
   ) {}
 
   /**
@@ -151,7 +164,13 @@ export class PostsService {
         ? [target.facebookConnectionId]
         : [],
     );
-    const [groups, connections] = await Promise.all([
+    const platformConnectionIds = targets.flatMap((target) =>
+      target.type === PublishingTargetType.INSTAGRAM_FEED ||
+      target.type === PublishingTargetType.INSTAGRAM_REEL
+        ? [target.platformConnectionId]
+        : [],
+    );
+    const [groups, connections, platformConnections] = await Promise.all([
       groupIds.length
         ? this.groupModel
             .find({
@@ -170,6 +189,18 @@ export class PostsService {
             })
             .exec()
         : [],
+      platformConnectionIds.length && this.platformConnectionModel
+        ? this.platformConnectionModel
+            .find({
+              _id: {
+                $in: platformConnectionIds.map((id) => new Types.ObjectId(id)),
+              },
+              clerkUserId,
+              platform: PublishingPlatform.INSTAGRAM,
+              archivedAt: { $exists: false },
+            })
+            .exec()
+        : [],
     ]);
 
     if (groups.length !== groupIds.length) {
@@ -183,11 +214,20 @@ export class PostsService {
       );
     }
 
+    if (platformConnections.length !== platformConnectionIds.length) {
+      throw new BadRequestException(
+        'One or more selected Instagram connections are invalid for this user',
+      );
+    }
+
     const groupsById = new Map(
       groups.map((group) => [group._id.toString(), group]),
     );
     const connectionsById = new Map(
       connections.map((connection) => [connection._id.toString(), connection]),
+    );
+    const platformConnectionsById = new Map(
+      platformConnections.map((connection) => [connection._id.toString(), connection]),
     );
     const orderedTargets: ResolvedCreatePostTarget[] = targets.map(
       (target, order) => {
@@ -199,17 +239,28 @@ export class PostsService {
           };
         }
 
-        const connection = connectionsById.get(target.facebookConnectionId)!;
-        if (!isVerifiedProfileConnection(connection)) {
+        if (target.type === PublishingTargetType.PROFILE_FEED) {
+          const connection = connectionsById.get(target.facebookConnectionId)!;
+          if (!isVerifiedProfileConnection(connection)) {
+            throw new BadRequestException(
+              'Profile feed publishing requires a verified Facebook connection',
+            );
+          }
+          return {
+            type: PublishingTargetType.PROFILE_FEED,
+            connection,
+            order,
+          };
+        }
+
+        const connection = platformConnectionsById.get(target.platformConnectionId)!;
+        if (!isVerifiedInstagramConnection(connection)) {
           throw new BadRequestException(
-            'Profile feed publishing requires a verified Facebook connection',
+            'Instagram publishing requires a connected and verified Instagram session',
           );
         }
-        return {
-          type: PublishingTargetType.PROFILE_FEED,
-          connection,
-          order,
-        };
+        this.validateInstagramMedia(target.type, mediaUrls);
+        return { type: target.type, connection, order };
       },
     );
 
@@ -244,9 +295,16 @@ export class PostsService {
                 ? { facebookConnectionId: target.group.facebookConnectionId }
                 : {}),
             }
-          : { facebookConnectionId: target.connection._id };
+          : target.type === PublishingTargetType.PROFILE_FEED
+            ? { facebookConnectionId: target.connection._id }
+            : { platformConnectionId: target.connection._id };
       return {
         postId: post._id,
+        platform:
+          target.type === PublishingTargetType.GROUP ||
+          target.type === PublishingTargetType.PROFILE_FEED
+            ? PublishingPlatform.FACEBOOK
+            : PublishingPlatform.INSTAGRAM,
         targetType: target.type,
         ...destination,
         status: PublishingJobStatus.PENDING,
@@ -374,6 +432,26 @@ export class PostsService {
       }
       return url;
     });
+  }
+
+  private validateInstagramMedia(
+    targetType: PublishingTargetType.INSTAGRAM_FEED | PublishingTargetType.INSTAGRAM_REEL,
+    mediaUrls: string[],
+  ): void {
+    if (mediaUrls.length !== 1) {
+      throw new BadRequestException(
+        targetType === PublishingTargetType.INSTAGRAM_FEED
+          ? 'Instagram Feed requires exactly one image'
+          : 'Instagram Reel requires exactly one video',
+      );
+    }
+    const isVideo = mediaUrls[0].startsWith('data:video/');
+    if (targetType === PublishingTargetType.INSTAGRAM_FEED && isVideo) {
+      throw new BadRequestException('Instagram Feed requires an image');
+    }
+    if (targetType === PublishingTargetType.INSTAGRAM_REEL && !isVideo) {
+      throw new BadRequestException('Instagram Reel requires a video');
+    }
   }
 
   /**

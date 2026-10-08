@@ -397,6 +397,7 @@ export class ExtensionsService {
     clerkUserId: string,
     installation: ExtensionInstallationDocument,
     platform: 'FACEBOOK' | 'INSTAGRAM' | 'TIKTOK',
+    options: { allowPublishing?: boolean } = {},
   ): Promise<PlatformConnectionDocument | null> {
     if (!this.platformConnectionModel) return null;
     const connection = await this.platformConnectionModel
@@ -411,7 +412,8 @@ export class ExtensionsService {
     // Verify the connection status allows claiming work
     if (
       connection.status !== PlatformConnectionStatus.CONNECTED ||
-      connection.workerStatus === PlatformConnectionWorkerStatus.PUBLISHING
+      (!options.allowPublishing &&
+        connection.workerStatus === PlatformConnectionWorkerStatus.PUBLISHING)
     ) {
       return null;
     }

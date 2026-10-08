@@ -410,26 +410,36 @@ Known limitations / next work:
 
 # Phase 4 - Instagram Feed and Reel MVP
 
-Status: `NOT STARTED`
+Status: `IN PROGRESS - QUEUE AND COMPOSER FOUNDATION`
 
 ## Checklist
 
-- [ ] Add Instagram destinations to the create-post form.
-- [ ] Validate target type against connection platform.
-- [ ] Validate one Feed image or one Reel video before job creation.
-- [ ] Create and schedule Instagram jobs through the shared queue.
-- [ ] Implement allowlisted Instagram navigation and readiness checks.
-- [ ] Implement Instagram Feed composer detection.
-- [ ] Implement Instagram Reel composer detection.
-- [ ] Attach the expected media and verify its preview.
-- [ ] Insert and verify the caption without duplication.
-- [ ] Re-check account identity and cancellation before Share.
-- [ ] Click only a verified, enabled Share control.
-- [ ] Detect published, failed, interrupted, and unknown outcomes.
-- [ ] Normalize and store reliable Instagram post/Reel URLs.
-- [ ] Prevent automatic retry after an accepted or uncertain result.
-- [ ] Add sanitized DOM fixture and orchestration tests.
-- [ ] Run the API, web, and extension builds/tests.
+- [x] Add Instagram Feed/Reel destinations to the create-post form; keep
+      selection disabled until the publishing flag/live review is approved.
+- [x] Validate target type against the Instagram platform connection.
+- [x] Validate one Feed image or one Reel video before job creation.
+- [x] Create Instagram jobs through the existing shared queue contract; UI
+      destination controls remain gated until the adapter review is complete.
+- [x] Implement allowlisted Instagram navigation and readiness checks.
+- [x] Implement initial Instagram Feed/Reel composer detection.
+- [x] Attach one expected media file and insert a caption through isolated DOM
+      code; live selector verification is still pending.
+- [x] Click only a visible, enabled Share control.
+- [x] Re-check account identity and cancellation immediately before Share.
+- [ ] Verify media preview and caption without duplication in live variants.
+- [ ] Enable the Instagram feature flag after live review.
+- [x] Detect published, failed, interrupted, and unknown outcomes.
+- [x] Normalize and store reliable Instagram post/Reel URLs.
+- [x] Treat accepted/unknown outcomes as terminal after the composer response;
+      crash-window recovery still requires live validation.
+- [x] Add sanitized DOM fixtures for Instagram selectors/composer flow and
+      final pre-Share cancellation coverage.
+- [x] Run the API and extension builds plus focused target/payload tests.
+- [x] Polish Instagram connection and destination UI with explicit loading,
+      verified, waiting, mismatch, and sign-in-required states.
+- [x] Add manual refresh, last-seen feedback, setup steps, and accessible
+      disabled-state explanations to the Instagram surfaces.
+- [ ] Run the full API/web/extension validation suite.
 - [ ] Complete recorded live validation with dedicated Instagram accounts.
 
 ## Review Gate
@@ -441,9 +451,56 @@ begin.
 ## Review Notes
 
 ```text
-Status: NOT STARTED
+Status: IN PROGRESS - foundation implemented; publishing remains feature-flagged
 
-No implementation files changed yet.
+Implementation added:
+- API target normalization and ownership/identity/media validation for
+  `INSTAGRAM_FEED` and `INSTAGRAM_REEL`.
+- Username-only Instagram identity support in claimed job payloads.
+- `platforms/instagram/{selectors,composer,adapter,index}.ts` with allowlisted
+  navigation, storage-backed account verification, isolated media/caption/Share
+  flow, and safe `UNKNOWN` result semantics after Share.
+- Instagram adapter registration while the Instagram publishing flag remains
+  disabled.
+- Web create-post form now loads verified Instagram connections and renders
+  Feed/Reel destination controls. They submit `platformConnectionId` when the
+  public web flag is enabled, but remain visibly gated during validation.
+- Instagram connection and destination surfaces now show a clear auto-connect
+  setup flow, refresh control, verified/mismatch/login/waiting states, last
+  seen activity, media requirements, and an explicit rollout explanation when
+  publishing is disabled.
+- The Instagram composer now asks the background worker for a final identity
+  and job-status check immediately before Share; it fails closed for account
+  changes, cancellation, stale jobs, disabled Share controls, or API-check
+  failures. A confirmed cancellation is reported as `CANCELED` to the shared
+  orchestrator instead of being converted into a generic failure. Generic job
+  ownership/status updates now support Instagram platform connections while
+  preserving the legacy Facebook path.
+- Added `tests/instagram-composer.test.cjs` with sanitized Feed/Reel fixtures
+  covering control discovery, media/caption insertion, pre-Share checks, and
+  the no-click-on-cancel safety path. The direct fixture run passes all five
+  tests, including the current sidebar `a[role="link"]` + nested `New post`
+  SVG shape captured from the dedicated test account.
+- Updated Instagram control discovery to support the current sidebar link
+  structure and added background logs around composer command/response
+  handoff.
+- Instagram outcome handling now detects a visible share confirmation or a
+  canonical `/p/`/`/reel/` URL, normalizes the permalink on the extension and
+  API paths, and persists `PUBLISHED` versus terminal `UNKNOWN` without an
+  automatic retry after the response is received.
+- Development-only Instagram publishing flags were enabled for the dedicated
+  test account on 2026-10-08. Production flags remain disabled until the live
+  review gate is approved.
+
+Checks:
+- API build passes.
+- Web production build passes after the Instagram UI/UX update.
+- Focused target, payload, and posts-service tests pass: 31 tests.
+- Extension development build passes.
+
+Remaining before enabling jobs:
+- Complete real browser validation for current Instagram Feed/Reel UI variants.
+- Verify accepted/unknown behavior across extension restart and lease recovery.
 ```
 
 ---
@@ -560,16 +617,11 @@ No implementation files changed yet.
 
 ## Current Next Action
 
-Continue with Phase 3 using only new structured Instagram modules:
+Continue Phase 4 validation before enabling Instagram publishing:
 
-- Add the generic Instagram session/identity reporting contract.
-- Add `platforms/instagram/identity.ts` and its independent content script.
-- Keep Instagram job creation disabled until session detection and connection
-  ownership are validated.
-- Return to the legacy Facebook folder split only after the Facebook
-  regression gate is approved.
-- Add adapter routing, cancellation, stale-message, and platform-status tests.
-- Run Facebook automated regression checks and record the manual baseline.
-- Resolve the extension test-runner `spawn EPERM` environment limitation.
-- Keep Instagram/TikTok adapters and job creation disabled until that gate is
-  approved.
+- Add cancellation and account re-check immediately before Share.
+- Add sanitized composer fixtures and orchestration tests.
+- Validate current Instagram Feed/Reel selectors in a real browser session.
+- Run the complete API/web/extension validation suite.
+- Keep the public Instagram publishing flag disabled until the live review
+  passes; Facebook remains unchanged during this gate.

@@ -188,6 +188,28 @@ function normalizeFacebookGroupPostUrl(value?: string): string | undefined {
   }
 }
 
+function normalizeInstagramPostUrl(value?: string): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    if (host !== 'instagram.com' && !host.endsWith('.instagram.com')) return undefined;
+    if (!/^\/(p|reel)\/[^/]+\/?$/i.test(url.pathname)) return undefined;
+    return `https://www.instagram.com${url.pathname.replace(/\/$/, '')}/`;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeSubmissionPostUrl(
+  platform: PublishingPlatform,
+  value?: string,
+): string | undefined {
+  return platform === PublishingPlatform.INSTAGRAM
+    ? normalizeInstagramPostUrl(value)
+    : normalizeFacebookGroupPostUrl(value);
+}
+
 function getFacebookPostIdentity(value?: string): string | undefined {
   const normalized = normalizeFacebookGroupPostUrl(value);
   if (!normalized) return undefined;
@@ -362,15 +384,21 @@ export class JobsController {
         clerkUserId,
         installation,
         platform,
+        { allowPublishing: true },
       );
       if (!pc || String(pc._id) !== String(platformConnectionId)) {
         return { platformConnection: null, facebookConnection: null };
       }
 
       // Verify platform connection status
+      const identityVerified = !pc.externalUsername || Boolean(
+        pc.detectedExternalUsername &&
+          pc.externalUsername.toLowerCase() ===
+            pc.detectedExternalUsername.toLowerCase(),
+      );
       const verified = pc.status === PlatformConnectionStatus.CONNECTED &&
         pc.sessionDetected &&
-        pc.workerStatus !== PlatformConnectionWorkerStatus.PUBLISHING;
+        identityVerified;
 
       return verified ? { platformConnection: pc, facebookConnection: null } : { platformConnection: null, facebookConnection: null };
     }
@@ -394,10 +422,35 @@ export class JobsController {
     credential: string | undefined,
     job: PublishingJobDocument,
     options: { requireActive: boolean } = { requireActive: true },
-  ): Promise<FacebookConnectionDocument> {
+  ): Promise<FacebookConnectionDocument | PlatformConnectionDocument> {
     const normalizedInstanceId = this.requireExtensionInstanceId(
       extensionInstanceId,
     );
+
+    // New platform jobs are owned by a generic PlatformConnection. Keep the
+    // legacy Facebook branch below intact for older jobs and maintenance work.
+    if (job.platformConnectionId && this.platformConnectionModel) {
+      const resolved = await this.getVerifiedPlatformConnection(
+        clerkUserId,
+        normalizedInstanceId,
+        credential,
+        job.platform ?? PublishingPlatform.FACEBOOK,
+        job.platformConnectionId,
+        job.facebookConnectionId,
+        options,
+      );
+      // Legacy Facebook jobs still use their FacebookConnection for
+      // maintenance/status updates even when a compatibility PlatformConnection
+      // is linked alongside them.
+      const connection = resolved.facebookConnection ?? resolved.platformConnection;
+      if (!connection) {
+        throw new UnauthorizedException(
+          'Extension instance is not linked to the verified platform connection for this job',
+        );
+      }
+      return connection;
+    }
+
     const connection = await this.getVerifiedWorkerConnection(
       clerkUserId,
       normalizedInstanceId,
@@ -840,7 +893,10 @@ export class JobsController {
       )
       .populate('postId', 'content mediaUrls')
       .populate('groupId', 'name url externalId')
-      .populate('platformConnectionId', 'platform displayName externalAccountId detectedExternalAccountId')
+      .populate(
+        'platformConnectionId',
+        'platform displayName externalAccountId externalUsername detectedExternalAccountId detectedExternalUsername',
+      )
       .populate(
         'facebookConnectionId',
         'displayName facebookUserId detectedFacebookUserId',
@@ -1669,22 +1725,13 @@ export class JobsController {
       normalizedInstanceId,
       credential,
     );
-    const workerConnection = await this.getVerifiedWorkerConnection(
+    const workerConnection = await this.assertWorkerOwnsJob(
       clerkUserId,
       normalizedInstanceId,
       credential,
+      job,
       { requireActive: false },
     );
-    if (!workerConnection) {
-      throw new UnauthorizedException(
-        'Extension instance is not linked to a verified Facebook connection',
-      );
-    }
-    if (String(job.facebookConnectionId) !== String(workerConnection._id)) {
-      throw new UnauthorizedException(
-        'Job is assigned to another Facebook connection',
-      );
-    }
     const workerConnectionId = workerConnection._id;
 
     // Final-result grace: a paused or disconnecting installation may only
@@ -1754,34 +1801,44 @@ export class JobsController {
       job.claimedByExtensionInstanceId = undefined;
       job.claimExpiresAt = undefined;
     }
-    if (workerConnectionId && body.status === PublishingJobStatus.RUNNING) {
-      await this.connectionModel.updateOne(
-        { _id: workerConnectionId },
-        {
-          $set: {
-            workerStatus: FacebookConnectionWorkerStatus.PUBLISHING,
-            lastSeenAt: new Date(),
-          },
-        },
-      );
-    } else if (
+    if (
       workerConnectionId &&
-      (body.status === PublishingJobStatus.SUCCESS ||
+      (body.status === PublishingJobStatus.RUNNING ||
+        body.status === PublishingJobStatus.SUCCESS ||
         body.status === PublishingJobStatus.FAILED ||
         body.status === PublishingJobStatus.CANCELED)
     ) {
-      await this.connectionModel.updateOne(
-        { _id: workerConnectionId },
-        {
-          $set: {
-            workerStatus: FacebookConnectionWorkerStatus.IDLE,
-            lastSeenAt: new Date(),
-          },
+      const workerStatus = body.status === PublishingJobStatus.RUNNING
+        ? PlatformConnectionWorkerStatus.PUBLISHING
+        : PlatformConnectionWorkerStatus.IDLE;
+      const update = {
+        $set: {
+          workerStatus,
+          lastSeenAt: new Date(),
         },
-      );
+      };
+      const isLegacyFacebookJob =
+        (job.platform ?? PublishingPlatform.FACEBOOK) === PublishingPlatform.FACEBOOK &&
+        Boolean(job.facebookConnectionId);
+      if (job.platformConnectionId && this.platformConnectionModel && !isLegacyFacebookJob) {
+        await this.platformConnectionModel.updateOne({ _id: workerConnectionId }, update);
+      } else {
+        await this.connectionModel.updateOne(
+          { _id: workerConnectionId },
+          {
+            $set: {
+              workerStatus: body.status === PublishingJobStatus.RUNNING
+                ? FacebookConnectionWorkerStatus.PUBLISHING
+                : FacebookConnectionWorkerStatus.IDLE,
+              lastSeenAt: new Date(),
+            },
+          },
+        );
+      }
     }
     if (body.submissionResult) {
-      const normalizedSubmissionPostUrl = normalizeFacebookGroupPostUrl(
+      const normalizedSubmissionPostUrl = normalizeSubmissionPostUrl(
+        job.platform ?? PublishingPlatform.FACEBOOK,
         body.submissionResult.postUrl,
       );
       const effectiveSubmissionStatus =
@@ -1797,7 +1854,13 @@ export class JobsController {
             FacebookSubmissionStatus.PENDING_APPROVAL)
       ) {
         const duplicateTargetFilter =
-          job.targetType === PublishingTargetType.PROFILE_FEED
+          (job.platform ?? PublishingPlatform.FACEBOOK) === PublishingPlatform.INSTAGRAM
+            ? {
+                platform: PublishingPlatform.INSTAGRAM,
+                platformConnectionId: job.platformConnectionId,
+                targetType: job.targetType,
+              }
+            : job.targetType === PublishingTargetType.PROFILE_FEED
             ? {
                 targetType: PublishingTargetType.PROFILE_FEED,
                 facebookConnectionId: job.facebookConnectionId,
@@ -1836,11 +1899,7 @@ export class JobsController {
         job.postUrl = undefined;
       }
       job.submissionReason = duplicatePermalink
-        ? `Facebook returned a permalink already assigned to another job in this ${
-            job.targetType === PublishingTargetType.PROFILE_FEED
-              ? 'profile feed'
-              : 'group'
-          }`
+        ? `${job.platform ?? PublishingPlatform.FACEBOOK} returned a permalink already assigned to another job`
         : effectiveSubmissionStatus === FacebookSubmissionStatus.UNKNOWN
           ? body.submissionResult.reason
           : undefined;

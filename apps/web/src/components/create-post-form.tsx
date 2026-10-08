@@ -4,6 +4,11 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { CalendarClock, CheckSquare, ChevronDown, Clock3, ImagePlus, Loader2, Search, Send, Square, Trash2, UserRound, Users, X } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import {
+  InstagramDestinationMenu,
+  type InstagramConnection,
+  type InstagramDestinationType,
+} from "@/components/instagram-destination-menu";
 
 interface Group {
   _id: string;
@@ -23,7 +28,8 @@ interface FacebookConnection {
 
 type SelectedDestination =
   | { key: string; type: "GROUP"; group: Group }
-  | { key: string; type: "PROFILE_FEED"; connection: FacebookConnection };
+  | { key: string; type: "PROFILE_FEED"; connection: FacebookConnection }
+  | { key: string; type: InstagramDestinationType; connection: InstagramConnection };
 
 interface CreatePostFormProps {
   groups?: Group[];
@@ -46,6 +52,7 @@ const MAX_MEDIA_FILES = 4;
 const MAX_MEDIA_FILE_SIZE = 2 * 1024 * 1024;
 const MAX_VIDEO_FILES = 1;
 const MAX_VIDEO_FILE_SIZE = 25 * 1024 * 1024;
+const INSTAGRAM_PUBLISHING_ENABLED = process.env.NEXT_PUBLIC_INSTAGRAM_PUBLISHING_ENABLED === "true";
 
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -61,6 +68,7 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
   const [availableGroups, setAvailableGroups] = useState<Group[]>(groups);
   const [selectedGroupsById, setSelectedGroupsById] = useState<Map<string, Group>>(new Map());
   const [selectedProfilesById, setSelectedProfilesById] = useState<Map<string, FacebookConnection>>(new Map());
+  const [selectedInstagramByKey, setSelectedInstagramByKey] = useState<Map<string, InstagramConnection>>(new Map());
   const [selectedTargetKeys, setSelectedTargetKeys] = useState<string[]>([]);
   const [content, setContent] = useState("");
   const [mediaUrls, setMediaUrls] = useState<string[]>([]);
@@ -74,6 +82,7 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
   const [groupTotal, setGroupTotal] = useState(groups.length);
   const [groupTotalPages, setGroupTotalPages] = useState(Math.max(1, Math.ceil(groups.length / GROUPS_PER_PAGE)));
   const [connections, setConnections] = useState<FacebookConnection[]>([]);
+  const [instagramConnections, setInstagramConnections] = useState<InstagramConnection[]>([]);
   const [selectedConnectionIds, setSelectedConnectionIds] = useState<string[]>([]);
   const [isProfileMenuOpen, setIsProfileMenuOpen] = useState(false);
   const [isGroupAccountMenuOpen, setIsGroupAccountMenuOpen] = useState(false);
@@ -90,9 +99,14 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
         const connection = selectedProfilesById.get(key.slice("PROFILE_FEED:".length));
         return connection ? [{ key, type: "PROFILE_FEED", connection }] : [];
       }
+      if (key.startsWith("INSTAGRAM_FEED:") || key.startsWith("INSTAGRAM_REEL:")) {
+        const connection = selectedInstagramByKey.get(key);
+        const type = key.startsWith("INSTAGRAM_FEED:") ? "INSTAGRAM_FEED" : "INSTAGRAM_REEL";
+        return connection ? [{ key, type, connection }] : [];
+      }
       return [];
     }),
-    [selectedGroupsById, selectedProfilesById, selectedTargetKeys],
+    [selectedGroupsById, selectedInstagramByKey, selectedProfilesById, selectedTargetKeys],
   );
 
   const fetchGroupsPage = useCallback(async (page: number, search: string) => {
@@ -122,14 +136,18 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
 
   useEffect(() => {
     let cancelled = false;
-    void fetch("/api/extensions/connections")
-      .then(async (res) => {
-        if (!res.ok) return [] as FacebookConnection[];
-        return (await res.json()) as FacebookConnection[];
-      })
-      .then((data) => {
+    void Promise.all([
+      fetch("/api/extensions/connections"),
+      fetch("/api/extensions/platform-connections"),
+    ])
+      .then(async ([facebookResponse, instagramResponse]) => [
+        facebookResponse.ok ? (await facebookResponse.json()) as FacebookConnection[] : [],
+        instagramResponse.ok ? (await instagramResponse.json()) as InstagramConnection[] : [],
+      ] as const)
+      .then(([facebookData, instagramData]) => {
         if (cancelled) return;
-        setConnections(data);
+        setConnections(facebookData);
+        setInstagramConnections(instagramData);
       })
       .catch(() => undefined);
 
@@ -253,9 +271,34 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
     );
   }, [selectedConnectionIds, updateGroupConnectionFilter]);
 
+  const toggleInstagram = useCallback((targetType: InstagramDestinationType, connection: InstagramConnection) => {
+    const key = `${targetType}:${connection._id}`;
+    setSelectedInstagramByKey((previous) => {
+      const next = new Map(previous);
+      if (next.has(key)) next.delete(key);
+      else next.set(key, connection);
+      return next;
+    });
+    setSelectedTargetKeys((keys) => keys.includes(key)
+      ? keys.filter((item) => item !== key)
+      : [...keys, key]);
+  }, []);
+
+  const clearInstagram = useCallback((targetType: InstagramDestinationType) => {
+    setSelectedInstagramByKey((previous) => {
+      const next = new Map(previous);
+      for (const key of next.keys()) {
+        if (key.startsWith(`${targetType}:`)) next.delete(key);
+      }
+      return next;
+    });
+    setSelectedTargetKeys((keys) => keys.filter((key) => !key.startsWith(`${targetType}:`)));
+  }, []);
+
   const clearAll = useCallback(() => {
     setSelectedGroupsById(new Map());
     setSelectedProfilesById(new Map());
+    setSelectedInstagramByKey(new Map());
     setSelectedTargetKeys([]);
   }, []);
 
@@ -285,7 +328,9 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
           mediaUrls,
           targets: selectedDestinations.map((destination) => destination.type === "GROUP"
             ? { type: "GROUP", groupId: destination.group._id }
-            : { type: "PROFILE_FEED", facebookConnectionId: destination.connection._id }),
+            : destination.type === "PROFILE_FEED"
+              ? { type: "PROFILE_FEED", facebookConnectionId: destination.connection._id }
+              : { type: destination.type, platformConnectionId: destination.connection._id }),
           ...(publishMode === "SCHEDULED" && startTime ? { startTime: new Date(startTime).toISOString() } : {}),
         }),
       });
@@ -466,19 +511,25 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
                 {selectedDestinations.map((destination) => {
                   const label = destination.type === "GROUP"
                     ? destination.group.name
-                    : connectionName(destination.connection);
+                    : destination.type === "PROFILE_FEED"
+                      ? connectionName(destination.connection)
+                      : `${destination.type === "INSTAGRAM_REEL" ? "Reel" : "Feed"} @${destination.connection.externalUsername ?? "Instagram"}`;
                   return (
                     <span
                       key={destination.key}
                       className="inline-flex h-8 max-w-full items-center gap-1.5 rounded-md border border-primary/20 bg-primary/10 pl-2.5 pr-1.5 text-xs font-medium text-foreground"
                     >
-                      {destination.type === "PROFILE_FEED"
+                      {destination.type !== "GROUP"
                         ? <UserRound className="h-3.5 w-3.5 shrink-0 text-primary" />
                         : <Users className="h-3.5 w-3.5 shrink-0 text-primary" />}
                       <span className="max-w-48 truncate">{label}</span>
                       <button
                         type="button"
-                        onClick={() => destination.type === "GROUP" ? toggleGroup(destination.group) : toggleProfile(destination.connection)}
+                        onClick={() => destination.type === "GROUP"
+                          ? toggleGroup(destination.group)
+                          : destination.type === "PROFILE_FEED"
+                            ? toggleProfile(destination.connection)
+                            : toggleInstagram(destination.type, destination.connection)}
                         className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-background hover:text-foreground"
                         aria-label={"Remove " + label}
                       >
@@ -590,6 +641,28 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
               )}
               <p className="text-[11px] leading-4 text-muted-foreground">Profile posts keep the audience currently set on Facebook.</p>
             </div>
+
+            <InstagramDestinationMenu
+              targetType="INSTAGRAM_FEED"
+              connections={instagramConnections}
+              selectedIds={Array.from(selectedInstagramByKey.keys())
+                .filter((key) => key.startsWith("INSTAGRAM_FEED:"))
+                .map((key) => key.slice("INSTAGRAM_FEED:".length))}
+              publishingEnabled={INSTAGRAM_PUBLISHING_ENABLED}
+              onToggle={(connection) => toggleInstagram("INSTAGRAM_FEED", connection)}
+              onClear={() => clearInstagram("INSTAGRAM_FEED")}
+            />
+
+            <InstagramDestinationMenu
+              targetType="INSTAGRAM_REEL"
+              connections={instagramConnections}
+              selectedIds={Array.from(selectedInstagramByKey.keys())
+                .filter((key) => key.startsWith("INSTAGRAM_REEL:"))
+                .map((key) => key.slice("INSTAGRAM_REEL:".length))}
+              publishingEnabled={INSTAGRAM_PUBLISHING_ENABLED}
+              onToggle={(connection) => toggleInstagram("INSTAGRAM_REEL", connection)}
+              onClear={() => clearInstagram("INSTAGRAM_REEL")}
+            />
 
             <div className="space-y-2 border-t border-border pt-3">
               <div className="flex items-center justify-between gap-3">
@@ -812,7 +885,11 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
                     {selectedDestinations.map((destination, index) => (
                       <div key={destination.key} className="flex justify-between gap-3">
                         <span className="truncate">
-                          {destination.type === "GROUP" ? destination.group.name : connectionName(destination.connection) + " - Profile"}
+                          {destination.type === "GROUP"
+                            ? destination.group.name
+                            : destination.type === "PROFILE_FEED"
+                              ? connectionName(destination.connection) + " - Profile"
+                              : `${destination.type === "INSTAGRAM_REEL" ? "Reel" : "Feed"} @${destination.connection.externalUsername ?? "Instagram"}`}
                         </span>
                         <span className="shrink-0 tabular-nums">
                           {index === 0
