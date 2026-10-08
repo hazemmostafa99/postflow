@@ -201,9 +201,11 @@ Status: `IN PROGRESS - FOUNDATION IMPLEMENTED`
 - [x] Add feature flags for Facebook, Instagram, and TikTok execution.
 - [x] Define a strict extension folder, dependency, reuse, and size contract.
 - [ ] Split the flat extension entrypoints into the target folder structure
-      incrementally without creating a second worker.
+      incrementally without creating a second worker. (Deferred until after
+      the Facebook regression gate.)
 - [ ] Extract shared Chrome/API/job/media/diagnostic helpers and remove
-      background-to-orchestrator circular imports.
+      background-to-orchestrator circular imports. (Deferred cleanup; new
+      platform code must still use the target boundaries.)
 - [ ] Enforce module/function size budgets and public `index.ts` boundaries.
 - [ ] Add adapter routing, claim isolation, cancellation, and stale-message
       tests.
@@ -261,9 +263,10 @@ Implementation:
 - Added platform status reporting endpoint for platform-scoped worker state.
 - Added a strict extension code-organization contract to the feature
   specification: target folders, dependency direction, reusable-helper rules,
-  module/function size budgets, no-circular-import policy, and incremental
-  migration requirements. This turn changed documentation only; no bulk file
-  move was performed.
+  module/function size budgets, no-circular-import policy, and migration
+  requirements. Existing Facebook files are explicitly a legacy zone for now;
+  all new Instagram/TikTok code must use the target structure. No bulk move
+  was performed.
 
 Tests/checks:
 - API build passes.
@@ -281,9 +284,11 @@ Known limitations / next work:
 - Need focused tests for adapter routing, cancellation, stale messages, and
   platform-status reporting.
 - The current extension still has flat legacy entrypoints (`background.ts`,
-  `content.ts`, and several root-level Facebook modules). They must be split
-  incrementally under `background/`, `shared/`, and `platforms/facebook/`;
-  do not add Instagram/TikTok logic to those legacy files.
+  `content.ts`, and several root-level Facebook modules). Their cleanup is
+  deferred until after the Facebook regression gate; do not add new
+  Instagram/TikTok logic to those legacy files. The only temporary bridge is
+  the one-line Instagram worker registration hook in `background.ts`; its
+  validation and API behavior live in `platforms/instagram/worker.ts`.
 - The target structure is a contract, not a reason to create empty files or
   duplicate the Facebook worker. Each move must preserve the old public import
   until build/test coverage proves the new path is safe.
@@ -295,22 +300,24 @@ Known limitations / next work:
 
 # Phase 3 - Instagram Connection and Session Detection
 
-Status: `NOT STARTED`
+Status: `IN PROGRESS - SESSION DETECTION FOUNDATION`
 
 ## Checklist
 
-- [ ] Add narrowly scoped Instagram manifest permission.
-- [ ] Add an independent Instagram content-script bundle.
-- [ ] Detect whether an Instagram session exists.
-- [ ] Detect the strongest reliable Instagram account identity.
-- [ ] Report expected and detected identity separately.
+- [x] Add narrowly scoped Instagram manifest permission.
+- [x] Add an independent Instagram content-script bundle.
+- [x] Detect whether an Instagram session exists.
+- [x] Detect the strongest reliable Instagram account identity available to
+      the sanitized DOM detector.
+- [x] Report expected and detected identity separately for bound connections.
 - [ ] Add Instagram connection/reconnection backend flows.
 - [ ] Add Instagram connection state to the extension popup.
 - [ ] Add Instagram connection state to the web dashboard.
-- [ ] Block Instagram claims for logout, mismatch, pause, or archive states.
+- [x] Block Instagram claims for logout, mismatch, pause, or archive states
+      when a generic Instagram connection exists.
 - [ ] Confirm an Instagram interruption does not block Facebook jobs.
 - [ ] Add sanitized session and identity fixture tests.
-- [ ] Keep Instagram publishing job creation disabled.
+- [x] Keep Instagram publishing execution disabled by feature flag.
 
 ## Review Gate
 
@@ -320,9 +327,46 @@ English UI with dedicated test accounts before enabling Instagram publishing.
 ## Review Notes
 
 ```text
-Status: NOT STARTED
+Status: IN PROGRESS - session reporting only; no connection binding
 
-No implementation files changed yet.
+Files changed:
+- apps/api/src/extensions/extensions.controller.ts
+- apps/api/src/extensions/extensions.service.ts
+- apps/api/src/extensions/extensions.controller.spec.ts
+- apps/api/src/extensions/extensions.service.spec.ts
+- apps/extension/manifest.json
+- apps/extension/src/background.ts
+- apps/extension/src/types.d.ts
+- apps/extension/src/platforms/instagram/identity.ts
+- apps/extension/src/platforms/instagram/content.ts
+- apps/extension/src/platforms/instagram/worker.ts
+
+Implementation:
+- Added a narrowly scoped Instagram host permission and independent content
+  script pair. The identity detector prefers canonical/Open Graph/profile-link
+  evidence and falls back to a normalized profile pathname.
+- Added a small worker bridge that accepts only messages from Instagram tabs
+  and reports session state to the credential-authenticated API endpoint.
+- Added `POST /api/extensions/platform-session`. It updates only an existing,
+  installation-owned generic connection, keeps expected/detected identities
+  separate, and marks logout or mismatch without automatic rebinding.
+- Instagram publishing remains disabled; no Instagram job creation or DOM
+  composer automation was enabled.
+
+Tests/checks:
+- API build passes.
+- Extension development build passes.
+- Extension/API controller and service tests pass: 61 tests.
+- Four sanitized identity fixture tests pass when run directly; the managed
+  multi-file Node test runner still reports `spawn EPERM`, and live account
+  validation is pending.
+
+Known limitations / next work:
+- A dashboard/reconnect flow must explicitly create or bind an Instagram
+  `PlatformConnection`; session reports intentionally return no connection for
+  an unbound installation.
+- Add popup/dashboard connection state and sanitized identity fixtures before
+  enabling Instagram publishing.
 ```
 
 ---
@@ -479,11 +523,14 @@ No implementation files changed yet.
 
 ## Current Next Action
 
-Finish the Phase 2 regression gate before starting Instagram work:
+Continue with Phase 3 using only new structured Instagram modules:
 
-- Begin the incremental extension split with `background/index.ts`,
-  `background/orchestrator.ts`, and `shared/platform/*`; keep compatibility
-  re-exports until the build and tests pass.
+- Add the generic Instagram session/identity reporting contract.
+- Add `platforms/instagram/identity.ts` and its independent content script.
+- Keep Instagram job creation disabled until session detection and connection
+  ownership are validated.
+- Return to the legacy Facebook folder split only after the Facebook
+  regression gate is approved.
 - Add adapter routing, cancellation, stale-message, and platform-status tests.
 - Run Facebook automated regression checks and record the manual baseline.
 - Resolve the extension test-runner `spawn EPERM` environment limitation.

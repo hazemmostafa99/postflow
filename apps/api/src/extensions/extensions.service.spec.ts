@@ -21,6 +21,10 @@ import {
   FacebookConnectionStatus,
   FacebookConnectionWorkerStatus,
 } from '../schemas/facebook-connection.schema';
+import {
+  PlatformConnectionStatus,
+  PlatformConnectionWorkerStatus,
+} from '../schemas/platform-connection.schema';
 import { hashInstallationCredential } from './installation-credential';
 import {
   ExtensionsService,
@@ -744,6 +748,64 @@ describe('ExtensionsService.updateSession recovery', () => {
     });
     expect(result.recoveryCandidates).toEqual([]);
     expect(bound.detectedFacebookUserId).toBe('fb-user-1');
+  });
+});
+
+describe('ExtensionsService.updatePlatformSession', () => {
+  it('marks an owned Instagram connection mismatched without rebinding it', async () => {
+    const harness = createHarness();
+    const platformConnection = {
+      _id: new Types.ObjectId(),
+      clerkUserId: 'clerk-user-1',
+      platform: 'INSTAGRAM',
+      activeExtensionInstallationId: harness.installation._id,
+      externalAccountId: undefined,
+      externalUsername: 'expected.account',
+      detectedExternalUsername: undefined,
+      status: PlatformConnectionStatus.CONNECTED,
+      workerStatus: PlatformConnectionWorkerStatus.IDLE,
+      sessionDetected: true,
+      lastSeenAt: new Date(),
+      save: jest.fn().mockImplementation(function save(this: unknown) {
+        return Promise.resolve(this);
+      }),
+      toObject: jest.fn(function toObject(this: Record<string, unknown>) {
+        return { ...this };
+      }),
+    };
+    const platformConnectionModel = {
+      findOne: jest.fn(() => ({
+        exec: jest.fn().mockResolvedValue(platformConnection),
+      })),
+    };
+    const service = new ExtensionsService(
+      harness.extensionModel as never,
+      harness.connectionModel as never,
+      harness.jobModel as never,
+      harness.auditModel as never,
+      platformConnectionModel as never,
+    );
+
+    const result = await service.updatePlatformSession(
+      'INSTAGRAM',
+      'clerk-user-1',
+      'extension-1',
+      undefined,
+      true,
+      undefined,
+      'different.account',
+    );
+
+    expect(platformConnection.status).toBe(PlatformConnectionStatus.ACCOUNT_MISMATCH);
+    expect(platformConnection.workerStatus).toBe(
+      PlatformConnectionWorkerStatus.ACCOUNT_MISMATCH,
+    );
+    expect(platformConnection.detectedExternalUsername).toBe('different.account');
+    expect(platformConnection.save).toHaveBeenCalled();
+    expect(result).toEqual(expect.objectContaining({
+      platform: 'INSTAGRAM',
+      status: PlatformConnectionStatus.ACCOUNT_MISMATCH,
+    }));
   });
 });
 

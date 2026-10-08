@@ -13,6 +13,7 @@ import {
   type ProfileFeedPublishTarget,
   type PublishJob,
 } from './publishing-target.js';
+import { registerInstagramSessionWorker } from './platforms/instagram/worker.js';
 import {
   checkPendingJobs as checkPlatformJobs,
   handlePlatformQueueResume,
@@ -478,6 +479,8 @@ export async function apiFetch(
   );
   return includeFailureDetails ? { apiFetchError: true, status: 0 } : null;
 }
+
+registerInstagramSessionWorker(apiFetch);
 
 // Reads persisted review state and submits only selected, valid normalized numbers.
 async function syncPhoneNumbersToBackend(): Promise<PhoneSyncResponse> {

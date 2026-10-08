@@ -31,6 +31,13 @@ class PlatformWorkerStatusDto {
   reason?: string;
 }
 
+class PlatformSessionDto {
+  platform: 'FACEBOOK' | 'INSTAGRAM' | 'TIKTOK';
+  sessionDetected: boolean;
+  externalAccountId?: string;
+  externalUsername?: string;
+}
+
 class ExtensionIdentityDto {
   extensionName?: unknown;
 }
@@ -276,6 +283,26 @@ export class ExtensionsController {
       credential,
       body.workerStatus,
       body.reason,
+    );
+  }
+
+  /** Called by a platform content script when its authenticated identity changes. */
+  @Post('platform-session')
+  @HttpCode(HttpStatus.OK)
+  async platformSession(
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+    @Headers('x-extension-instance-id') extensionInstanceId?: string,
+    @Headers('x-extension-credential') credential?: string,
+    @Body() body: PlatformSessionDto = new PlatformSessionDto(),
+  ) {
+    return this.extensionsService.updatePlatformSession(
+      body.platform,
+      this.requireClerkUserId(clerkUserId),
+      extensionInstanceId,
+      credential,
+      body.sessionDetected,
+      body.externalAccountId,
+      body.externalUsername,
     );
   }
 

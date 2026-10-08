@@ -906,6 +906,90 @@ export class ExtensionsService {
     return sanitizePlatformConnection(platformConnection);
   }
 
+  /**
+   * Update one platform's detected session identity without binding a new
+   * connection. Binding remains an explicit dashboard action.
+   */
+  async updatePlatformSession(
+    platform: 'FACEBOOK' | 'INSTAGRAM' | 'TIKTOK',
+    clerkUserId: string,
+    extensionInstanceId?: string,
+    credential?: string,
+    sessionDetected?: boolean,
+    detectedExternalAccountId?: string,
+    detectedExternalUsername?: string,
+  ) {
+    if (!['FACEBOOK', 'INSTAGRAM', 'TIKTOK'].includes(platform)) {
+      throw new BadRequestException('Invalid publishing platform');
+    }
+    if (!this.platformConnectionModel) {
+      throw new NotFoundException('Platform connections are not enabled');
+    }
+    const installation = await this.verifyWorkerIdentity(
+      clerkUserId,
+      extensionInstanceId,
+      credential,
+    );
+    const platformConnection = (await this.platformConnectionModel
+      .findOne({
+        clerkUserId,
+        platform: platform as any,
+        activeExtensionInstallationId: installation._id,
+        archivedAt: { $exists: false },
+      })
+      .exec()) as PlatformConnectionDocument | null;
+
+    if (!platformConnection) return null;
+
+    const normalizedAccountId = detectedExternalAccountId?.trim() || undefined;
+    const normalizedUsername = detectedExternalUsername?.trim() || undefined;
+    const expectedAccountId = platformConnection.externalAccountId?.trim();
+    const expectedUsername = platformConnection.externalUsername?.trim();
+    const identityMismatch = Boolean(
+      sessionDetected &&
+        ((expectedAccountId &&
+          (!normalizedAccountId || expectedAccountId !== normalizedAccountId)) ||
+          (!expectedAccountId &&
+            expectedUsername &&
+            (!normalizedUsername ||
+              expectedUsername.toLowerCase() !== normalizedUsername.toLowerCase()))),
+    );
+
+    const persistentStatuses = new Set([
+      PlatformConnectionWorkerStatus.PUBLISHING,
+      PlatformConnectionWorkerStatus.BLOCKED,
+      PlatformConnectionWorkerStatus.CHECKPOINT_OR_VERIFICATION,
+      PlatformConnectionWorkerStatus.CAPTCHA_OR_CHALLENGE,
+      PlatformConnectionWorkerStatus.MANUAL_INTERVENTION_REQUIRED,
+    ]);
+    platformConnection.sessionDetected = Boolean(sessionDetected);
+    platformConnection.status = !sessionDetected
+      ? PlatformConnectionStatus.LOGIN_REQUIRED
+      : identityMismatch
+        ? PlatformConnectionStatus.ACCOUNT_MISMATCH
+        : PlatformConnectionStatus.CONNECTED;
+    platformConnection.workerStatus = !sessionDetected
+      ? PlatformConnectionWorkerStatus.LOGIN_REQUIRED
+      : identityMismatch
+        ? PlatformConnectionWorkerStatus.ACCOUNT_MISMATCH
+        : persistentStatuses.has(platformConnection.workerStatus)
+          ? platformConnection.workerStatus
+          : PlatformConnectionWorkerStatus.IDLE;
+    platformConnection.statusReason = identityMismatch
+      ? 'Detected platform identity does not match the expected connection.'
+      : undefined;
+    if (normalizedAccountId) {
+      platformConnection.detectedExternalAccountId = normalizedAccountId;
+    }
+    if (normalizedUsername) {
+      platformConnection.detectedExternalUsername = normalizedUsername;
+    }
+    platformConnection.lastSeenAt = new Date();
+    await platformConnection.save();
+
+    return sanitizePlatformConnection(platformConnection);
+  }
+
   async updateSession(
     clerkUserId: string,
     extensionInstanceId?: string,

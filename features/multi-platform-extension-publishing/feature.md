@@ -246,9 +246,11 @@ not allowed to grow by appending more branches to `background.ts`,
 
 ### Target folder structure
 
-This is the required destination structure for new code. Existing Facebook
-files may be moved incrementally, but every file changed after this contract
-is approved must follow these boundaries.
+This is the required structure for new Instagram and TikTok code. The current
+Facebook implementation is a legacy zone for this feature: do not perform a
+large move or rewrite while the Facebook regression gate is still open. A
+later cleanup may migrate those files incrementally behind compatibility
+re-exports.
 
 ```text
 apps/extension/src/
@@ -349,23 +351,27 @@ The following rules are mandatory:
 - New reusable code requires a focused unit test or a sanitized DOM fixture;
   dead generic helpers and catch-all `utils.ts` files are prohibited.
 
-### Incremental migration rule
+### New-code and legacy-code rule
 
-The refactor must not create two workers or two implementations of Facebook.
-Move one responsibility at a time behind the existing entrypoint, preserve
-the old import as a temporary re-export when needed, and delete it only after
-the new path has build/test coverage. Each migration step must record:
+Instagram and TikTok must start in their platform folders and use the shared
+contracts without adding branches to the legacy Facebook files. The existing
+Facebook files remain operational until the regression gate is approved. Do
+not create a second worker or a second Facebook implementation.
+
+When the later Facebook cleanup begins, move one responsibility at a time
+behind the existing entrypoint, preserve the old import as a temporary
+re-export when needed, and delete it only after the new path has build/test
+coverage. Each migration step must record:
 
 1. source file moved or split,
 2. public API kept stable,
 3. tests/build checks run, and
 4. remaining legacy files and their deletion condition.
 
-The first required splits are `background.ts` into the background modules,
-`platform-adapter.ts` and `publishing-target.ts` into `shared/`, and Facebook
-tracking/composer files into `platforms/facebook/`. Instagram and TikTok code
-must start in their platform folders and must not be added to the legacy
-Facebook files.
+The Facebook splits (`background.ts`, `platform-adapter.ts`,
+`publishing-target.ts`, and Facebook tracking/composer files) are deferred
+cleanup work, not a prerequisite for the Instagram MVP. New platform code
+must still avoid importing Facebook private implementation files.
 
 ---
 
@@ -487,6 +493,37 @@ supports it.
    again and compares it with the job's expected connection identity.
 
 The extension must never publish merely because some account is logged in.
+
+### Phase 3 Instagram session detection contract
+
+The first Instagram implementation must be isolated under
+`apps/extension/src/platforms/instagram/` and must not add Instagram DOM
+selectors to the legacy Facebook content script. Its initial modules are:
+
+```text
+platforms/instagram/
+├── identity.ts   # pure, sanitized DOM identity detector
+├── content.ts    # tiny content-script entrypoint and runtime message
+└── worker.ts     # validated background-to-API session bridge
+```
+
+The detector may use the canonical profile URL, Open Graph profile URL, or a
+visible profile link. A username is a fallback identity only; it must be
+normalized and never treated as a numeric account ID. The content script sends
+only `{ platform, sessionDetected, externalUsername }` through a typed runtime
+message. It must not receive PostFlow credentials or call the API directly.
+
+The worker validates that the message originated from an Instagram tab, then
+reports it to `POST /api/extensions/platform-session`. The backend verifies
+the installation credential and updates only the matching, already-bound
+Instagram `PlatformConnection`. It stores detected identity separately from
+expected identity, marks a mismatch as `ACCOUNT_MISMATCH`, and never creates
+or rebinds a connection from a session report. Connection creation remains an
+explicit dashboard/reconnect action.
+
+The manifest may add only `https://www.instagram.com/*` for this phase. The
+Instagram feature flag remains disabled for publishing until connection
+creation, popup/dashboard state, and sanitized identity fixtures are complete.
 
 ### Account mismatch
 

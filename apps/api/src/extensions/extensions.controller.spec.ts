@@ -29,6 +29,8 @@ describe('ExtensionsController', () => {
     rename: jest.fn(),
     updateSession: jest.fn(),
     updateWorkerStatus: jest.fn(),
+    updatePlatformConnectionWorkerStatus: jest.fn(),
+    updatePlatformSession: jest.fn(),
   };
 
   type Service = typeof service;
@@ -128,6 +130,27 @@ describe('ExtensionsController', () => {
       'credential-1',
       FacebookConnectionWorkerStatus.BLOCKED,
       'checkpoint',
+    );
+  });
+
+  it('forwards platform session identity without binding it automatically', async () => {
+    const controller = createController();
+    const internal = controller as unknown as { extensionsService: Service };
+
+    await controller.platformSession('user-1', 'extension-1', 'credential-1', {
+      platform: 'INSTAGRAM',
+      sessionDetected: true,
+      externalUsername: 'brand.account',
+    });
+
+    expect(internal.extensionsService.updatePlatformSession).toHaveBeenCalledWith(
+      'INSTAGRAM',
+      'user-1',
+      'extension-1',
+      'credential-1',
+      true,
+      undefined,
+      'brand.account',
     );
   });
 

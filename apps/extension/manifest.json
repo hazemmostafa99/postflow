@@ -13,6 +13,7 @@
   ],
   "host_permissions": [
     "https://www.facebook.com/*",
+    "https://www.instagram.com/*",
     "http://localhost:8000/*",
     "http://127.0.0.1:8000/*",
     "https://api.fitcure.online/*",
@@ -50,6 +51,14 @@
     {
       "matches": ["https://www.facebook.com/*"],
       "js": ["dist/facebook-session.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.instagram.com/*"],
+      "js": [
+        "dist/platforms/instagram/identity.js",
+        "dist/platforms/instagram/content.js"
+      ],
       "run_at": "document_idle"
     },
     {

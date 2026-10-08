@@ -41,3 +41,15 @@ interface Window {
 interface WorkerGlobalScope {
   PostFlowPostingTiming?: PostFlowPostingTimingConfig;
 }
+
+interface InstagramIdentityDetector {
+  detect: () => {
+    sessionDetected: boolean;
+    externalUsername?: string;
+    source: string;
+  };
+}
+
+interface Window {
+  PostFlowInstagramIdentity?: InstagramIdentityDetector;
+}
