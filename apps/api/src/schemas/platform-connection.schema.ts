@@ -98,6 +98,15 @@ export class PlatformConnection {
   @Prop({ default: false })
   sessionDetected: boolean;
 
+  @Prop({ enum: ['VERIFIED', 'CHECKING', 'LOGIN_REQUIRED', 'STALE'] })
+  sessionEvidenceState?: string;
+
+  @Prop()
+  sessionVerifiedAt?: Date;
+
+  @Prop()
+  sessionEvidenceSource?: string;
+
   @Prop({ default: Date.now })
   lastSeenAt: Date;
 

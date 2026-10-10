@@ -3,6 +3,7 @@ import {
   getPlatformEngagementQueueFilter,
   isFacebookEngagementPermalink,
   isInstagramEngagementPermalink,
+  isTikTokEngagementPermalink,
   isEligibleForEngagementSync,
 } from './engagement-eligibility';
 
@@ -88,6 +89,7 @@ describe('engagement eligibility', () => {
     'https://www.instagram.com/p/DeOaDcwHEsk/',
     'https://www.instagram.com/ema.d1852/p/DeOaDcwHEsk/',
     'https://instagram.com/ema.d1852/reel/ABC_123/',
+    'https://www.instagram.com/reels/DePpMfhhGwj/',
   ])('accepts a supported Instagram permalink: %s', (postUrl) => {
     expect(isInstagramEngagementPermalink(postUrl)).toBe(true);
   });
@@ -110,5 +112,45 @@ describe('engagement eligibility', () => {
         now,
       ),
     ).toBe(true);
+    expect(
+      isEligibleForEngagementSync(
+        {
+          platform: 'INSTAGRAM',
+          status: 'SUCCESS',
+          submissionStatus: 'PUBLISHED',
+          postUrl: 'https://www.instagram.com/reels/DePpMfhhGwj/',
+        },
+        now,
+      ),
+    ).toBe(true);
+  });
+
+  it.each([
+    'https://www.tiktok.com/@creator/video/7695090241077644565',
+    'https://tiktok.com/@creator_name/photo/7695090241077644565?is_from_webapp=1',
+    '[TikTok post](https://www.tiktok.com/@creator/video/7695090241077644565)',
+  ])('accepts a supported TikTok permalink: %s', (postUrl) => {
+    expect(isTikTokEngagementPermalink(postUrl)).toBe(true);
+    expect(isEligibleForEngagementSync({
+      platform: 'TIKTOK',
+      status: 'SUCCESS',
+      submissionStatus: 'PUBLISHED',
+      postUrl,
+    }, now)).toBe(true);
+  });
+
+  it.each([
+    'https://www.tiktok.com/@creator',
+    'https://www.tiktok.com/@creator/video/not-a-number',
+    'https://tiktok.com.evil/@creator/video/7695090241077644565',
+  ])('rejects an unsupported TikTok URL: %s', (postUrl) => {
+    expect(isTikTokEngagementPermalink(postUrl)).toBe(false);
+  });
+
+  it('builds a TikTok-specific engagement queue filter', () => {
+    const filter = getPlatformEngagementQueueFilter('TIKTOK', now);
+    expect(filter.postUrl.$regex).toBeDefined();
+    expect(filter.postUrl.$regex.test('https://www.tiktok.com/@creator/video/7695090241077644565')).toBe(true);
+    expect(filter.$or).toHaveLength(3);
   });
 });

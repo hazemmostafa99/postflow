@@ -30,6 +30,11 @@ interface PublishedProfilePostMatch {
   postUrl: string;
 }
 
+interface ProfileVideoPostCandidate {
+  postUrl: string;
+  text: string;
+}
+
 let activeProfileTrackingSession: ProfilePublishTrackingSession | null = null;
 
 function normalizeFacebookProfilePostUrl(
@@ -146,6 +151,69 @@ function getProfilePostPermalink(
     }
   }
   return null;
+}
+
+/**
+ * Returns the video/reel permalinks currently rendered in a profile feed.
+ *
+ * Facebook virtualizes the feed and often renders a new video first without
+ * a timestamp. URL identity is therefore a safer before/after comparison than
+ * relying on CSS classes or the order of feed cards.
+ */
+function getProfileVideoPostCandidates(
+  root: ParentNode = document,
+  expectedFacebookUserId: string,
+  submittedText = '',
+  includeNonVideo = false,
+): ProfileVideoPostCandidate[] {
+  const selector = '[role="article"], [data-pagelet*="FeedUnit"]';
+  const candidates: Element[] = [];
+  if (root instanceof Element && root.matches(selector)) candidates.push(root);
+  candidates.push(...Array.from(root.querySelectorAll(selector)));
+
+  const normalizedSubmittedText = submittedText
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+  const seen = new Set<string>();
+  const results: ProfileVideoPostCandidate[] = [];
+
+  for (const candidate of candidates) {
+    const postUrl = getProfilePostPermalink(candidate, expectedFacebookUserId, true);
+    if (!postUrl) continue;
+
+    let path = '';
+    try {
+      path = new URL(postUrl).pathname.toLowerCase();
+    } catch {
+      continue;
+    }
+    const hasVideoElement = Boolean(candidate.querySelector('video, [data-video-id]'));
+    const isVideoPermalink = path.startsWith('/reel/') || path.includes('/videos/');
+    if (!includeNonVideo && !hasVideoElement && !isVideoPermalink) continue;
+
+    const key = postUrl.replace(/\/$/, '').toLowerCase();
+    if (seen.has(key)) continue;
+
+    const text = (candidate.textContent ?? '')
+      .normalize('NFKC')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (normalizedSubmittedText) {
+      const normalizedCandidateText = text.toLowerCase();
+      const minimumComparableLength = Math.min(40, Math.ceil(normalizedSubmittedText.length * 0.6));
+      const textMatches = normalizedCandidateText.includes(normalizedSubmittedText) ||
+        (normalizedCandidateText.length >= minimumComparableLength &&
+          normalizedSubmittedText.includes(normalizedCandidateText.slice(0, minimumComparableLength)));
+      if (!textMatches) continue;
+    }
+
+    seen.add(key);
+    results.push({ postUrl, text });
+  }
+
+  return results;
 }
 
 function findPublishedProfilePost({

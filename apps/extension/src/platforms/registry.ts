@@ -4,13 +4,14 @@
 import type { PlatformPublisherAdapter, PublishingPlatform } from '../platform-adapter.js';
 import { facebookAdapter } from './facebook/facebook-adapter.js';
 import { instagramAdapter } from './instagram/index.js';
+import { tiktokAdapter } from './tiktok/index.js';
 
 const adapters = new Map<PublishingPlatform, PlatformPublisherAdapter>();
 
 // Register built-in adapters
 adapters.set('FACEBOOK', facebookAdapter);
 adapters.set('INSTAGRAM', instagramAdapter);
-// TikTok will be registered when its adapter is implemented.
+adapters.set('TIKTOK', tiktokAdapter);
 
 export function getPlatformAdapter(platform: PublishingPlatform): PlatformPublisherAdapter | undefined {
   return adapters.get(platform);

@@ -18,6 +18,102 @@ import {
   PublishingJobStatus,
   PublishingTargetType,
 } from '../schemas/publishing-job.schema';
+import { PublishingPlatform } from '../schemas/publishing-platform';
+import { hashJobMediaAccessToken } from './job-media-delivery';
+import * as tikTokPolicy from './tiktok-publishing-policy';
+
+describe('JobsController.getJobMedia', () => {
+  const accessToken = 'a'.repeat(43);
+
+  function createMediaHarness(overrides: Record<string, unknown> = {}) {
+    const job = {
+      status: PublishingJobStatus.RUNNING,
+      claimedByExtensionInstanceId: 'extension-1',
+      claimExpiresAt: new Date(Date.now() + 60_000),
+      mediaAccessTokenHash: hashJobMediaAccessToken(accessToken),
+      mediaAccessExpiresAt: new Date(Date.now() + 60_000),
+      postId: { mediaUrls: ['data:video/mp4;base64,SGVsbG8='] },
+      ...overrides,
+    };
+    const query = {
+      select: jest.fn().mockReturnThis(),
+      populate: jest.fn().mockReturnThis(),
+      exec: jest.fn().mockResolvedValue(job),
+    };
+    const jobModel = { findById: jest.fn().mockReturnValue(query) };
+    const controller = new JobsController(
+      jobModel as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+    const response = {
+      setHeader: jest.fn(),
+      end: jest.fn(),
+    };
+    return { controller, jobModel, query, response };
+  }
+
+  it('streams bytes only for a valid token on an active job lease', async () => {
+    const { controller, query, response } = createMediaHarness();
+
+    await controller.getJobMedia(
+      'job-1',
+      '0',
+      `Bearer ${accessToken}`,
+      response as never,
+    );
+
+    expect(query.select).toHaveBeenCalledWith('+mediaAccessTokenHash');
+    expect(response.setHeader).toHaveBeenCalledWith(
+      'Cache-Control',
+      'private, no-store, max-age=0',
+    );
+    expect(response.setHeader).toHaveBeenCalledWith(
+      'Content-Type',
+      'video/mp4',
+    );
+    expect(response.end).toHaveBeenCalledWith(Buffer.from('Hello'));
+  });
+
+  it('rejects a token after cancellation or lease expiry', async () => {
+    const canceled = createMediaHarness({
+      status: PublishingJobStatus.CANCEL_REQUESTED,
+    });
+    await expect(
+      canceled.controller.getJobMedia(
+        'job-1',
+        '0',
+        `Bearer ${accessToken}`,
+        canceled.response as never,
+      ),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+
+    const expired = createMediaHarness({
+      claimExpiresAt: new Date(Date.now() - 1),
+    });
+    await expect(
+      expired.controller.getJobMedia(
+        'job-1',
+        '0',
+        `Bearer ${accessToken}`,
+        expired.response as never,
+      ),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+  });
+
+  it('rejects a bearer token issued for another job', async () => {
+    const { controller, response } = createMediaHarness();
+    await expect(
+      controller.getJobMedia(
+        'job-1',
+        '0',
+        `Bearer ${'b'.repeat(43)}`,
+        response as never,
+      ),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+  });
+});
 
 describe('JobsController.getNextJob', () => {
   const clerkUserId = 'clerk-user-1';
@@ -277,7 +373,9 @@ describe('JobsController.getNextJob', () => {
     });
   });
 
-  it('claims only jobs owned by the installation platform connections', async () => {
+  it.each(['false', 'true'])('claims only jobs owned by the installation platform connections (TikTok enabled=%s)', async (enabled) => {
+    const previousFlag = process.env.TIKTOK_EXTENSION_PUBLISHING_ENABLED;
+    process.env.TIKTOK_EXTENSION_PUBLISHING_ENABLED = enabled;
     const instagramConnectionId = { toString: () => 'instagram-connection-1' };
     const platformConnectionModel = {
       find: jest.fn(() => ({
@@ -326,6 +424,68 @@ describe('JobsController.getNextJob', () => {
         ]),
       }),
     );
+    expect(claimQuery.$and[1].$or.some((branch: { platform?: string }) => branch.platform === 'TIKTOK')).toBe(enabled === 'true');
+    expect(claimQuery.$and[2]).toEqual({ $or: [
+      { platform: { $ne: 'TIKTOK' }, targetType: { $nin: ['TIKTOK_VIDEO', 'TIKTOK_PHOTO'] } },
+      { submittedAt: { $exists: false }, submissionStatus: { $nin: ['UNKNOWN', 'PROCESSING', 'PUBLISHED'] } },
+    ] });
+    if (previousFlag === undefined) delete process.env.TIKTOK_EXTENSION_PUBLISHING_ENABLED;
+    else process.env.TIKTOK_EXTENSION_PUBLISHING_ENABLED = previousFlag;
+  });
+
+  it('keeps legacy Facebook jobs claimable beside an Instagram connection', async () => {
+    const instagramConnectionId = { toString: () => 'instagram-connection-1' };
+    const platformConnectionModel = {
+      find: jest.fn(() => ({
+        select: jest.fn().mockReturnThis(),
+        lean: jest.fn().mockReturnThis(),
+        exec: jest.fn().mockResolvedValue([
+          { _id: instagramConnectionId, platform: 'INSTAGRAM' },
+        ]),
+      })),
+    };
+    const postModel = {
+      find: jest.fn(() => queryChain([{ _id: postObjectId }])),
+    };
+    const jobModel = {
+      findOneAndUpdate: jest.fn(() => populatedJobChain(null)),
+    };
+    const legacyFacebookConnection = {
+      _id: connectionObjectId,
+      status: 'CONNECTED',
+      facebookSessionDetected: true,
+      facebookUserId: 'facebook-user-1',
+      detectedFacebookUserId: 'facebook-user-1',
+    };
+    const extensionsService = {
+      verifyWorkerIdentity: jest.fn().mockResolvedValue({
+        _id: { toString: () => 'installation-1' },
+        clerkUserId,
+        extensionInstanceId,
+        status: 'ACTIVE',
+      }),
+      assertInstallationActive: jest.fn(),
+      resolveActiveWorkerConnection: jest.fn().mockResolvedValue(
+        legacyFacebookConnection,
+      ),
+    };
+    const controller = new JobsController(
+      jobModel as never,
+      postModel as never,
+      { findOne: jest.fn() } as never,
+      extensionsService as never,
+      platformConnectionModel as never,
+    );
+
+    await controller.getNextJob(clerkUserId, extensionInstanceId);
+
+    const [claimQuery] = jobModel.findOneAndUpdate.mock.calls[0];
+    expect(claimQuery.$and[0]).toEqual({
+      $or: [
+        { platformConnectionId: { $in: [instagramConnectionId] } },
+        { facebookConnectionId: { $in: [connectionObjectId] } },
+      ],
+    });
   });
 
   it('does not claim a job for an unverified extension connection', async () => {
@@ -384,7 +544,7 @@ describe('JobsController target-specific sync guards', () => {
 
   function createProfileController(options?: {
     claimed?: boolean;
-    engagement?: { reactionCount?: number; commentCount?: number };
+    engagement?: { reactionCount?: number; commentCount?: number; favoriteCount?: number; shareCount?: number };
     claimExpiresAt?: Date;
   }) {
     const profileJob = {
@@ -510,6 +670,26 @@ describe('JobsController target-specific sync guards', () => {
     });
   });
 
+  it('persists TikTok favorite/share counts and preserves counters omitted by a partial result', async () => {
+    const previous = { reactionCount: 5, commentCount: 7, favoriteCount: 2, shareCount: 3 };
+    const { controller, profileJob } = createProfileController({ claimed: true, engagement: previous });
+
+    await controller.updateEngagement('clerk-user-1', extensionInstanceId, 'job-1', {
+      status: 'PARTIAL',
+      reactionCount: 9,
+      favoriteCount: 4,
+      reason: 'TikTok did not expose every engagement counter',
+      claimToken: 'claim-token',
+    });
+
+    expect((profileJob as { engagement?: unknown }).engagement).toMatchObject({
+      reactionCount: 9,
+      commentCount: 7,
+      favoriteCount: 4,
+      shareCount: 3,
+    });
+  });
+
   it('preserves all previous counters when an analytics check fails', async () => {
     const engagement = { reactionCount: 5, commentCount: 7 };
     const { controller, profileJob } = createProfileController({
@@ -582,6 +762,87 @@ describe('JobsController target-specific sync guards', () => {
         claimToken: 'claim-token',
       }),
     ).rejects.toThrow('Invalid or expired maintenance claim');
+  });
+});
+
+describe('JobsController platform connection ownership', () => {
+  const clerkUserId = 'clerk-user-1';
+  const extensionInstanceId = 'extension-1';
+  const jobConnectionId = { toString: () => 'instagram-connection-job' };
+  const installationId = { toString: () => 'installation-1' };
+
+  it('verifies the exact platform connection bound to the job', async () => {
+    const profileJob = {
+      _id: { toString: () => 'instagram-job-1' },
+      platform: PublishingPlatform.INSTAGRAM,
+      platformConnectionId: jobConnectionId,
+      postId: { clerkUserId },
+      submissionStatus: FacebookSubmissionStatus.PUBLISHED,
+      postUrl: 'https://www.instagram.com/p/DeOiAoDDRUC/',
+      maintenanceClaimedByExtensionInstanceId: extensionInstanceId,
+      maintenanceClaimType: MaintenanceClaimType.ENGAGEMENT,
+      maintenanceClaimToken: 'claim-token',
+      maintenanceClaimExpiresAt: new Date(Date.now() + 60_000),
+      save: jest.fn().mockResolvedValue(undefined),
+    };
+    const platformConnection = {
+      _id: jobConnectionId,
+      clerkUserId,
+      platform: PublishingPlatform.INSTAGRAM,
+      activeExtensionInstallationId: installationId,
+      status: 'CONNECTED',
+      sessionDetected: true,
+      externalUsername: 'ema.d1852',
+      detectedExternalUsername: 'ema.d1852',
+    };
+    const findOne = jest.fn((query: Record<string, unknown>) => ({
+      exec: jest.fn().mockResolvedValue(
+        query._id === jobConnectionId ? platformConnection : null,
+      ),
+    }));
+    const controller = new JobsController(
+      {
+        findById: jest.fn().mockReturnValue({
+          populate: jest.fn().mockReturnThis(),
+          exec: jest.fn().mockResolvedValue(profileJob),
+        }),
+      } as never,
+      {} as never,
+      {} as never,
+      {
+        verifyWorkerIdentity: jest.fn().mockResolvedValue({
+          _id: installationId,
+          clerkUserId,
+          extensionInstanceId,
+          status: 'ACTIVE',
+        }),
+        assertInstallationActive: jest.fn(),
+        // The old implementation used this platform-level lookup. Keep it
+        // deliberately different to prove the job-bound lookup is used.
+        resolveActivePlatformConnection: jest.fn().mockResolvedValue({
+          _id: { toString: () => 'stale-instagram-connection' },
+        }),
+      } as never,
+      { findOne } as never,
+    );
+
+    await expect(
+      controller.updateEngagement(clerkUserId, extensionInstanceId, 'instagram-job-1', {
+        status: 'SUCCESS',
+        reactionCount: 0,
+        commentCount: 0,
+        claimToken: 'claim-token',
+      }),
+    ).resolves.toBe(profileJob);
+
+    expect(findOne).toHaveBeenCalledWith({
+      _id: jobConnectionId,
+      clerkUserId,
+      platform: PublishingPlatform.INSTAGRAM,
+      activeExtensionInstallationId: installationId,
+      archivedAt: { $exists: false },
+    });
+    expect(profileJob.save).toHaveBeenCalled();
   });
 });
 
@@ -719,6 +980,65 @@ describe('JobsController maintenance claims', () => {
       maintenanceClaimType: MaintenanceClaimType.ENGAGEMENT,
     });
   });
+
+  it.each([
+    { manualOnly: undefined, excludeTikTok: undefined, includesTikTok: true },
+    { manualOnly: undefined, excludeTikTok: 'true', includesTikTok: false },
+    { manualOnly: 'true', excludeTikTok: 'true', includesTikTok: true },
+  ])(
+    'applies TikTok analytics rollout filtering (manualOnly=$manualOnly, excludeTikTok=$excludeTikTok)',
+    async ({ manualOnly, excludeTikTok, includesTikTok }) => {
+      const installationId = { toString: () => 'installation-1' };
+      const tiktokConnectionId = { toString: () => 'tiktok-connection-1' };
+      const platformConnectionModel = {
+        find: jest.fn(() => ({
+          select: jest.fn().mockReturnThis(),
+          lean: jest.fn().mockReturnThis(),
+          exec: jest.fn().mockResolvedValue([{
+            _id: tiktokConnectionId,
+            platform: PublishingPlatform.TIKTOK,
+          }]),
+        })),
+      };
+      const postModel = {
+        find: jest.fn(() => ({
+          select: jest.fn().mockReturnThis(),
+          lean: jest.fn().mockReturnThis(),
+          exec: jest.fn().mockResolvedValue([{ _id: postObjectId }]),
+        })),
+      };
+      const findOneAndUpdate = jest.fn().mockReturnValue(resultChain(null));
+      const controller = new JobsController(
+        { findOneAndUpdate } as never,
+        postModel as never,
+        { findOne: jest.fn().mockReturnValue(resultChain(null)) } as never,
+        {
+          verifyWorkerIdentity: jest.fn().mockResolvedValue({
+            _id: installationId,
+            clerkUserId,
+            extensionInstanceId,
+            status: 'ACTIVE',
+          }),
+          assertInstallationActive: jest.fn(),
+          resolveActiveWorkerConnection: jest.fn().mockResolvedValue(null),
+        } as never,
+        platformConnectionModel as never,
+      );
+
+      await controller.getEngagementPendingPosts(
+        clerkUserId,
+        extensionInstanceId,
+        '1',
+        manualOnly,
+        excludeTikTok,
+      );
+
+      const [claimFilter] = findOneAndUpdate.mock.calls[0];
+      expect(claimFilter.$or.some((branch: { platform?: string }) =>
+        branch.platform === PublishingPlatform.TIKTOK,
+      )).toBe(includesTikTok);
+    },
+  );
 });
 
 describe('JobsController concurrent maintenance lease recovery', () => {
@@ -1012,12 +1332,14 @@ describe('JobsController manual maintenance claims', () => {
 });
 
 describe('JobsController.updateJobStatus lifecycle gating', () => {
+  afterEach(() => jest.restoreAllMocks());
   const clerkUserId = 'clerk-user-1';
   const extensionInstanceId = 'extension-1';
   const connectionObjectId = { toString: () => 'connection-1' };
   const postObjectId = { toString: () => 'post-1' };
 
   function createStatusController(options?: {
+    platform?: PublishingPlatform;
     installationStatus?: string;
     claimedBy?: string;
     claimExpiresAt?: Date;
@@ -1027,6 +1349,7 @@ describe('JobsController.updateJobStatus lifecycle gating', () => {
   }) {
     const job = {
       _id: { toString: () => 'job-1' },
+      platform: options?.platform,
       postId: { clerkUserId, _id: postObjectId },
       facebookConnectionId: connectionObjectId,
       status: options?.previousStatus ?? PublishingJobStatus.RUNNING,
@@ -1117,6 +1440,48 @@ describe('JobsController.updateJobStatus lifecycle gating', () => {
       }),
     ).resolves.toBe(job);
     expect(job.save).toHaveBeenCalled();
+  });
+
+  it.each([PublishingJobStatus.RUNNING, PublishingJobStatus.PENDING])('blocks disabled TikTok status bypass: %s', async (status) => {
+    jest.spyOn(tikTokPolicy, 'isTikTokPublishingEnabled').mockReturnValue(false);
+    const { controller, job } = createStatusController({ platform: PublishingPlatform.TIKTOK });
+    await expect(controller.updateJobStatus(clerkUserId, extensionInstanceId, 'job-1', { status }))
+      .rejects.toThrow('TikTok publishing is disabled for new work');
+    expect(job.save).not.toHaveBeenCalled();
+  });
+
+  it('allows TikTok terminal reporting after rollback', async () => {
+    jest.spyOn(tikTokPolicy, 'isTikTokPublishingEnabled').mockReturnValue(false);
+    const { controller, job } = createStatusController({ platform: PublishingPlatform.TIKTOK });
+    await expect(controller.updateJobStatus(clerkUserId, extensionInstanceId, 'job-1', { status: PublishingJobStatus.SUCCESS })).resolves.toBe(job);
+    expect(job.save).toHaveBeenCalled();
+  });
+
+  it('persists TikTok processing as accepted, without marking it published', async () => {
+    const { controller, job } = createStatusController({ platform: PublishingPlatform.TIKTOK });
+    await controller.updateJobStatus(clerkUserId, extensionInstanceId, 'job-1', {
+      status: PublishingJobStatus.SUCCESS, submissionResult: { status: FacebookSubmissionStatus.PROCESSING, reason: 'Still processing on TikTok' },
+    });
+    expect(job).toMatchObject({ status: 'SUCCESS', submissionStatus: 'PROCESSING', submissionReason: 'Still processing on TikTok' });
+    expect(job).not.toHaveProperty('publishedDetectedAt');
+  });
+
+  it('cannot mark TikTok published using an unsupported permalink', async () => {
+    const { controller, job } = createStatusController({ platform: PublishingPlatform.TIKTOK });
+    await controller.updateJobStatus(clerkUserId, extensionInstanceId, 'job-1', {
+      status: PublishingJobStatus.SUCCESS, submissionResult: { status: FacebookSubmissionStatus.PUBLISHED, postUrl: 'https://www.facebook.com/groups/group/posts/123/' },
+    });
+    expect(job).toMatchObject({ submissionStatus: 'UNKNOWN' });
+    expect((job as any).postUrl).toBeUndefined();
+  });
+
+  it('keeps checkpointed TikTok jobs non-retryable after execution is re-enabled', async () => {
+    jest.spyOn(tikTokPolicy, 'isTikTokPublishingEnabled').mockReturnValue(true);
+    const { controller, job } = createStatusController({ platform: PublishingPlatform.TIKTOK });
+    (job as any).submittedAt = new Date();
+    await expect(controller.updateJobStatus(clerkUserId, extensionInstanceId, 'job-1', { status: PublishingJobStatus.PENDING }))
+      .rejects.toThrow('cannot be retried automatically');
+    expect(job.save).not.toHaveBeenCalled();
   });
 
   it('rejects a paused installation that holds no valid job lease', async () => {

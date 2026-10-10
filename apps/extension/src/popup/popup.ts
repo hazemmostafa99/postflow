@@ -4,6 +4,7 @@ import {
   type RecoveryCandidate,
 } from "../extension-recovery.js";
 import { initInstagramPopup } from "../platforms/instagram/popup.js";
+import { initTikTokPopup } from "../platforms/tiktok/popup.js";
 
 const statusElement = document.getElementById("status")!;
 const refreshButton = document.getElementById("refresh")!;
@@ -822,17 +823,26 @@ async function loadConnectionStatus() {
     Date.now() - result.webAppLastSeenAt < 90_000;
   setIndicator("web-app-dot", "web-app-status", webAppOnline ? "Connected" : "Offline", webAppOnline ? "online" : "offline");
 
-  const syncStatus = result.groupsSyncStatus as string | undefined;
-  if (syncStatus === "synced") {
-    setIndicator("sync-dot", "sync-status", `Synced (${result.groupsSyncCount ?? 0})`, "synced");
-  } else if (syncStatus === "syncing") {
-    setIndicator("sync-dot", "sync-status", "Syncing...", "not-synced");
-  } else if (syncStatus === "identity-required") {
-    setIndicator("sync-dot", "sync-status", "Login needed", "offline");
-  } else if (syncStatus === "error") {
-    setIndicator("sync-dot", "sync-status", "Sync failed", "offline");
-  } else {
-    setIndicator("sync-dot", "sync-status", "Not synced", "not-synced");
+  const facebookDetected = identityVerified && facebookStatus === "CONNECTED";
+  const facebookStatusText = facebookDetected
+    ? "Session detected"
+    : facebookStatus === "LOGIN_REQUIRED"
+      ? "Not detected"
+      : facebookStatus === "UNKNOWN"
+        ? "Checking..."
+        : facebookHealthLabel(facebookStatus).text;
+  const facebookIndicatorState = facebookDetected
+    ? "synced"
+    : ["BLOCKED", "CHECKPOINT_OR_VERIFICATION", "CAPTCHA_OR_CHALLENGE", "MANUAL_INTERVENTION_REQUIRED"].includes(facebookStatus)
+      ? "offline"
+      : "not-synced";
+  setIndicator("sync-dot", "sync-status", facebookStatusText, facebookIndicatorState);
+  const facebookDetailElement = document.getElementById("facebook-detail");
+  if (facebookDetailElement) {
+    const readableStatus = facebookStatus.replace(/_/g, " ");
+    facebookDetailElement.textContent = detectedFacebookUserId
+      ? `Account identity linked - ••••${detectedFacebookUserId.slice(-4)} · ${readableStatus}`
+      : `Open Facebook - ${readableStatus}`;
   }
 
   const lastSyncedAt = typeof result.groupsLastSyncedAt === "number"
@@ -1083,6 +1093,7 @@ loadConnectionStatus();
 loadExtensionName();
 loadPhoneCollectorState();
 initInstagramPopup();
+initTikTokPopup();
 
 refreshConnectionButton.addEventListener("click", async () => {
   refreshConnectionButton.disabled = true;

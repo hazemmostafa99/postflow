@@ -3,6 +3,10 @@ import {
   resolvePublishingTargetType,
 } from '../schemas/publishing-target';
 import { PublishingPlatform, resolvePublishingPlatform } from '../schemas/publishing-platform';
+import {
+  buildJobMediaReferences,
+  JobMediaReference,
+} from './job-media-delivery';
 
 type IdLike = {
   toString(): string;
@@ -54,17 +58,21 @@ export type PublishJobTarget =
   | {
       type: PublishingTargetType.INSTAGRAM_FEED;
       platformConnectionId: string;
+      instagramAccountId?: string;
+      /** Legacy jobs only; ID-backed jobs intentionally omit this field. */
       instagramUsername?: string;
       url: string;
     }
   | {
       type: PublishingTargetType.INSTAGRAM_REEL;
       platformConnectionId: string;
+      instagramAccountId?: string;
+      /** Legacy jobs only; ID-backed jobs intentionally omit this field. */
       instagramUsername?: string;
       url: string;
     }
   | {
-      type: PublishingTargetType.TIKTOK_VIDEO;
+      type: PublishingTargetType.TIKTOK_VIDEO | PublishingTargetType.TIKTOK_PHOTO;
       platformConnectionId: string;
       tiktokUsername?: string;
       url: string;
@@ -78,6 +86,7 @@ export type PublishJobPayload = {
   post: {
     content?: string;
     mediaUrls: string[];
+    media?: JobMediaReference[];
   };
   target: PublishJobTarget;
   postId: PopulatedPost;
@@ -93,6 +102,11 @@ export type PublishJobSource = {
   postId?: PopulatedPost;
   groupId?: unknown;
   facebookConnectionId?: IdLike | PopulatedFacebookConnection;
+  claimExpiresAt?: Date;
+};
+
+export type PublishJobPayloadOptions = {
+  mediaAccessToken?: string;
 };
 
 function isPopulatedPlatformConnection(
@@ -144,6 +158,7 @@ function getPlatformForTargetTypeLocal(targetType: PublishingTargetType): Publis
     case PublishingTargetType.INSTAGRAM_REEL:
       return PublishingPlatform.INSTAGRAM;
     case PublishingTargetType.TIKTOK_VIDEO:
+    case PublishingTargetType.TIKTOK_PHOTO:
       return PublishingPlatform.TIKTOK;
     default:
       return PublishingPlatform.FACEBOOK;
@@ -152,6 +167,7 @@ function getPlatformForTargetTypeLocal(targetType: PublishingTargetType): Publis
 
 export function toPublishJobPayload(
   job: PublishJobSource,
+  options: PublishJobPayloadOptions = {},
 ): PublishJobPayload | null {
   const id = job._id.toString();
   const targetType = resolvePublishingTargetType(job.targetType);
@@ -247,7 +263,8 @@ export function toPublishJobPayload(
       target: {
         type: PublishingTargetType.INSTAGRAM_FEED,
         platformConnectionId: pc._id.toString(),
-        instagramUsername: pc.externalUsername,
+        ...(pc.externalAccountId ? { instagramAccountId: pc.externalAccountId } : {}),
+        ...(!pc.externalAccountId && pc.externalUsername ? { instagramUsername: pc.externalUsername } : {}),
         url: pc.externalUsername
           ? getInstagramProfileUrl(pc.externalUsername)
           : 'https://www.instagram.com/',
@@ -275,7 +292,8 @@ export function toPublishJobPayload(
       target: {
         type: PublishingTargetType.INSTAGRAM_REEL,
         platformConnectionId: pc._id.toString(),
-        instagramUsername: pc.externalUsername,
+        ...(pc.externalAccountId ? { instagramAccountId: pc.externalAccountId } : {}),
+        ...(!pc.externalAccountId && pc.externalUsername ? { instagramUsername: pc.externalUsername } : {}),
         url: pc.externalUsername
           ? getInstagramProfileUrl(pc.externalUsername)
           : 'https://www.instagram.com/',
@@ -283,22 +301,40 @@ export function toPublishJobPayload(
     };
   }
 
-  if (targetType === PublishingTargetType.TIKTOK_VIDEO) {
+  if (targetType === PublishingTargetType.TIKTOK_VIDEO || targetType === PublishingTargetType.TIKTOK_PHOTO) {
     const pc = platformConnection;
-    if (!isPopulatedPlatformConnection(pc) || !pc.externalAccountId) {
+    if (
+      !isPopulatedPlatformConnection(pc) ||
+      (!pc.externalAccountId && !pc.externalUsername) ||
+      !options.mediaAccessToken ||
+      !job.claimExpiresAt
+    ) {
       return null;
     }
+
+    const media = buildJobMediaReferences(
+      id,
+      post.mediaUrls,
+      options.mediaAccessToken,
+      job.claimExpiresAt,
+    );
+    if (media.length !== post.mediaUrls.length) return null;
+    const deliveredPost = {
+      content: post.content,
+      mediaUrls: [],
+      media,
+    };
 
     return {
       id,
       _id: id,
       platform: PublishingPlatform.TIKTOK,
-      targetType: PublishingTargetType.TIKTOK_VIDEO,
-      post,
-      postId: post,
+      targetType,
+      post: deliveredPost,
+      postId: deliveredPost,
       platformConnectionId: pc._id.toString(),
       target: {
-        type: PublishingTargetType.TIKTOK_VIDEO,
+        type: targetType,
         platformConnectionId: pc._id.toString(),
         tiktokUsername: pc.externalUsername,
         url: pc.externalUsername

@@ -12,8 +12,11 @@ import {
   NotFoundException,
   BadRequestException,
   ForbiddenException,
+  ConflictException,
   Query,
+  Res,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import {
@@ -36,6 +39,7 @@ import {
   getEngagementQueueFilter,
   getPlatformEngagementQueueFilter,
   isInstagramEngagementPermalink,
+  isTikTokEngagementPermalink,
 } from './engagement-eligibility';
 import {
   FacebookConnection,
@@ -56,11 +60,19 @@ import {
 } from '../schemas/extension-installation.schema';
 import { ExtensionsService } from '../extensions/extensions.service';
 import { toPublishJobPayload } from './publish-job-payload';
+import {
+  createJobMediaAccessGrant,
+  decodeJobMediaDataUrl,
+  verifyJobMediaAccessToken,
+} from './job-media-delivery';
+import { isTikTokPublishingEnabled } from './tiktok-publishing-policy';
 
 type PostEngagementSyncResult = {
   status: 'SUCCESS' | 'PARTIAL' | 'CHECK_FAILED';
   reactionCount?: number;
   commentCount?: number;
+  favoriteCount?: number;
+  shareCount?: number;
   reason?: string;
   claimToken?: string;
 };
@@ -143,7 +155,7 @@ const platformPublishableTargetFilter = {
     },
     {
       platform: PublishingPlatform.TIKTOK,
-      targetType: { $in: [PublishingTargetType.TIKTOK_VIDEO] },
+      targetType: { $in: [PublishingTargetType.TIKTOK_VIDEO, PublishingTargetType.TIKTOK_PHOTO] },
     },
     {
       platform: { $exists: false },
@@ -199,9 +211,10 @@ function normalizeInstagramPostUrl(value?: string): string | undefined {
     const url = new URL(value);
     const host = url.hostname.toLowerCase();
     if (host !== 'instagram.com' && !host.endsWith('.instagram.com')) return undefined;
-    const match = url.pathname.match(/^\/(?:[^/]+\/)?(p|reel)\/([^/]+)\/?$/i);
+    const match = url.pathname.match(/^\/(?:[^/]+\/)?(p|reels?)\/([^/]+)\/?$/i);
     if (!match) return undefined;
-    return `https://www.instagram.com/${match[1].toLowerCase()}/${match[2]}/`;
+    const kind = match[1].toLowerCase() === 'p' ? 'p' : 'reel';
+    return `https://www.instagram.com/${kind}/${match[2]}/`;
   } catch {
     return undefined;
   }
@@ -211,6 +224,14 @@ function normalizeSubmissionPostUrl(
   platform: PublishingPlatform,
   value?: string,
 ): string | undefined {
+  if (platform === PublishingPlatform.TIKTOK) {
+    try {
+      const url = new URL(value ?? '');
+      const match = url.pathname.match(/^\/@([A-Za-z0-9._]{1,24})\/(video|photo)\/(\d+)\/?$/);
+      return url.protocol === 'https:' && !url.username && !url.password && ['tiktok.com', 'www.tiktok.com'].includes(url.hostname) && match
+        ? `https://www.tiktok.com/@${match[1]}/${match[2].toLowerCase()}/${match[3]}` : undefined;
+    } catch { return undefined; }
+  }
   return platform === PublishingPlatform.INSTAGRAM
     ? normalizeInstagramPostUrl(value)
     : normalizeFacebookGroupPostUrl(value);
@@ -234,6 +255,11 @@ function maskExtensionInstanceId(value?: string): string {
   if (normalized.length <= 8)
     return `${normalized.slice(0, 2)}…${normalized.slice(-2)}`;
   return `${normalized.slice(0, 4)}…${normalized.slice(-4)}`;
+}
+
+function parseBearerToken(value?: string): string | null {
+  const match = value?.match(/^Bearer ([A-Za-z0-9_-]{32,})$/);
+  return match?.[1] ?? null;
 }
 
 @Controller('api/jobs')
@@ -386,22 +412,40 @@ export class JobsController {
 
     // For new platform jobs (Instagram, TikTok, or migrated Facebook), use platformConnectionId
     if (platformConnectionId) {
-      const pc = await this.extensionsService.resolveActivePlatformConnection(
-        clerkUserId,
-        installation,
-        platform,
-        { allowPublishing: true },
-      );
-      if (!pc || String(pc._id) !== String(platformConnectionId)) {
+      // A job is bound to one concrete connection record. Do not resolve by
+      // platform here: an installation can have more than one active/recreated
+      // connection for the same platform, and a platform-level lookup may pick
+      // a different record than the one used when the job was claimed.
+      const pc = this.platformConnectionModel
+        ? await this.platformConnectionModel
+            .findOne({
+              _id: platformConnectionId,
+              clerkUserId,
+              platform,
+              activeExtensionInstallationId: installation._id,
+              archivedAt: { $exists: false },
+            })
+            .exec()
+        : null;
+      if (!pc) {
         return { platformConnection: null, facebookConnection: null };
       }
 
       // Verify platform connection status
-      const identityVerified = !pc.externalUsername || Boolean(
-        pc.detectedExternalUsername &&
-          pc.externalUsername.toLowerCase() ===
-            pc.detectedExternalUsername.toLowerCase(),
-      );
+      const identityVerified = platform === PublishingPlatform.INSTAGRAM
+        ? Boolean(
+            (pc.externalAccountId && pc.detectedExternalAccountId &&
+              pc.externalAccountId === pc.detectedExternalAccountId) ||
+            (!pc.externalAccountId && (!pc.externalUsername || Boolean(
+              pc.detectedExternalUsername &&
+                pc.externalUsername.toLowerCase() === pc.detectedExternalUsername.toLowerCase(),
+            )))
+          )
+        : !pc.externalUsername || Boolean(
+            pc.detectedExternalUsername &&
+              pc.externalUsername.toLowerCase() ===
+                pc.detectedExternalUsername.toLowerCase(),
+          );
       const verified = pc.status === PlatformConnectionStatus.CONNECTED &&
         pc.sessionDetected &&
         identityVerified;
@@ -450,6 +494,13 @@ export class JobsController {
       // is linked alongside them.
       const connection = resolved.facebookConnection ?? resolved.platformConnection;
       if (!connection) {
+        this.logger.warn('[TikTok] publishing ownership rejected', {
+          jobId: String(job._id ?? 'unknown'),
+          platformConnectionId: String(job.platformConnectionId),
+          platform: job.platform ?? PublishingPlatform.FACEBOOK,
+          extensionInstanceId: maskExtensionInstanceId(normalizedInstanceId),
+          reasonCode: 'INSTALLATION_NOT_LINKED_OR_IDENTITY_UNVERIFIED',
+        });
         throw new UnauthorizedException(
           'Extension instance is not linked to the verified platform connection for this job',
         );
@@ -635,6 +686,9 @@ export class JobsController {
     const instagramJob = job.platform === PublishingPlatform.INSTAGRAM ||
       job.targetType === PublishingTargetType.INSTAGRAM_FEED ||
       job.targetType === PublishingTargetType.INSTAGRAM_REEL;
+    const tiktokJob = job.platform === PublishingPlatform.TIKTOK ||
+      job.targetType === PublishingTargetType.TIKTOK_VIDEO ||
+      job.targetType === PublishingTargetType.TIKTOK_PHOTO;
     const eligibility =
       claimType === MaintenanceClaimType.PENDING_APPROVAL
         ? {
@@ -767,11 +821,37 @@ export class JobsController {
   }
 
   /** GET /api/jobs/next — fetch the next pending job for the extension */
+  @Post(':id/submission-intent')
+  async armTikTokSubmission(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Headers('x-extension-instance-id') extensionInstanceId: string,
+    @Headers('x-extension-credential') credential: string,
+    @Param('id') id: string,
+  ) {
+    if (!isTikTokPublishingEnabled()) throw new ForbiddenException('TikTok publishing is disabled');
+    const job = await this.jobModel.findById(id).populate('postId').exec();
+    if (!job) throw new NotFoundException('Job not found');
+    if ((job.postId as unknown as PostDocument).clerkUserId !== clerkUserId || job.platform !== PublishingPlatform.TIKTOK) {
+      throw new UnauthorizedException('Not an owned TikTok job');
+    }
+    await this.assertWorkerOwnsJob(clerkUserId, extensionInstanceId, credential, job);
+    const now = new Date();
+    // Atomic, single-use permission. Persist before Post, never after it.
+    const armed = await this.jobModel.findOneAndUpdate({
+      _id: job._id, platform: PublishingPlatform.TIKTOK, status: PublishingJobStatus.RUNNING,
+      claimedByExtensionInstanceId: extensionInstanceId, claimExpiresAt: { $gt: now },
+      submittedAt: { $exists: false }, submissionStatus: { $nin: ['UNKNOWN', 'PROCESSING', 'PUBLISHED'] },
+    } as any, { $set: { submittedAt: now, submissionStatus: FacebookSubmissionStatus.UNKNOWN,
+      submissionReason: 'Post submission armed; reconcile manually if the worker result is lost' } }, { new: true }).exec();
+    return { allowed: Boolean(armed) };
+  }
+
   @Get('next')
   async getNextJob(
     @Headers('x-clerk-user-id') clerkUserId: string,
     @Headers('x-extension-instance-id') extensionInstanceId?: string,
     @Headers('x-extension-credential') credential?: string,
+    @Query('manualRetry') manualRetry?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
@@ -779,6 +859,7 @@ export class JobsController {
     const normalizedInstanceId = this.requireExtensionInstanceId(
       extensionInstanceId,
     );
+    const manualRetryOnly = manualRetry === 'true';
 
     // Keep the legacy unit-test/consumer contract safe while the generic model
     // is rolled out. The application modules always provide this model; an
@@ -794,6 +875,7 @@ export class JobsController {
         clerkUserId,
         normalizedInstanceId,
         connection._id,
+        manualRetryOnly,
       );
     }
 
@@ -808,6 +890,7 @@ export class JobsController {
     // Find all platform connections owned by this installation
     const platformConnections = await this.platformConnectionModel
       .find({
+        clerkUserId,
         activeExtensionInstallationId: installation._id,
         archivedAt: { $exists: false },
         status: PlatformConnectionStatus.CONNECTED,
@@ -817,16 +900,26 @@ export class JobsController {
       .lean()
       .exec();
 
+    // A single installation can own a legacy Facebook connection and a newer
+    // Instagram platform connection. Resolve Facebook independently instead
+    // of deriving it only from platformConnections; otherwise adding
+    // Instagram makes legacy Facebook jobs invisible to the worker.
+    const legacyFacebookConnection = await this.getVerifiedWorkerConnection(
+      clerkUserId,
+      normalizedInstanceId,
+      credential,
+    );
+
     if (platformConnections.length === 0) {
-      // Check for legacy Facebook connection
-      const fbConnection = await this.extensionsService.resolveActiveWorkerConnection(
-        clerkUserId,
-        installation,
-      );
-      if (!fbConnection) return null;
+      if (!legacyFacebookConnection) return null;
 
       // Legacy path for backward compatibility
-      return this.claimLegacyFacebookJob(clerkUserId, normalizedInstanceId, fbConnection._id);
+      return this.claimLegacyFacebookJob(
+        clerkUserId,
+        normalizedInstanceId,
+        legacyFacebookConnection._id,
+        manualRetryOnly,
+      );
     }
 
     // Build platform connection IDs by platform
@@ -849,6 +942,7 @@ export class JobsController {
 
     const now = new Date();
     const leaseExpiresAt = new Date(now.getTime() + JobsController.JOB_CLAIM_LEASE_MS);
+    const mediaGrant = createJobMediaAccessGrant(leaseExpiresAt);
 
     // Build query for platform-aware jobs
     const platformConnectionIds = platformConnections.map((pc) => pc._id);
@@ -856,6 +950,14 @@ export class JobsController {
       .filter((pc) => pc.platform === PublishingPlatform.FACEBOOK)
       .map((pc) => pc.legacyFacebookConnectionId)
       .filter((id): id is Types.ObjectId => !!id);
+    if (
+      legacyFacebookConnection &&
+      !legacyFacebookConnectionIds.some(
+        (id) => String(id) === String(legacyFacebookConnection._id),
+      )
+    ) {
+      legacyFacebookConnectionIds.push(legacyFacebookConnection._id);
+    }
 
     const ownershipFilter = {
       $or: [
@@ -866,7 +968,12 @@ export class JobsController {
       ],
     };
 
-    const supportedTargetFilter = platformPublishableTargetFilter;
+    const supportedTargetFilter = {
+      $or: platformPublishableTargetFilter.$or.filter((branch) =>
+        branch.platform !== PublishingPlatform.TIKTOK ||
+        isTikTokPublishingEnabled(),
+      ),
+    };
 
     const job = (await this.jobModel
       .findOneAndUpdate(
@@ -875,6 +982,11 @@ export class JobsController {
           $and: [
             ownershipFilter,
             supportedTargetFilter,
+            { $or: [
+              { platform: { $ne: PublishingPlatform.TIKTOK }, targetType: { $nin: [PublishingTargetType.TIKTOK_VIDEO, PublishingTargetType.TIKTOK_PHOTO] } },
+              { submittedAt: { $exists: false }, submissionStatus: { $nin: ['UNKNOWN', 'PROCESSING', 'PUBLISHED'] } },
+            ] },
+            ...(manualRetryOnly ? [{ manualRetryRequestedAt: { $exists: true } }] : []),
             {
               $or: [
                 { scheduledFor: { $exists: false } },
@@ -900,8 +1012,11 @@ export class JobsController {
             status: PublishingJobStatus.RUNNING,
             claimedByExtensionInstanceId: normalizedInstanceId,
             claimExpiresAt: leaseExpiresAt,
+            mediaAccessTokenHash: mediaGrant.tokenHash,
+            mediaAccessExpiresAt: mediaGrant.expiresAt,
             startedAt: now,
           },
+          ...(manualRetryOnly ? { $unset: { manualRetryRequestedAt: 1 } } : {}),
         },
         {
           new: true,
@@ -922,7 +1037,18 @@ export class JobsController {
 
     if (!job) return null;
 
-    return toPublishJobPayload(job);
+    if (job.platform === PublishingPlatform.TIKTOK ||
+      job.targetType === PublishingTargetType.TIKTOK_VIDEO || job.targetType === PublishingTargetType.TIKTOK_PHOTO) {
+      this.logger.log('[TikTok] publishing job claimed', {
+        jobId: String(job._id),
+        platformConnectionId: job.platformConnectionId ? String(job.platformConnectionId) : null,
+        extensionInstanceId: maskExtensionInstanceId(normalizedInstanceId),
+      });
+    }
+
+    return toPublishJobPayload(job, {
+      mediaAccessToken: mediaGrant.accessToken,
+    });
   }
 
   /**
@@ -933,6 +1059,7 @@ export class JobsController {
     clerkUserId: string,
     normalizedInstanceId: string,
     facebookConnectionId: Types.ObjectId,
+    manualRetryOnly = false,
   ) {
     const posts = await this.postModel
       .find({ clerkUserId })
@@ -953,6 +1080,7 @@ export class JobsController {
           postId: { $in: postIds },
           $and: [
             publishableTargetFilter,
+            ...(manualRetryOnly ? [{ manualRetryRequestedAt: { $exists: true } }] : []),
             {
               $or: [
                 { scheduledFor: { $exists: false } },
@@ -980,6 +1108,7 @@ export class JobsController {
             claimExpiresAt: leaseExpiresAt,
             startedAt: now,
           },
+          ...(manualRetryOnly ? { $unset: { manualRetryRequestedAt: 1 } } : {}),
         },
         {
           new: true,
@@ -1169,6 +1298,7 @@ export class JobsController {
     @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Query('limit') limit?: string,
     @Query('manualOnly') manualOnly?: string,
+    @Query('excludeTikTok') excludeTikTok?: string,
     @Headers('x-extension-credential') credential?: string,
   ) {
     if (!clerkUserId)
@@ -1177,6 +1307,7 @@ export class JobsController {
       extensionInstanceId,
     );
     let connection: FacebookConnectionDocument | null = null;
+    let legacyFacebookConnection: FacebookConnectionDocument | null = null;
     type PlatformConnectionSummary = {
       _id: Types.ObjectId;
       platform: PublishingPlatform;
@@ -1192,21 +1323,25 @@ export class JobsController {
       this.extensionsService.assertInstallationActive(installation);
       installationPlatformConnections = await this.platformConnectionModel
         .find({
+          clerkUserId,
           activeExtensionInstallationId: installation._id,
           archivedAt: { $exists: false },
           status: PlatformConnectionStatus.CONNECTED,
           workerStatus: { $ne: PlatformConnectionWorkerStatus.PUBLISHING },
-          platform: { $in: [PublishingPlatform.FACEBOOK, PublishingPlatform.INSTAGRAM] },
+          platform: { $in: [PublishingPlatform.FACEBOOK, PublishingPlatform.INSTAGRAM, PublishingPlatform.TIKTOK] },
         })
         .select('_id platform legacyFacebookConnectionId')
         .lean()
         .exec() as PlatformConnectionSummary[];
+      // Keep legacy Facebook maintenance visible when this same installation
+      // also owns an Instagram platform connection.
+      legacyFacebookConnection = await this.getVerifiedWorkerConnection(
+        clerkUserId,
+        normalizedInstanceId,
+        credential,
+      );
       if (installationPlatformConnections.length === 0) {
-        connection = await this.getVerifiedWorkerConnection(
-          clerkUserId,
-          normalizedInstanceId,
-          credential,
-        );
+        connection = legacyFacebookConnection;
       }
     } else {
       connection = await this.getVerifiedWorkerConnection(
@@ -1214,6 +1349,7 @@ export class JobsController {
         normalizedInstanceId,
         credential,
       );
+      legacyFacebookConnection = connection;
     }
     if (!connection && installationPlatformConnections.length === 0) {
       this.logMaintenanceEvent(
@@ -1243,6 +1379,7 @@ export class JobsController {
     const manualOnlyRequested = manualOnly === 'true';
     const engagementQueueFilter = getEngagementQueueFilter(now);
     const instagramQueueFilter = getPlatformEngagementQueueFilter('INSTAGRAM', now);
+    const tiktokQueueFilter = getPlatformEngagementQueueFilter('TIKTOK', now);
     const platformConnectionIds = installationPlatformConnections.map((item) => item._id);
     const facebookPlatformConnectionIds = installationPlatformConnections
       .filter((item) => item.platform === PublishingPlatform.FACEBOOK)
@@ -1250,9 +1387,20 @@ export class JobsController {
     const instagramPlatformConnectionIds = installationPlatformConnections
       .filter((item) => item.platform === PublishingPlatform.INSTAGRAM)
       .map((item) => item._id);
+    const tiktokPlatformConnectionIds = installationPlatformConnections
+      .filter((item) => item.platform === PublishingPlatform.TIKTOK)
+      .map((item) => item._id);
     const legacyFacebookConnectionIds = installationPlatformConnections
       .filter((item) => item.platform === PublishingPlatform.FACEBOOK && item.legacyFacebookConnectionId)
       .map((item) => item.legacyFacebookConnectionId!);
+    if (
+      legacyFacebookConnection &&
+      !legacyFacebookConnectionIds.some(
+        (id) => String(id) === String(legacyFacebookConnection?._id),
+      )
+    ) {
+      legacyFacebookConnectionIds.push(legacyFacebookConnection._id);
+    }
     const usePlatformConnections = Boolean(
       this.platformConnectionModel && installationPlatformConnections.length > 0,
     );
@@ -1265,6 +1413,11 @@ export class JobsController {
             ...(instagramPlatformConnectionIds.length
               ? [{ platform: PublishingPlatform.INSTAGRAM, platformConnectionId: { $in: instagramPlatformConnectionIds }, postUrl: instagramQueueFilter.postUrl }]
               : []),
+            ...(!manualOnlyRequested && excludeTikTok === 'true'
+              ? []
+              : tiktokPlatformConnectionIds.length
+                ? [{ platform: PublishingPlatform.TIKTOK, platformConnectionId: { $in: tiktokPlatformConnectionIds }, postUrl: tiktokQueueFilter.postUrl }]
+                : []),
             ...(legacyFacebookConnectionIds.length
               ? [{ facebookConnectionId: { $in: legacyFacebookConnectionIds }, postUrl: engagementQueueFilter.postUrl }]
               : []),
@@ -1362,6 +1515,111 @@ export class JobsController {
   }
 
   /** POST /api/jobs/:id/maintenance-request — queue dashboard maintenance for the owning extension. */
+  /** POST /api/jobs/:id/retry - explicitly requeue a failed, never-submitted job. */
+  @Post(':id/retry')
+  @HttpCode(HttpStatus.OK)
+  async retryFailedJob(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('id') id: string,
+  ) {
+    if (!clerkUserId) {
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    }
+
+    const job = await this.jobModel.findById(id).populate('postId').exec();
+    if (!job) throw new NotFoundException('Job not found');
+    const post = job.postId as unknown as PostDocument;
+    if (post.clerkUserId !== clerkUserId) {
+      throw new UnauthorizedException('Not your job');
+    }
+    if (job.status !== PublishingJobStatus.FAILED) {
+      throw new BadRequestException('Only failed jobs can be retried manually');
+    }
+    if (job.submittedAt || job.postUrl || job.externalPublishId || job.externalPostId || job.submissionStatus) {
+      throw new ConflictException('This job may already have been submitted; reconcile it instead of retrying');
+    }
+    if ((job.platform === PublishingPlatform.TIKTOK ||
+      job.targetType === PublishingTargetType.TIKTOK_VIDEO ||
+      job.targetType === PublishingTargetType.TIKTOK_PHOTO) && !isTikTokPublishingEnabled()) {
+      throw new ForbiddenException('TikTok publishing is disabled for new work');
+    }
+
+    // A retry is a user action, so it does not require the extension to be
+    // online. It does require the account record to remain connected and
+    // identity-verified before the job is put back in the worker queue.
+    if (job.platformConnectionId && this.platformConnectionModel) {
+      const connection = await this.platformConnectionModel.findOne({
+        _id: job.platformConnectionId,
+        clerkUserId,
+        platform: job.platform ?? PublishingPlatform.FACEBOOK,
+        archivedAt: { $exists: false },
+      }).exec();
+      const identityVerified = connection?.platform === PublishingPlatform.TIKTOK
+        ? Boolean(connection.externalUsername && connection.detectedExternalUsername &&
+          connection.externalUsername.toLowerCase() === connection.detectedExternalUsername.toLowerCase())
+        : Boolean(connection?.externalAccountId && connection.detectedExternalAccountId &&
+          connection.externalAccountId === connection.detectedExternalAccountId) ||
+          Boolean(connection?.externalUsername && connection.detectedExternalUsername &&
+            connection.externalUsername.toLowerCase() === connection.detectedExternalUsername.toLowerCase());
+      if (!connection || connection.status !== PlatformConnectionStatus.CONNECTED ||
+        !connection.sessionDetected || !identityVerified) {
+        throw new BadRequestException('Reconnect and verify the publishing account before retrying');
+      }
+    }
+
+    // The status predicate makes two simultaneous clicks safe: only one can
+    // transition the failed record back to PENDING.
+    const requestedAt = new Date();
+    const retried = await this.jobModel.findOneAndUpdate(
+      {
+        _id: id,
+        status: PublishingJobStatus.FAILED,
+        submittedAt: { $exists: false },
+        postUrl: { $exists: false },
+        externalPublishId: { $exists: false },
+        externalPostId: { $exists: false },
+        submissionStatus: { $exists: false },
+      },
+      {
+        $set: { status: PublishingJobStatus.PENDING, manualRetryRequestedAt: requestedAt },
+        $unset: {
+          error: 1,
+          submissionReason: 1,
+          startedAt: 1,
+          completedAt: 1,
+          scheduledFor: 1,
+          claimedByExtensionInstanceId: 1,
+          claimExpiresAt: 1,
+          mediaAccessTokenHash: 1,
+          mediaAccessExpiresAt: 1,
+          submittedAt: 1,
+          postUrl: 1,
+          externalPublishId: 1,
+          externalPostId: 1,
+          submissionStatus: 1,
+        },
+      },
+      { new: true },
+    ).exec();
+    if (!retried) {
+      throw new ConflictException('The job changed before it could be retried');
+    }
+
+    await this.updateParentPostStatus(post);
+    this.logger.log('[Publishing] Manual retry queued', {
+      jobId: String(retried._id),
+      platform: retried.platform ?? PublishingPlatform.FACEBOOK,
+      targetType: retried.targetType,
+      clerkUserId,
+    });
+    return {
+      id: retried._id.toString(),
+      status: retried.status,
+      attempts: retried.attempts,
+      queuedAt: new Date().toISOString(),
+    };
+  }
+
   @Post(':id/maintenance-request')
   @HttpCode(HttpStatus.ACCEPTED)
   async requestMaintenance(
@@ -1387,6 +1645,9 @@ export class JobsController {
     const instagramJob = job.platform === PublishingPlatform.INSTAGRAM ||
       job.targetType === PublishingTargetType.INSTAGRAM_FEED ||
       job.targetType === PublishingTargetType.INSTAGRAM_REEL;
+    const tiktokJob = job.platform === PublishingPlatform.TIKTOK ||
+      job.targetType === PublishingTargetType.TIKTOK_VIDEO ||
+      job.targetType === PublishingTargetType.TIKTOK_PHOTO;
     if (!job.facebookConnectionId && !job.platformConnectionId) {
       throw new BadRequestException('Job is not assigned to a platform connection');
     }
@@ -1417,7 +1678,9 @@ export class JobsController {
         !job.postUrl ||
         (instagramJob
           ? !isInstagramEngagementPermalink(job.postUrl)
-          : !job.postUrl)
+          : tiktokJob
+            ? !isTikTokEngagementPermalink(job.postUrl)
+            : !job.postUrl)
       ) {
         throw new BadRequestException('Job is not a published post with a supported permalink');
       }
@@ -1460,6 +1723,134 @@ export class JobsController {
     );
   }
 
+  /** Downloads one attachment while the associated publishing lease is live. */
+  @Get(':id/media/:index')
+  async getJobMedia(
+    @Param('id') id: string,
+    @Param('index') indexValue: string,
+    @Headers('authorization') authorization: string | undefined,
+    @Res() response: Response,
+  ): Promise<void> {
+    const accessToken = parseBearerToken(authorization);
+    if (!accessToken) throw new UnauthorizedException('Media token required');
+
+    const job = await this.jobModel
+      .findById(id)
+      .select('+mediaAccessTokenHash')
+      .populate('postId', 'mediaUrls')
+      .exec();
+    if (!job) throw new NotFoundException('Job not found');
+    this.assertActiveMediaGrant(job, accessToken);
+
+    const index = Number(indexValue);
+    const post = job.postId as unknown as PostDocument;
+    const value = Number.isSafeInteger(index) && index >= 0
+      ? post.mediaUrls?.[index]
+      : undefined;
+    const media = typeof value === 'string'
+      ? decodeJobMediaDataUrl(value)
+      : null;
+    if (!media) throw new NotFoundException('Job media not found');
+
+    response.setHeader('Cache-Control', 'private, no-store, max-age=0');
+    response.setHeader('Content-Type', media.contentType);
+    response.setHeader('Content-Length', String(media.bytes.length));
+    response.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${media.fileName}"`,
+    );
+    response.setHeader('X-Content-Type-Options', 'nosniff');
+    response.end(media.bytes);
+  }
+
+  @Post(':id/tiktok-reconciliation')
+  @HttpCode(HttpStatus.OK)
+  async reconcileTikTokJob(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('id') id: string,
+    @Body() body: { status: 'PUBLISHED' | 'PROCESSING' | 'UNKNOWN'; postUrl?: string; reason?: string },
+  ) {
+    if (!clerkUserId) throw new UnauthorizedException('x-clerk-user-id header is required');
+    if (!['PUBLISHED', 'PROCESSING', 'UNKNOWN'].includes(body.status)) {
+      throw new BadRequestException('Invalid TikTok reconciliation status');
+    }
+    const job = await this.jobModel
+      .findById(id)
+      .populate('postId')
+      .populate('platformConnectionId', 'externalUsername')
+      .exec();
+    if (!job) throw new NotFoundException('Job not found');
+    const post = job.postId as unknown as PostDocument;
+    if (post.clerkUserId !== clerkUserId) throw new UnauthorizedException('Not your job');
+    if (job.platform !== PublishingPlatform.TIKTOK ||
+      ![PublishingTargetType.TIKTOK_VIDEO, PublishingTargetType.TIKTOK_PHOTO].includes(job.targetType)) {
+      throw new BadRequestException('TikTok reconciliation is only supported for TikTok publishing jobs');
+    }
+    if (job.status === PublishingJobStatus.PENDING || job.status === PublishingJobStatus.RUNNING || job.status === PublishingJobStatus.CANCEL_REQUESTED) {
+      throw new BadRequestException('TikTok job has not reached a reconcilable terminal state');
+    }
+    if (job.submissionStatus === FacebookSubmissionStatus.PUBLISHED && body.status !== 'PUBLISHED') {
+      throw new BadRequestException('Published TikTok jobs cannot be downgraded');
+    }
+
+    const connection = job.platformConnectionId as unknown as { externalUsername?: string };
+    const expectedUsername = connection?.externalUsername?.toLowerCase();
+    const normalizedUrl = normalizeSubmissionPostUrl(PublishingPlatform.TIKTOK, body.postUrl);
+    if (body.status === 'PUBLISHED') {
+      if (!normalizedUrl || !expectedUsername) throw new BadRequestException('A valid TikTok permalink is required');
+      if (job.submissionStatus === FacebookSubmissionStatus.PUBLISHED && job.postUrl && job.postUrl !== normalizedUrl) {
+        throw new BadRequestException('Published TikTok jobs cannot change their permalink');
+      }
+      const publishedUsername = new URL(normalizedUrl).pathname.match(/^\/@([^/]+)\//)?.[1]?.toLowerCase();
+      if (!publishedUsername || publishedUsername !== expectedUsername) throw new BadRequestException('TikTok permalink does not belong to the connected account');
+      const existing = await this.jobModel.findOne({
+        _id: { $ne: job._id }, platform: PublishingPlatform.TIKTOK,
+        platformConnectionId: job.platformConnectionId, postUrl: normalizedUrl,
+      }).select('_id').lean().exec();
+      if (existing) {
+        job.submissionStatus = FacebookSubmissionStatus.UNKNOWN;
+        job.submissionReason = 'The supplied TikTok permalink is already assigned to another job';
+        job.postUrl = undefined;
+      } else {
+        job.submissionStatus = FacebookSubmissionStatus.PUBLISHED;
+        job.submissionReason = undefined;
+        job.postUrl = normalizedUrl;
+        job.publishedDetectedAt ??= new Date();
+      }
+    } else {
+      job.submissionStatus = body.status as FacebookSubmissionStatus;
+      job.submissionReason = body.reason?.trim().slice(0, 500) || undefined;
+      job.postUrl = undefined;
+    }
+    job.lastCheckedAt = new Date();
+    await job.save();
+    return {
+      id: job._id.toString(), status: job.status,
+      submissionStatus: job.submissionStatus, postUrl: job.postUrl, submissionReason: job.submissionReason,
+    };
+  }
+
+  private assertActiveMediaGrant(
+    job: PublishingJobDocument,
+    accessToken: string,
+  ): void {
+    const now = Date.now();
+    const hasActiveClaim = Boolean(
+      job.status === PublishingJobStatus.RUNNING &&
+      job.claimedByExtensionInstanceId &&
+      job.claimExpiresAt &&
+      job.claimExpiresAt.getTime() > now,
+    );
+    const tokenIsActive = Boolean(
+      job.mediaAccessExpiresAt &&
+      job.mediaAccessExpiresAt.getTime() > now &&
+      verifyJobMediaAccessToken(accessToken, job.mediaAccessTokenHash),
+    );
+    if (!hasActiveClaim || !tokenIsActive) {
+      throw new ForbiddenException('Media access expired or invalid');
+    }
+  }
+
   @Get(':id')
   async getJob(
     @Headers('x-clerk-user-id') clerkUserId: string,
@@ -1485,6 +1876,7 @@ export class JobsController {
     return {
       id: job._id.toString(),
       status: job.status,
+      ...(job.submittedAt ? { submittedAt: job.submittedAt, submissionStatus: job.submissionStatus } : {}),
     };
   }
 
@@ -1502,6 +1894,15 @@ export class JobsController {
       throw new UnauthorizedException('x-clerk-user-id header is required');
     if (!['SUCCESS', 'PARTIAL', 'CHECK_FAILED'].includes(body.status)) {
       throw new BadRequestException('Invalid engagement sync result');
+    }
+    const counts = [
+      body.reactionCount,
+      body.commentCount,
+      body.favoriteCount,
+      body.shareCount,
+    ];
+    if (counts.some((count) => count !== undefined && (!Number.isSafeInteger(count) || count < 0))) {
+      throw new BadRequestException('Engagement counters must be non-negative integers');
     }
 
     const job = await this.jobModel.findById(id).populate('postId').exec();
@@ -1542,7 +1943,12 @@ export class JobsController {
         (job.engagement as
           | Partial<NonNullable<PublishingJobDocument['engagement']>>
           | undefined) ?? {};
-      if (body.reactionCount !== undefined || body.commentCount !== undefined) {
+      if (
+        body.reactionCount !== undefined ||
+        body.commentCount !== undefined ||
+        body.favoriteCount !== undefined ||
+        body.shareCount !== undefined
+      ) {
         job.engagement = {
           ...(previous.reactionCount !== undefined ||
           body.reactionCount !== undefined
@@ -1551,6 +1957,13 @@ export class JobsController {
           ...(previous.commentCount !== undefined ||
           body.commentCount !== undefined
             ? { commentCount: body.commentCount ?? previous.commentCount }
+            : {}),
+          ...(previous.favoriteCount !== undefined ||
+          body.favoriteCount !== undefined
+            ? { favoriteCount: body.favoriteCount ?? previous.favoriteCount }
+            : {}),
+          ...(previous.shareCount !== undefined || body.shareCount !== undefined
+            ? { shareCount: body.shareCount ?? previous.shareCount }
             : {}),
           lastSyncedAt: syncedAt,
         };
@@ -1853,6 +2266,19 @@ export class JobsController {
     }
 
     const previousStatus = job.status;
+    if (body.submissionResult?.status === FacebookSubmissionStatus.PROCESSING && job.platform !== PublishingPlatform.TIKTOK) {
+      throw new BadRequestException('Processing results are supported only for TikTok');
+    }
+    if (job.platform === PublishingPlatform.TIKTOK && job.submittedAt &&
+      (body.status === PublishingJobStatus.RUNNING || body.status === PublishingJobStatus.PENDING)) {
+      throw new ForbiddenException('Submitted TikTok jobs cannot be retried automatically');
+    }
+    if ((job.platform === PublishingPlatform.TIKTOK ||
+      job.targetType === PublishingTargetType.TIKTOK_VIDEO || job.targetType === PublishingTargetType.TIKTOK_PHOTO) &&
+      !isTikTokPublishingEnabled() &&
+      (body.status === PublishingJobStatus.RUNNING || body.status === PublishingJobStatus.PENDING)) {
+      throw new ForbiddenException('TikTok publishing is disabled for new work');
+    }
     if (
       body.status === PublishingJobStatus.CANCELED &&
       previousStatus !== PublishingJobStatus.CANCEL_REQUESTED
@@ -1894,6 +2320,8 @@ export class JobsController {
     ) {
       job.claimedByExtensionInstanceId = undefined;
       job.claimExpiresAt = undefined;
+      job.mediaAccessTokenHash = undefined;
+      job.mediaAccessExpiresAt = undefined;
     }
     if (
       workerConnectionId &&
@@ -1936,6 +2364,8 @@ export class JobsController {
         body.submissionResult.postUrl,
       );
       const effectiveSubmissionStatus =
+        job.platform === PublishingPlatform.TIKTOK && body.submissionResult.status === FacebookSubmissionStatus.PUBLISHED && !normalizedSubmissionPostUrl
+          ? FacebookSubmissionStatus.UNKNOWN :
         normalizedSubmissionPostUrl &&
         isPendingFacebookPostUrl(normalizedSubmissionPostUrl)
           ? FacebookSubmissionStatus.PENDING_APPROVAL
@@ -1948,9 +2378,9 @@ export class JobsController {
             FacebookSubmissionStatus.PENDING_APPROVAL)
       ) {
         const duplicateTargetFilter =
-          (job.platform ?? PublishingPlatform.FACEBOOK) === PublishingPlatform.INSTAGRAM
+          [PublishingPlatform.INSTAGRAM, PublishingPlatform.TIKTOK].includes(job.platform)
             ? {
-                platform: PublishingPlatform.INSTAGRAM,
+                platform: job.platform,
                 platformConnectionId: job.platformConnectionId,
                 targetType: job.targetType,
               }
@@ -1994,7 +2424,7 @@ export class JobsController {
       }
       job.submissionReason = duplicatePermalink
         ? `${job.platform ?? PublishingPlatform.FACEBOOK} returned a permalink already assigned to another job`
-        : effectiveSubmissionStatus === FacebookSubmissionStatus.UNKNOWN
+        : [FacebookSubmissionStatus.UNKNOWN, FacebookSubmissionStatus.PROCESSING].includes(effectiveSubmissionStatus)
           ? body.submissionResult.reason
           : undefined;
 

@@ -3,7 +3,9 @@ type InstagramIdentityApi = {
     sessionDetected: boolean;
     externalUsername?: string;
     source: string;
+    evidenceState: 'VERIFIED' | 'CHECKING' | 'LOGIN_REQUIRED';
   };
+  getProfileUrl?: () => string | undefined;
 };
 
 type InstagramContentComposerApi = {
@@ -47,19 +49,39 @@ console.info('[PostFlow][Instagram] Content script loaded', {
   engagementAvailable: Boolean(engagement),
 });
 
-let lastReportKey = '';
+let identityInterval: number | undefined;
+let extensionContextInvalidated = false;
+let lastIdentityReportKey: string | undefined;
+let lastIdentityReportAt = 0;
+const IDENTITY_REPORT_REFRESH_MS = 60_000;
+
+function stopIdentityReporting(error?: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  if (!/extension context invalidated|context invalidated/i.test(message)) return false;
+  extensionContextInvalidated = true;
+  if (identityInterval !== undefined) window.clearInterval(identityInterval);
+  return true;
+}
 
 function reportCurrentIdentity(): void {
+  if (extensionContextInvalidated) return;
   const detection = detector?.detect() ?? {
     sessionDetected: false,
     source: 'detector-unavailable',
+    evidenceState: 'CHECKING',
   };
-  const reportKey = `${detection.sessionDetected}:${detection.externalUsername ?? ''}:${location.pathname}`;
-  if (reportKey === lastReportKey) return;
-  lastReportKey = reportKey;
-
+  const reportKey = [
+    location.pathname,
+    detection.sessionDetected ? '1' : '0',
+    detection.evidenceState,
+    detection.source,
+    detection.externalUsername ?? '',
+  ].join('|');
+  const now = Date.now();
+  if (reportKey === lastIdentityReportKey && now - lastIdentityReportAt < IDENTITY_REPORT_REFRESH_MS) return;
+  lastIdentityReportKey = reportKey;
+  lastIdentityReportAt = now;
   console.log('[PostFlow] Instagram session detected:', detection.sessionDetected, {
-    externalUsername: detection.externalUsername,
     source: detection.source,
   });
 
@@ -67,28 +89,47 @@ function reportCurrentIdentity(): void {
     type: 'PLATFORM_SESSION_STATUS',
     platform: 'INSTAGRAM',
     sessionDetected: detection.sessionDetected,
+    // Sent only as a legacy fallback; the session manager drops it whenever
+    // the cookie-backed account id is available.
     ...(detection.externalUsername
       ? { externalUsername: detection.externalUsername }
       : {}),
   };
-  chrome.runtime.sendMessage(message, (response) => {
-    const runtimeError = chrome.runtime.lastError;
-    if (runtimeError) {
-      console.error('[PostFlow][Instagram] Could not reach session worker', {
-        message: runtimeError.message,
-      });
-      return;
-    }
-    console.info('[PostFlow][Instagram] Session worker acknowledged report', {
-      response,
+  try {
+    chrome.runtime.sendMessage(message, (response) => {
+      try {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          console.error('[PostFlow][Instagram] Could not reach session worker', {
+            message: runtimeError.message,
+          });
+          return;
+        }
+        console.info('[PostFlow][Instagram] Session worker acknowledged report', {
+          response,
+        });
+      } catch (error) {
+        if (!stopIdentityReporting(error)) console.error('[PostFlow][Instagram] Session report callback failed', error);
+      }
     });
-  });
+  } catch (error) {
+    if (!stopIdentityReporting(error)) console.error('[PostFlow][Instagram] Session report failed', error);
+  }
 }
 
+identityInterval = window.setInterval(reportCurrentIdentity, 15_000);
 reportCurrentIdentity();
-window.setInterval(reportCurrentIdentity, 3000);
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === 'INSTAGRAM_GET_SESSION_EVIDENCE') {
+    const evidence = detector?.detect();
+    sendResponse(evidence ? { ...evidence, url: location.href } : { evidenceState: 'CHECKING', source: 'detector-unavailable', url: location.href });
+    return;
+  }
+  if (message?.type === 'INSTAGRAM_GET_PROFILE_URL') {
+    sendResponse({ profileUrl: detector?.getProfileUrl?.() });
+    return;
+  }
   if (message?.type === 'CHECK_INSTAGRAM_POST_ENGAGEMENT') {
     if (!engagement || typeof message.postUrl !== 'string') {
       sendResponse({ ok: false, result: { status: 'CHECK_FAILED', reason: 'Instagram engagement extractor is unavailable' } });

@@ -1,10 +1,12 @@
 // ── Configuration ──
 
 import './posting-config.js';
+import { connectionIdentityUpdate } from './shared/connections/index.js';
 
 import {
   API_BASE_URL,
   AUTOMATIC_ANALYTICS_ENABLED,
+  TIKTOK_AUTOMATIC_ANALYTICS_ENABLED,
   BUILD_ENV,
 } from './env.js';
 import {
@@ -13,7 +15,8 @@ import {
   type ProfileFeedPublishTarget,
   type PublishJob,
 } from './publishing-target.js';
-import { registerInstagramSessionWorker } from './platforms/instagram/worker.js';
+import { refreshInstagramSession, registerInstagramSessionWorker } from './platforms/instagram/worker.js';
+import { refreshTikTokSession, registerTikTokSessionWorker, registerTikTokPublishingBridge } from './platforms/tiktok/index.js';
 import {
   checkPendingJobs as checkPlatformJobs,
   handlePlatformQueueResume,
@@ -482,6 +485,9 @@ export async function apiFetch(
 
 registerInstagramSessionWorker(apiFetch);
 console.info('[PostFlow][Instagram] Background bridge ready');
+registerTikTokSessionWorker(apiFetch);
+registerTikTokPublishingBridge(apiFetch);
+console.info('[PostFlow][TikTok] Background bridge ready');
 
 // Reads persisted review state and submits only selected, valid normalized numbers.
 async function syncPhoneNumbersToBackend(): Promise<PhoneSyncResponse> {
@@ -648,7 +654,7 @@ export async function updateJobStatus(
     status: string;
     error?: string;
     submissionResult?: {
-      status: 'PUBLISHED' | 'PENDING_APPROVAL' | 'UNKNOWN';
+      status: 'PUBLISHED' | 'PENDING_APPROVAL' | 'PROCESSING' | 'UNKNOWN';
       postUrl?: string;
       reason?: string;
     };
@@ -665,6 +671,15 @@ export async function updateJobStatus(
 // ── Registration ──
 
 let registrationPromise: Promise<boolean> | null = null;
+
+/**
+ * Publishing checks use this barrier so a service-worker wake-up cannot claim
+ * a job before registration has finished binding the current platform session.
+ */
+export async function waitForExtensionRegistration(): Promise<boolean> {
+  const pending = registrationPromise;
+  return pending ? pending : true;
+}
 
 function registerExtension(): Promise<boolean> {
   if (registrationPromise) return registrationPromise;
@@ -687,6 +702,8 @@ function registerExtension(): Promise<boolean> {
     );
     if (result) {
       await chrome.alarms.clear(REGISTER_RETRY_ALARM);
+      const connectionIdentity = connectionIdentityUpdate(result);
+      if (connectionIdentity) await chrome.storage.local.set(connectionIdentity);
       const registrationStatus = typeof result.status === 'string'
         ? result.status
         : 'ACTIVE';
@@ -730,6 +747,16 @@ function registerExtension(): Promise<boolean> {
       await chrome.storage.local.set({ extensionConnectionStage: 'verifying-facebook' });
       console.log('[PostFlow] Registered with backend:', registrationStatus);
       const facebookReady = await refreshFacebookSession();
+      // Instagram uses top-level document evidence instead of Facebook's
+      // c_user cookie, but it follows the same installation-bound startup
+      // refresh when an Instagram tab is already open in this profile.
+      void refreshInstagramSession().then((instagramReady) => {
+        console.info('[PostFlow][Instagram] Startup session refresh completed', { connected: instagramReady });
+      }).catch((error) => {
+        console.warn('[PostFlow][Instagram] Startup session refresh failed', error);
+      });
+      const tiktokReady = await refreshTikTokSession();
+      console.info('[PostFlow][TikTok] Startup session refresh completed', { connected: tiktokReady });
       await chrome.storage.local.set({
         extensionConnectionStage: facebookReady ? 'connected' : 'facebook-required',
       });
@@ -757,6 +784,8 @@ async function sendHeartbeat() {
     'POST',
   );
   if (result && typeof result.status === 'string') {
+    const connectionIdentity = connectionIdentityUpdate(result);
+    if (connectionIdentity) await chrome.storage.local.set(connectionIdentity);
     console.log(
       `[PostFlow] Heartbeat sent at ${new Date().toISOString()} | lifecycle: ${result.status}`,
     );
@@ -948,14 +977,28 @@ async function completeExtensionRecovery(options: {
   await persistExtensionLifecycleStatus('ACTIVE');
   await chrome.storage.local.set({ extensionConnectionStage: 'connected' });
   await refreshFacebookSession();
+  // Bind any already-open Instagram document to the newly created
+  // installation immediately; do not wait for the 15-second content heartbeat.
+  void refreshInstagramSession().then((connected) => {
+    console.info('[PostFlow][Instagram] New-connection session refresh completed', { connected });
+  });
   return { ok: true };
 }
 
 chrome.cookies.onChanged.addListener((changeInfo) => {
   const domain = changeInfo.cookie.domain.replace(/^\./, '').toLowerCase();
   const isFacebookDomain = domain === 'facebook.com' || domain.endsWith('.facebook.com');
-  if (changeInfo.cookie.name !== 'c_user' || !isFacebookDomain) return;
-  void refreshFacebookSession();
+  const isInstagramDomain = domain === 'instagram.com' || domain.endsWith('.instagram.com');
+  if (changeInfo.cookie.name === 'c_user' && isFacebookDomain) {
+    void refreshFacebookSession();
+    return;
+  }
+  if ((changeInfo.cookie.name === 'ds_user_id' || changeInfo.cookie.name === 'sessionid') && isInstagramDomain) {
+    // Re-evaluate the same open top-level document immediately when Instagram
+    // finishes login or switches accounts. The content heartbeat remains the
+    // fallback for pages that do not emit a cookie-change event.
+    void refreshInstagramSession();
+  }
 });
 
 type ExtensionWorkerStatus =
@@ -1304,6 +1347,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     );
   }
 
+  if (message.type === 'TRIGGER_ANALYTICS_SYNC') {
+    // The web dashboard has already created the authenticated maintenance
+    // request. Start only the engagement worker here; the periodic alarm stays
+    // as a recovery path if the dashboard bridge is unavailable.
+    void runMaintenanceCoordinator({
+      manualOnly: true,
+      pending: false,
+      analytics: true,
+      analyticsMode: 'MANUAL',
+    })
+      .then((results) => sendResponse({ ok: true, processed: results.length }))
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Analytics sync failed',
+      }));
+    return true;
+  }
+
   if (message.type === 'TRIGGER_GROUP_SYNC') {
     (async () => {
       try {
@@ -1429,11 +1490,49 @@ let publishQueuePaused: {
 } | null = null;
 let pendingCheckSequence = 0;
 let finishExecutionHandshake: (() => void) | null = () => {};
+interface FacebookExecutionCompletionGate {
+  promise: Promise<void>;
+  resolve: () => void;
+  timeoutId: ReturnType<typeof setTimeout>;
+}
+
+const facebookExecutionCompletionGates = new Map<string, FacebookExecutionCompletionGate>();
+
+function createFacebookExecutionCompletionGate(jobId: string): void {
+  if (facebookExecutionCompletionGates.has(jobId)) return;
+  let resolveGate!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    resolveGate = resolve;
+  });
+  const timeoutId = setTimeout(() => {
+    console.warn('[PostFlow] Profile-video reconciliation safety timeout reached', { jobId });
+    resolveFacebookExecutionCompletion(jobId);
+  }, 5 * 60_000);
+  facebookExecutionCompletionGates.set(jobId, {
+    promise,
+    resolve: resolveGate,
+    timeoutId,
+  });
+}
+
+function resolveFacebookExecutionCompletion(jobId: string): void {
+  const gate = facebookExecutionCompletionGates.get(jobId);
+  if (!gate) return;
+  clearTimeout(gate.timeoutId);
+  facebookExecutionCompletionGates.delete(jobId);
+  gate.resolve();
+}
+
+export function waitForFacebookExecutionSettled(jobId: string): Promise<void> {
+  return facebookExecutionCompletionGates.get(jobId)?.promise ?? Promise.resolve();
+}
+
 let activeExecution: {
   jobId: string;
   tabId: number;
   target: PublishJob['target'];
   post: PublishJob['post'];
+  profileVideoProfileBaselineUrls?: string[] | null;
   profileVideoNotificationBaselineKeys?: string[] | null;
 } | null = null;
 
@@ -1447,28 +1546,54 @@ export async function prepareFacebookExecution(
   job: PublishJob,
   tabId: number,
 ): Promise<string[] | null> {
-  const baseline =
-    job.target.type === 'PROFILE_FEED' && publishJobHasVideo(job.post)
-      ? await snapshotProcessedProfileVideoNotificationKeys(job.id)
-      : null;
+  const profileTarget = job.target.type === 'PROFILE_FEED' ? job.target : null;
+  const isProfileVideo = Boolean(profileTarget && publishJobHasVideo(job.post));
+  if (isProfileVideo) createFacebookExecutionCompletionGate(job.id);
+  const [profileBaseline, notificationBaseline] = isProfileVideo
+    ? await Promise.all([
+      snapshotProfileVideoPostUrls(tabId, job.id, profileTarget!.facebookUserId),
+      snapshotProcessedProfileVideoNotificationKeys(job.id),
+    ])
+    : [null, null] as const;
   activeExecution = {
     jobId: job.id,
     tabId,
     target: job.target,
     post: job.post,
-    profileVideoNotificationBaselineKeys: baseline,
+    profileVideoProfileBaselineUrls: profileBaseline,
+    profileVideoNotificationBaselineKeys: notificationBaseline,
   };
-  return baseline;
+  if (isProfileVideo) {
+    console.log('[PostFlow][Facebook] Profile-video baselines captured', {
+      jobId: job.id,
+      profilePostCount: profileBaseline?.length ?? null,
+      notificationIdentityCount: notificationBaseline?.length ?? null,
+    });
+  }
+  return notificationBaseline;
 }
 
-export function clearFacebookExecution(jobId: string): void {
+export function clearFacebookExecution(jobId: string, settleCompletion = false): void {
   if (activeExecution?.jobId === jobId) activeExecution = null;
+  if (settleCompletion) resolveFacebookExecutionCompletion(jobId);
+}
+
+export function getFacebookProfileVideoBaselineUrls(jobId: string): string[] | null {
+  if (activeExecution?.jobId !== jobId) return null;
+  return Array.isArray(activeExecution.profileVideoProfileBaselineUrls)
+    ? [...activeExecution.profileVideoProfileBaselineUrls]
+    : null;
 }
 
 interface ProcessedProfileVideoNotificationScanResult {
   key: string;
   notificationId?: string;
   postUrl: string;
+}
+
+interface ProfileVideoPostScanCandidate {
+  postUrl: string;
+  text?: string;
 }
 
 function publishJobHasVideo(post: PublishJob['post'] | undefined): boolean {
@@ -1684,6 +1809,197 @@ async function saveBackgroundPostingStep(
   await chrome.storage.local.set({ postingLogs: logs.slice(-500) });
 }
 
+function normalizeProfileVideoPostUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== 'https:' ||
+      !['facebook.com', 'www.facebook.com'].includes(url.hostname.toLowerCase())
+    ) return null;
+
+    const path = url.pathname.replace(/\/+$/, '');
+    if (/^\/reel\/[A-Za-z0-9_-]+$/i.test(path)) {
+      return `https://www.facebook.com${path}/`;
+    }
+    if (/^\/share\/v\/[A-Za-z0-9_-]+$/i.test(path)) {
+      return `https://www.facebook.com${path}/`;
+    }
+    if (/^\/[^/]+\/(?:posts|videos)\/[A-Za-z0-9_-]+$/i.test(path)) {
+      return `https://www.facebook.com${path}/`;
+    }
+    if (path.toLowerCase() === '/profile.php' || path.toLowerCase() === '/permalink.php') {
+      const id = url.searchParams.get('id');
+      const storyFbid = url.searchParams.get('story_fbid');
+      if (id && storyFbid) {
+        return `https://www.facebook.com${path}?id=${encodeURIComponent(id)}&story_fbid=${encodeURIComponent(storyFbid)}`;
+      }
+    }
+    if (path.toLowerCase() === '/watch') {
+      const videoId = url.searchParams.get('v');
+      if (videoId && /^[A-Za-z0-9_-]+$/.test(videoId)) {
+        return `https://www.facebook.com/watch/?v=${encodeURIComponent(videoId)}`;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function parseProfileVideoPostScan(
+  response: unknown,
+): { surfaceReady: boolean; candidates: ProfileVideoPostScanCandidate[] } | null {
+  if (typeof response !== 'object' || response === null) return null;
+  const value = response as Record<string, unknown>;
+  if (value.ok !== true || !Array.isArray(value.candidates)) return null;
+
+  const candidates: ProfileVideoPostScanCandidate[] = [];
+  const seen = new Set<string>();
+  for (const rawCandidate of value.candidates) {
+    if (typeof rawCandidate !== 'object' || rawCandidate === null) continue;
+    const candidate = rawCandidate as Record<string, unknown>;
+    if (typeof candidate.postUrl !== 'string') continue;
+    const postUrl = normalizeProfileVideoPostUrl(candidate.postUrl);
+    if (!postUrl) continue;
+    const key = postUrl.replace(/\/$/, '').toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    candidates.push({
+      postUrl,
+      ...(typeof candidate.text === 'string' ? { text: candidate.text } : {}),
+    });
+  }
+  return {
+    surfaceReady: value.surfaceReady === true,
+    candidates,
+  };
+}
+
+async function scanProfileVideoPosts(
+  tabId: number,
+  jobId: string,
+  expectedFacebookUserId: string,
+  submittedText = '',
+  includeNonVideo = false,
+): Promise<{ surfaceReady: boolean; candidates: ProfileVideoPostScanCandidate[] } | null> {
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, {
+      type: 'GET_PROFILE_VIDEO_POSTS',
+      jobId,
+      expectedFacebookUserId,
+      submittedText,
+      includeNonVideo,
+    });
+    return parseProfileVideoPostScan(response);
+  } catch {
+    return null;
+  }
+}
+
+async function snapshotProfileVideoPostUrls(
+  tabId: number,
+  jobId: string,
+  expectedFacebookUserId: string,
+): Promise<string[] | null> {
+  const startedAt = Date.now();
+  let surfaceReadyAt: number | null = null;
+  while (Date.now() - startedAt < POSTING_TIMING.facebookTabReadyTimeoutMs) {
+    const scan = await scanProfileVideoPosts(tabId, jobId, expectedFacebookUserId, '', true);
+    if (scan?.surfaceReady) {
+      surfaceReadyAt ??= Date.now();
+      // Allow the virtualized profile feed a short hydration window before
+      // freezing the baseline. This captures the visible top cards only; a
+      // newly published card will still be compared after a refresh.
+      if (Date.now() - surfaceReadyAt >= 3000) {
+        const urls = scan.candidates.map((candidate) => candidate.postUrl);
+        await saveBackgroundPostingStep(jobId, 'profile_video_profile_baseline_captured', {
+          profilePostCount: urls.length,
+        }).catch(() => undefined);
+        return urls;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, POSTING_TIMING.profileVideoProfilePollIntervalMs));
+  }
+
+  await saveBackgroundPostingStep(jobId, 'profile_video_profile_baseline_failed', {
+    reason: 'Facebook profile feed did not expose a ready DOM surface',
+  }).catch(() => undefined);
+  return null;
+}
+
+async function waitForNewProfileVideoPost(
+  jobId: string,
+  target: ProfileFeedPublishTarget,
+  baselineUrls: readonly string[],
+  submittedText: string,
+): Promise<ProfileVideoPostScanCandidate | null> {
+  let tabId: number | undefined;
+  try {
+    const profileUrl = getSafeFacebookProfileUrl(target) ?? target.url;
+    const tab = await chrome.tabs.create({ url: profileUrl, active: false });
+    tabId = tab.id;
+    if (
+      tabId === undefined ||
+      !(await waitForFacebookTabAfterNavigation(
+        tabId,
+        profileUrl,
+        POSTING_TIMING.facebookTabReadyTimeoutMs,
+      ))
+    ) return null;
+
+    const baseline = new Set(
+      baselineUrls.map((url) => url.replace(/\/$/, '').toLowerCase()),
+    );
+    const startedAt = Date.now();
+    let lastRefreshAt = startedAt;
+    while (Date.now() - startedAt < POSTING_TIMING.profileVideoProfileTimeoutMs) {
+      const scan = await scanProfileVideoPosts(
+        tabId,
+        jobId,
+        target.facebookUserId,
+        submittedText,
+      );
+      const found = scan?.candidates.find((candidate) =>
+        !baseline.has(candidate.postUrl.replace(/\/$/, '').toLowerCase()),
+      );
+      if (found) {
+        await saveBackgroundPostingStep(jobId, 'profile_video_profile_post_matched', {
+          postUrl: found.postUrl,
+        }).catch(() => undefined);
+        return found;
+      }
+
+      if (Date.now() - lastRefreshAt >= POSTING_TIMING.profileVideoProfileRefreshIntervalMs) {
+        await chrome.tabs.reload(tabId).catch(() => undefined);
+        await waitForFacebookTabAfterNavigation(
+          tabId,
+          profileUrl,
+          POSTING_TIMING.facebookTabReadyTimeoutMs,
+        );
+        lastRefreshAt = Date.now();
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, POSTING_TIMING.profileVideoProfilePollIntervalMs));
+      }
+    }
+
+    await saveBackgroundPostingStep(jobId, 'profile_video_profile_post_not_found', {
+      baselineProfilePostCount: baseline.size,
+    }).catch(() => undefined);
+    return null;
+  } catch (error) {
+    console.warn('[PostFlow] Profile-video profile-page reconciliation failed', {
+      jobId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    await saveBackgroundPostingStep(jobId, 'profile_video_profile_check_failed', {
+      reason: error instanceof Error ? error.message : String(error),
+    }).catch(() => undefined);
+    return null;
+  } finally {
+    if (tabId !== undefined) await chrome.tabs.remove(tabId).catch(() => undefined);
+  }
+}
+
 async function snapshotProcessedProfileVideoNotificationKeys(jobId: string): Promise<string[] | null> {
   let tabId: number | undefined;
   try {
@@ -1739,6 +2055,7 @@ async function snapshotProcessedProfileVideoNotificationKeys(jobId: string): Pro
 async function waitForNewProcessedProfileVideoNotification(
   jobId: string,
   baselineKeys: readonly string[],
+  timeoutMs = POSTING_TIMING.profileVideoNotificationTimeoutMs,
 ): Promise<ProcessedProfileVideoNotificationScanResult | null> {
   let tabId: number | undefined;
   try {
@@ -1756,7 +2073,7 @@ async function waitForNewProcessedProfileVideoNotification(
     const baseline = new Set(baselineKeys);
     const startedAt = Date.now();
     let lastRefreshAt = startedAt;
-    while (Date.now() - startedAt < POSTING_TIMING.profileVideoNotificationTimeoutMs) {
+    while (Date.now() - startedAt < timeoutMs) {
       const scan = await scanProcessedProfileVideoNotifications(tabId, jobId);
       const found = scan?.notifications.find((notification) =>
         !baseline.has(notification.key) && !baseline.has(`post:${notification.postUrl}`),
@@ -1839,58 +2156,92 @@ chrome.runtime.onMessage.addListener((message, sender) => {
       });
 
       const completedPostHasVideo = publishJobHasVideo(completedExecution?.post);
-      const shouldReconcileProfileVideoNotification = Boolean(
+      const shouldReconcileProfileVideoPost = Boolean(
         completedExecution?.target.type === 'PROFILE_FEED' &&
         completedPostHasVideo &&
-        message.submissionResult?.status === 'PUBLISHED' &&
+        (
+          message.submissionResult?.status === 'PUBLISHED' ||
+          message.submissionResult?.status === 'UNKNOWN'
+        ) &&
         !message.submissionResult.postUrl &&
-        Array.isArray(completedExecution.profileVideoNotificationBaselineKeys),
+        (
+          Array.isArray(completedExecution.profileVideoProfileBaselineUrls) ||
+          Array.isArray(completedExecution.profileVideoNotificationBaselineKeys)
+        ),
       );
 
       if (
-        shouldReconcileProfileVideoNotification &&
+        shouldReconcileProfileVideoPost &&
         completedExecution?.target.type === 'PROFILE_FEED' &&
-        Array.isArray(completedExecution.profileVideoNotificationBaselineKeys)
+        (
+          Array.isArray(completedExecution.profileVideoProfileBaselineUrls) ||
+          Array.isArray(completedExecution.profileVideoNotificationBaselineKeys)
+        )
       ) {
-        console.log('[PostFlow] Waiting for a new processed profile-video notification', {
+        console.log('[PostFlow] Reconciling the new Facebook profile video', {
           jobId: message.jobId,
-          baselineIdentityCount: completedExecution.profileVideoNotificationBaselineKeys.length,
+          profileBaselineCount: completedExecution.profileVideoProfileBaselineUrls?.length ?? null,
+          notificationBaselineCount: completedExecution.profileVideoNotificationBaselineKeys?.length ?? null,
         });
         const identityStillMatches = await verifyProfileTargetIdentity(completedExecution.target);
-        const notification = identityStillMatches
+        const reconciliationStartedAt = Date.now();
+        const submittedText = typeof completedExecution.post?.content === 'string'
+          ? completedExecution.post.content
+          : '';
+        const profilePost = identityStillMatches &&
+          Array.isArray(completedExecution.profileVideoProfileBaselineUrls)
+          ? await waitForNewProfileVideoPost(
+              message.jobId,
+              completedExecution.target,
+              completedExecution.profileVideoProfileBaselineUrls,
+              submittedText,
+            )
+          : null;
+        const remainingNotificationTimeoutMs = Math.max(
+          0,
+          POSTING_TIMING.profileVideoNotificationTimeoutMs -
+            (Date.now() - reconciliationStartedAt),
+        );
+        const notification = !profilePost && identityStillMatches &&
+          Array.isArray(completedExecution.profileVideoNotificationBaselineKeys)
           ? await waitForNewProcessedProfileVideoNotification(
               message.jobId,
               completedExecution.profileVideoNotificationBaselineKeys,
+              remainingNotificationTimeoutMs,
             )
           : null;
-        if (notification) {
+        const resolvedPostUrl = profilePost?.postUrl ?? notification?.postUrl ?? null;
+        if (resolvedPostUrl) {
           const updatedJob = await updateJobStatus(message.jobId, {
             status: 'SUCCESS',
             submissionResult: {
               status: 'PUBLISHED',
-              postUrl: notification.postUrl,
+              postUrl: resolvedPostUrl,
             },
           });
           if (updatedJob) {
             await saveBackgroundPostingStep(message.jobId, 'profile_video_post_url_saved', {
-              postUrl: notification.postUrl,
+              postUrl: resolvedPostUrl,
+              source: profilePost ? 'profile_feed' : 'processed_notification',
             }).catch(() => undefined);
             console.log('[PostFlow] Profile-video job enriched with its canonical reel URL', {
               jobId: message.jobId,
-              postUrl: notification.postUrl,
+              postUrl: resolvedPostUrl,
+              source: profilePost ? 'profile_feed' : 'processed_notification',
             });
           } else {
             await saveBackgroundPostingStep(message.jobId, 'profile_video_post_url_update_failed', {
-              postUrl: notification.postUrl,
+              postUrl: resolvedPostUrl,
             }).catch(() => undefined);
           }
         } else if (!identityStillMatches) {
-          await saveBackgroundPostingStep(message.jobId, 'profile_video_notification_check_skipped', {
+          await saveBackgroundPostingStep(message.jobId, 'profile_video_reconciliation_skipped', {
             reason: 'Facebook identity no longer matches the profile target',
           }).catch(() => undefined);
         }
       }
 
+      resolveFacebookExecutionCompletion(message.jobId);
       isProcessingJob = false;
       activeExecution = null;
 
@@ -1953,7 +2304,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
             Boolean(syncResult.postUrl)
           );
         const updated = shouldPersistAutomaticPostLinkCheck
-          ? await persistPendingSyncResult(syncPost, syncResult)
+          ? await persistAutomaticPostLinkResult(message.jobId, syncResult)
           : false;
         console.log('[PostFlow] Automatic post-link check finished', {
           jobId: message.jobId,
@@ -1974,7 +2325,16 @@ chrome.runtime.onMessage.addListener((message, sender) => {
       }
 
       checkPendingJobs();
-    })();
+    })().catch((error) => {
+      console.error('[PostFlow] Facebook job completion reconciliation failed', {
+        jobId: message.jobId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      resolveFacebookExecutionCompletion(message.jobId);
+      isProcessingJob = false;
+      activeExecution = null;
+      checkPendingJobs();
+    });
   }
   if (message.type === 'JOB_FAILED') {
     if (!isCurrentExecutionResult(message, sender)) return;
@@ -1998,6 +2358,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
         console.warn('[PostFlow] Publishing queue paused for manual attention', publishQueuePaused);
       }
       await updateJobStatus(message.jobId, { status: 'FAILED', error: message.error });
+      resolveFacebookExecutionCompletion(message.jobId);
       isProcessingJob = false;
       activeExecution = null;
       if (!publishQueuePaused) checkPendingJobs();
@@ -2009,6 +2370,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
       console.warn('[PostFlow] Job canceled before Facebook submit:', message.jobId);
       finishExecutionHandshake?.();
       await updateJobStatus(message.jobId, { status: 'CANCELED' });
+      resolveFacebookExecutionCompletion(message.jobId);
       isProcessingJob = false;
       activeExecution = null;
       checkPendingJobs();
@@ -2625,6 +2987,35 @@ async function persistPendingSyncResult(post: PendingFacebookPost, result: Pendi
   return Boolean(response);
 }
 
+/**
+ * Persist a post URL discovered immediately after publishing.
+ *
+ * This path is owned by the publishing job execution, not by the scheduled
+ * pending-approval maintenance worker, so it must use the normal job status
+ * endpoint instead of /pending-sync (which intentionally requires a
+ * maintenance claim token).
+ */
+async function persistAutomaticPostLinkResult(
+  jobId: string,
+  result: PendingPostSyncResult,
+): Promise<boolean> {
+  const submissionStatus = result.status === 'PUBLISHED'
+    ? 'PUBLISHED'
+    : result.status === 'STILL_PENDING'
+      ? 'PENDING_APPROVAL'
+      : null;
+  if (!submissionStatus) return false;
+
+  const response = await updateJobStatus(jobId, {
+    status: 'SUCCESS',
+    submissionResult: {
+      status: submissionStatus,
+      ...('postUrl' in result && result.postUrl ? { postUrl: result.postUrl } : {}),
+    },
+  });
+  return Boolean(response);
+}
+
 let isEngagementBatchRunning = false;
 let engagementCheckSequence = 0;
 let isCheckingEngagement = false;
@@ -2771,9 +3162,10 @@ function normalizeInstagramEngagementPermalink(value: string): string | null {
     const url = new URL(candidate);
     const hostname = url.hostname.toLowerCase();
     if (hostname !== 'instagram.com' && !hostname.endsWith('.instagram.com')) return null;
-    const match = url.pathname.match(/^(?:\/[^/]+)?\/(p|reel)\/([A-Za-z0-9_-]+)\/?$/i);
+    const match = url.pathname.match(/^(?:\/[^/]+)?\/(p|reels?)\/([A-Za-z0-9_-]+)\/?$/i);
     if (!match) return null;
-    return `https://www.instagram.com/${match[1].toLowerCase()}/${match[2]}/`;
+    const kind = match[1].toLowerCase() === 'p' ? 'p' : 'reel';
+    return `https://www.instagram.com/${kind}/${match[2]}/`;
   } catch {
     return null;
   }
@@ -2785,7 +3177,7 @@ async function waitForInstagramTabAfterNavigation(tabId: number, targetUrl: stri
   let targetIdentity = '';
   try {
     targetPath = new URL(targetUrl).pathname.replace(/\/+$/, '').toLowerCase();
-    targetIdentity = targetPath.match(/\/(?:p|reel)\/([a-z0-9_-]+)/i)?.[1] ?? '';
+    targetIdentity = targetPath.match(/\/(?:p|reels?)\/([a-z0-9_-]+)/i)?.[1] ?? '';
   } catch {
     return false;
   }
@@ -2793,7 +3185,7 @@ async function waitForInstagramTabAfterNavigation(tabId: number, targetUrl: stri
     try {
       const tab = await chrome.tabs.get(tabId);
       const currentPath = tab.url ? new URL(tab.url).pathname.replace(/\/+$/, '').toLowerCase() : '';
-      const currentIdentity = currentPath.match(/\/(?:p|reel)\/([a-z0-9_-]+)/i)?.[1] ?? '';
+      const currentIdentity = currentPath.match(/\/(?:p|reels?)\/([a-z0-9_-]+)/i)?.[1] ?? '';
       const landedOnTarget = currentPath === targetPath ||
         Boolean(targetIdentity && currentIdentity && targetIdentity === currentIdentity);
       if (tab.status === 'complete' && landedOnTarget && Date.now() - startedAt >= 1200) return true;
@@ -2805,6 +3197,14 @@ async function waitForInstagramTabAfterNavigation(tabId: number, targetUrl: stri
   return false;
 }
 
+// Instagram post-detail pages can stream the dialog and counters long after
+// the initial document reports complete. Keep these independent from the
+// shorter Facebook readiness window.
+const INSTAGRAM_ANALYTICS_TAB_READY_TIMEOUT_MS = 60_000;
+const INSTAGRAM_ANALYTICS_MESSAGE_TIMEOUT_MS = 60_000;
+const TIKTOK_ANALYTICS_TAB_READY_TIMEOUT_MS = 60_000;
+const TIKTOK_ANALYTICS_MESSAGE_TIMEOUT_MS = 30_000;
+
 async function checkSingleInstagramPostEngagement(
   post: PublishedPlatformPost,
 ): Promise<PostEngagementSyncResult> {
@@ -2815,16 +3215,27 @@ async function checkSingleInstagramPostEngagement(
     console.log('[PostAnalytics][Instagram] Opening published post', { postId: post.id, postUrl });
     const tab = await chrome.tabs.create({ url: postUrl, active: false });
     tabId = tab.id;
+    console.log('[PostAnalytics][Instagram] Waiting for post details tab', {
+      postId: post.id,
+      tabId,
+      tabReadyTimeoutMs: INSTAGRAM_ANALYTICS_TAB_READY_TIMEOUT_MS,
+      engagementTimeoutMs: INSTAGRAM_ANALYTICS_MESSAGE_TIMEOUT_MS,
+    });
     const ready = Boolean(tabId && await waitForInstagramTabAfterNavigation(
       tabId,
       postUrl,
-      POSTING_TIMING.facebookTabReadyTimeoutMs,
+      INSTAGRAM_ANALYTICS_TAB_READY_TIMEOUT_MS,
     ));
     if (!tabId || !ready) {
+      console.warn('[PostAnalytics][Instagram] Post details tab readiness timeout', {
+        postId: post.id,
+        tabId,
+        postUrl,
+      });
       return { status: 'CHECK_FAILED', reason: 'Target Instagram post did not finish loading' };
     }
     const startedAt = Date.now();
-    while (Date.now() - startedAt < POSTING_TIMING.facebookTabReadyTimeoutMs) {
+    while (Date.now() - startedAt < INSTAGRAM_ANALYTICS_MESSAGE_TIMEOUT_MS) {
       try {
         const response = await chrome.tabs.sendMessage(tabId, {
           type: 'CHECK_INSTAGRAM_POST_ENGAGEMENT',
@@ -2853,6 +3264,91 @@ async function checkSingleInstagramPostEngagement(
   }
 }
 
+function normalizeTikTokAnalyticsPermalink(value: string): string | null {
+  const markdownMatch = value.trim().match(/^\[[^\]]+\]\((https?:\/\/[^)]+)\)$/i);
+  const candidate = markdownMatch?.[1] ?? value.trim();
+  try {
+    const url = new URL(candidate);
+    if (!['www.tiktok.com', 'tiktok.com'].includes(url.hostname.toLowerCase())) return null;
+    const match = url.pathname.match(/^\/@([A-Za-z0-9._]{1,24})\/(video|photo)\/(\d+)\/?$/i);
+    if (!match || url.protocol !== 'https:' || url.username || url.password) return null;
+    return `https://www.tiktok.com/@${match[1]}/${match[2].toLowerCase()}/${match[3]}`;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForTikTokTabAfterNavigation(tabId: number, targetUrl: string, timeoutMs: number): Promise<boolean> {
+  const target = normalizeTikTokAnalyticsPermalink(targetUrl);
+  if (!target) return false;
+  const targetPath = new URL(target).pathname.toLowerCase();
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.url) {
+        const currentUrl = new URL(tab.url);
+        if (!['www.tiktok.com', 'tiktok.com'].includes(currentUrl.hostname.toLowerCase())) return false;
+        if (/^\/(?:login|signup)(?:\/|$)/i.test(currentUrl.pathname)) return false;
+        const currentPath = currentUrl.pathname.replace(/\/+$/, '').toLowerCase();
+        if (tab.status === 'complete' && currentPath === targetPath && Date.now() - startedAt >= 1_200) return true;
+      }
+    } catch {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return false;
+}
+
+async function checkSingleTikTokPostEngagement(
+  post: PublishedPlatformPost,
+): Promise<PostEngagementSyncResult> {
+  const postUrl = normalizeTikTokAnalyticsPermalink(post.postUrl);
+  if (!postUrl) return { status: 'CHECK_FAILED', reason: 'Stored TikTok post URL is invalid' };
+  let tabId: number | undefined;
+  try {
+    console.info('[PostAnalytics][TikTok] Opening published post', { postId: post.id, postUrl });
+    const tab = await chrome.tabs.create({ url: postUrl, active: false });
+    tabId = tab.id;
+    const ready = Boolean(tabId && await waitForTikTokTabAfterNavigation(
+      tabId,
+      postUrl,
+      TIKTOK_ANALYTICS_TAB_READY_TIMEOUT_MS,
+    ));
+    if (!tabId || !ready) {
+      return { status: 'CHECK_FAILED', reason: 'Target TikTok post did not finish loading' };
+    }
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < TIKTOK_ANALYTICS_MESSAGE_TIMEOUT_MS) {
+      try {
+        const response = await chrome.tabs.sendMessage(tabId, {
+          type: 'CHECK_TIKTOK_POST_ENGAGEMENT',
+          postUrl,
+        });
+        if (response?.ok && response.result) {
+          console.info('[PostAnalytics][TikTok] Engagement result received', {
+            postId: post.id,
+            status: response.result.status,
+          });
+          return response.result as PostEngagementSyncResult;
+        }
+      } catch {
+        // The content script can start after the navigation completes.
+      }
+      await new Promise((resolve) => setTimeout(resolve, POSTING_TIMING.facebookMessageRetryIntervalMs));
+    }
+    return { status: 'CHECK_FAILED', reason: 'Timed out waiting for TikTok engagement counters' };
+  } catch (error) {
+    return {
+      status: 'CHECK_FAILED',
+      reason: error instanceof Error ? error.message : 'TikTok engagement check failed',
+    };
+  } finally {
+    if (tabId !== undefined) await chrome.tabs.remove(tabId).catch(() => undefined);
+  }
+}
+
 async function syncPublishedEngagementBatch(
   manualOnly = false,
   maxItems = MAINTENANCE_BATCH_LIMIT,
@@ -2872,6 +3368,9 @@ async function syncPublishedEngagementBatch(
     const queryParams = new URLSearchParams({
       limit: String(Math.min(MAINTENANCE_BATCH_LIMIT, Math.max(1, maxItems))),
       ...(manualOnly ? { manualOnly: 'true' } : {}),
+      ...(mode === 'AUTOMATIC' && !TIKTOK_AUTOMATIC_ANALYTICS_ENABLED
+        ? { excludeTikTok: 'true' }
+        : {}),
     });
     const query = `/api/jobs/engagement-pending?${queryParams.toString()}`;
     const posts = await apiFetch(query);
@@ -2894,7 +3393,9 @@ async function syncPublishedEngagementBatch(
       );
       const result = post.platform === 'INSTAGRAM' || post.targetType === 'INSTAGRAM_FEED' || post.targetType === 'INSTAGRAM_REEL'
         ? await checkSingleInstagramPostEngagement(post)
-        : await checkSinglePostEngagement(post, true, mode);
+        : post.platform === 'TIKTOK' || post.targetType === 'TIKTOK_VIDEO' || post.targetType === 'TIKTOK_PHOTO'
+          ? await checkSingleTikTokPostEngagement(post)
+          : await checkSinglePostEngagement(post, true, mode);
       const updated = Boolean(await apiFetch(`/api/jobs/${post.id}/engagement`, {
         ...result,
         ...(post.claimToken ? { claimToken: post.claimToken } : {}),
@@ -2948,9 +3449,16 @@ async function hasVerifiedMaintenanceSession(): Promise<boolean> {
   const stored = await chrome.storage.local.get([
     'instagramSessionDetected',
     'instagramConnectionStatus',
+    'tiktokSessionDetected',
+    'tiktokConnectionStatus',
   ]);
-  return stored.instagramSessionDetected === true &&
-    stored.instagramConnectionStatus === 'CONNECTED';
+  return (
+    stored.instagramSessionDetected === true &&
+    stored.instagramConnectionStatus === 'CONNECTED'
+  ) || (
+    stored.tiktokSessionDetected === true &&
+    stored.tiktokConnectionStatus === 'CONNECTED'
+  );
 }
 
 /** Run maintenance in priority order with one navigation at a time. */
@@ -3128,6 +3636,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === HEARTBEAT_ALARM) {
     sendHeartbeat();
     void refreshFacebookSession();
+    void refreshInstagramSession().catch((error) => {
+      console.warn('[PostFlow][Instagram] Heartbeat session refresh failed', error);
+    });
     checkPendingJobs(); // Also check jobs on heartbeat
   }
   if (alarm.name === PENDING_POST_SYNC_ALARM) {

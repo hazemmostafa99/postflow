@@ -1,6 +1,7 @@
 import { PublishingTargetType } from '../schemas/publishing-target';
 import {
   isVerifiedInstagramConnection,
+  isVerifiedPlatformConnection,
   isVerifiedProfileConnection,
   normalizeCreatePostTargets,
 } from './create-post-targets';
@@ -46,6 +47,22 @@ describe('normalizeCreatePostTargets', () => {
     expect(normalizeCreatePostTargets(undefined, [groupId])).toEqual([
       { type: PublishingTargetType.GROUP, groupId },
     ]);
+  });
+
+  it('normalizes a TikTok target and rejects mixed Facebook fields', () => {
+    expect(normalizeCreatePostTargets([{ type: 'TIKTOK_VIDEO', platformConnectionId: connectionId }], undefined))
+      .toEqual([{ type: PublishingTargetType.TIKTOK_VIDEO, platformConnectionId: connectionId }]);
+    expect(normalizeCreatePostTargets([{ type: 'TIKTOK_PHOTO', platformConnectionId: connectionId }], undefined))
+      .toEqual([{ type: PublishingTargetType.TIKTOK_PHOTO, platformConnectionId: connectionId }]);
+    expect(() => normalizeCreatePostTargets([{ type: 'TIKTOK_VIDEO', platformConnectionId: connectionId, groupId }], undefined))
+      .toThrow('Platform targets must not include Facebook destinations');
+  });
+
+  it('verifies TikTok identity and rejects cross-platform or mismatched connections', () => {
+    const connection = { platform: 'TIKTOK', status: 'CONNECTED', sessionDetected: true, externalUsername: 'Creator', detectedExternalUsername: 'creator' };
+    expect(isVerifiedPlatformConnection(connection, 'TIKTOK')).toBe(true);
+    expect(isVerifiedPlatformConnection(connection, 'INSTAGRAM')).toBe(false);
+    expect(isVerifiedPlatformConnection({ ...connection, detectedExternalUsername: 'someone.else' }, 'TIKTOK')).toBe(false);
   });
 
   it('canonicalizes object IDs for stable ownership lookup', () => {

@@ -1,6 +1,6 @@
 type InstagramPopupState = {
   instagramSessionDetected?: boolean;
-  instagramDetectedUsername?: string | null;
+  instagramDetectedAccountId?: string | null;
   instagramConnectionStatus?: string | null;
 };
 
@@ -12,21 +12,20 @@ function renderInstagramState(state: InstagramPopupState): void {
 
   const detected = state.instagramSessionDetected === true;
   const connectionStatus = state.instagramConnectionStatus || 'UNKNOWN';
-  const username = typeof state.instagramDetectedUsername === 'string'
-    ? state.instagramDetectedUsername
-    : '';
+  const accountIdDetected = typeof state.instagramDetectedAccountId === 'string'
+    && state.instagramDetectedAccountId.length > 0;
   statusElement.textContent = detected ? 'Session detected' : 'Not detected';
   const readableStatus = connectionStatus.replace(/_/g, ' ');
-  detailElement.textContent = username
-    ? `@${username} · ${readableStatus}`
-    : `Open Instagram · ${readableStatus}`;
+  detailElement.textContent = accountIdDetected
+    ? `Account identity linked - ${readableStatus}`
+    : `Open Instagram - ${readableStatus}`;
   dotElement.className = `status-dot ${detected ? 'synced' : 'not-synced'}`;
 }
 
 export function initInstagramPopup(): void {
   const keys = [
     'instagramSessionDetected',
-    'instagramDetectedUsername',
+    'instagramDetectedAccountId',
     'instagramConnectionStatus',
   ];
   void chrome.storage.local.get(keys).then((state) => {

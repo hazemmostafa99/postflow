@@ -26,6 +26,10 @@ interface PostFlowPostingTimingConfig {
   profileVideoNotificationTimeoutMs: number;
   profileVideoNotificationPollIntervalMs: number;
   profileVideoNotificationRefreshIntervalMs: number;
+  profileVideoProfileTimeoutMs: number;
+  profileVideoProfilePollIntervalMs: number;
+  profileVideoProfileRefreshIntervalMs: number;
+  profileVideoAcceptedEvidenceGraceMs: number;
   publishPollIntervalMs: number;
   mediaButtonDelayMs: number;
   mediaInputTimeoutMs: number;
@@ -45,6 +49,7 @@ interface WorkerGlobalScope {
 interface InstagramIdentityDetector {
   detect: () => {
     sessionDetected: boolean;
+    externalAccountId?: string;
     externalUsername?: string;
     source: string;
   };

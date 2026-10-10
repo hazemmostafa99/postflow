@@ -35,10 +35,16 @@ import {
 } from './post-flow-time-spacing';
 import {
   CreatePostTarget,
-  isVerifiedInstagramConnection,
+  isVerifiedPlatformConnection,
   isVerifiedProfileConnection,
   normalizeCreatePostTargets,
 } from './create-post-targets';
+import {
+  getJobMediaDataUrlMetadata,
+  MAX_JOB_IMAGE_BYTES,
+  MAX_JOB_MEDIA_BYTES,
+} from './job-media-delivery';
+import { isTikTokPublishingEnabled } from './tiktok-publishing-policy';
 
 export class CreatePostDto {
   content!: string;
@@ -108,7 +114,8 @@ type ResolvedCreatePostTarget =
       order: number;
     }
   | {
-      type: PublishingTargetType.INSTAGRAM_FEED | PublishingTargetType.INSTAGRAM_REEL;
+      type: PublishingTargetType.INSTAGRAM_FEED | PublishingTargetType.INSTAGRAM_REEL |
+        PublishingTargetType.TIKTOK_VIDEO | PublishingTargetType.TIKTOK_PHOTO;
       connection: PlatformConnectionDocument;
       order: number;
     };
@@ -151,6 +158,11 @@ export class PostsService {
       );
     }
 
+    if (targets.some((target) => target.type === PublishingTargetType.TIKTOK_VIDEO ||
+      target.type === PublishingTargetType.TIKTOK_PHOTO) && !isTikTokPublishingEnabled()) {
+      throw new BadRequestException('TikTok publishing is not available yet');
+    }
+
     const startTime = dto.startTime ? new Date(dto.startTime) : undefined;
     if (dto.startTime && (!startTime || Number.isNaN(startTime.getTime()))) {
       throw new BadRequestException('Start time must be a valid date');
@@ -164,12 +176,14 @@ export class PostsService {
         ? [target.facebookConnectionId]
         : [],
     );
-    const platformConnectionIds = targets.flatMap((target) =>
+    const platformConnectionIds = [...new Set(targets.flatMap((target) =>
       target.type === PublishingTargetType.INSTAGRAM_FEED ||
-      target.type === PublishingTargetType.INSTAGRAM_REEL
+      target.type === PublishingTargetType.INSTAGRAM_REEL ||
+      target.type === PublishingTargetType.TIKTOK_VIDEO ||
+      target.type === PublishingTargetType.TIKTOK_PHOTO
         ? [target.platformConnectionId]
         : [],
-    );
+    ))];
     const [groups, connections, platformConnections] = await Promise.all([
       groupIds.length
         ? this.groupModel
@@ -196,7 +210,7 @@ export class PostsService {
                 $in: platformConnectionIds.map((id) => new Types.ObjectId(id)),
               },
               clerkUserId,
-              platform: PublishingPlatform.INSTAGRAM,
+              platform: { $in: [PublishingPlatform.INSTAGRAM, PublishingPlatform.TIKTOK] },
               archivedAt: { $exists: false },
             })
             .exec()
@@ -216,7 +230,7 @@ export class PostsService {
 
     if (platformConnections.length !== platformConnectionIds.length) {
       throw new BadRequestException(
-        'One or more selected Instagram connections are invalid for this user',
+        'One or more selected platform connections are invalid for this user',
       );
     }
 
@@ -254,12 +268,25 @@ export class PostsService {
         }
 
         const connection = platformConnectionsById.get(target.platformConnectionId)!;
-        if (!isVerifiedInstagramConnection(connection)) {
+        const platform = target.type === PublishingTargetType.TIKTOK_VIDEO ||
+          target.type === PublishingTargetType.TIKTOK_PHOTO ? 'TIKTOK' : 'INSTAGRAM';
+        if (!isVerifiedPlatformConnection(connection, platform)) {
           throw new BadRequestException(
-            'Instagram publishing requires a connected and verified Instagram session',
+            `${platform === 'TIKTOK' ? 'TikTok' : 'Instagram'} publishing requires a connected and verified session`,
           );
         }
-        this.validateInstagramMedia(target.type, mediaUrls);
+        if (target.type === PublishingTargetType.TIKTOK_VIDEO) {
+          if (mediaUrls.length !== 1 || !mediaUrls[0].startsWith('data:video/')) {
+            throw new BadRequestException('TikTok Video requires exactly one video, 25MB or smaller');
+          }
+        } else if (target.type === PublishingTargetType.TIKTOK_PHOTO) {
+          if (mediaUrls.length < 1 || mediaUrls.length > 4 ||
+            mediaUrls.some((url) => !url.startsWith('data:image/'))) {
+            throw new BadRequestException('TikTok Photo requires 1 to 4 images, 2MB or smaller each');
+          }
+        } else {
+          this.validateInstagramMedia(target.type, mediaUrls);
+        }
         return { type: target.type, connection, order };
       },
     );
@@ -304,7 +331,10 @@ export class PostsService {
           target.type === PublishingTargetType.GROUP ||
           target.type === PublishingTargetType.PROFILE_FEED
             ? PublishingPlatform.FACEBOOK
-            : PublishingPlatform.INSTAGRAM,
+            : target.type === PublishingTargetType.TIKTOK_VIDEO ||
+              target.type === PublishingTargetType.TIKTOK_PHOTO
+              ? PublishingPlatform.TIKTOK
+              : PublishingPlatform.INSTAGRAM,
         targetType: target.type,
         ...destination,
         status: PublishingJobStatus.PENDING,
@@ -405,17 +435,17 @@ export class PostsService {
     }
 
     return mediaUrls.map((url) => {
-      if (
-        typeof url !== 'string' ||
-        !/^data:(image|video)\/[a-zA-Z0-9.+-]+;base64,/.test(url)
-      ) {
+      const media = typeof url === 'string'
+        ? getJobMediaDataUrlMetadata(url)
+        : null;
+      if (!media) {
         throw new BadRequestException(
           'Only image and video attachments are supported',
         );
       }
-      const isVideo = url.startsWith('data:video/');
-      const maxEncodedLength = isVideo ? 34_000_000 : 3_000_000;
-      if (url.length > maxEncodedLength) {
+      const isVideo = media.contentType.startsWith('video/');
+      const maxBytes = isVideo ? MAX_JOB_MEDIA_BYTES : MAX_JOB_IMAGE_BYTES;
+      if (media.sizeBytes > maxBytes) {
         throw new BadRequestException(
           isVideo
             ? 'Videos must be 25MB or smaller'
@@ -438,19 +468,19 @@ export class PostsService {
     targetType: PublishingTargetType.INSTAGRAM_FEED | PublishingTargetType.INSTAGRAM_REEL,
     mediaUrls: string[],
   ): void {
-    if (mediaUrls.length !== 1) {
-      throw new BadRequestException(
-        targetType === PublishingTargetType.INSTAGRAM_FEED
-          ? 'Instagram Feed requires exactly one image'
-          : 'Instagram Reel requires exactly one video',
-      );
+    const imageCount = mediaUrls.filter((url) => url.startsWith('data:image/')).length;
+    const videoCount = mediaUrls.filter((url) => url.startsWith('data:video/')).length;
+    if (targetType === PublishingTargetType.INSTAGRAM_REEL) {
+      if (mediaUrls.length !== 1 || videoCount !== 1) {
+        throw new BadRequestException('Instagram Reel requires exactly one video');
+      }
+      return;
     }
-    const isVideo = mediaUrls[0].startsWith('data:video/');
-    if (targetType === PublishingTargetType.INSTAGRAM_FEED && isVideo) {
-      throw new BadRequestException('Instagram Feed requires an image');
+    if (videoCount > 0) {
+      throw new BadRequestException('Instagram Feed supports images only; use one video for a Reel');
     }
-    if (targetType === PublishingTargetType.INSTAGRAM_REEL && !isVideo) {
-      throw new BadRequestException('Instagram Reel requires a video');
+    if (imageCount < 1 || imageCount > 4 || imageCount !== mediaUrls.length) {
+      throw new BadRequestException('Instagram Feed requires one to four images');
     }
   }
 
@@ -657,6 +687,8 @@ export class PostsService {
               $unset: {
                 claimedByExtensionInstanceId: 1,
                 claimExpiresAt: 1,
+                mediaAccessTokenHash: 1,
+                mediaAccessExpiresAt: 1,
               },
             },
           )
@@ -664,7 +696,13 @@ export class PostsService {
         this.jobModel
           .updateMany(
             { postId: postRef, status: PublishingJobStatus.RUNNING },
-            { $set: { status: PublishingJobStatus.CANCEL_REQUESTED } },
+            {
+              $set: { status: PublishingJobStatus.CANCEL_REQUESTED },
+              $unset: {
+                mediaAccessTokenHash: 1,
+                mediaAccessExpiresAt: 1,
+              },
+            },
           )
           .exec(),
       ]);

@@ -8,11 +8,15 @@ type InstagramCaptionApi = {
   read: (post?: InstagramCaptionPost) => { text: string; source: 'content' | 'caption' | 'text' | 'none' };
   insert: (field: HTMLElement, content: string) => boolean;
   matches: (field: HTMLElement, expected: string) => boolean;
+  verified: (field: HTMLElement, expected: string) => boolean;
 };
+
+// A DOM value alone does not prove React/Lexical received an editing event.
+const instagramCaptionTransactions = new WeakMap<HTMLElement, string>();
 
 function normalizeCaptionText(value: string): string {
   return value
-    .replace(/[\u200B\uFEFF]/g, '')
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, '')
     .replace(/\u00A0/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -25,32 +29,58 @@ function captionMatches(field: HTMLElement, expected: string): boolean {
       : field.innerText || field.textContent || '',
   );
   const normalizedExpected = normalizeCaptionText(expected);
-  return actual === normalizedExpected || actual.includes(normalizedExpected);
+  // Require an exact normalized value. `includes` treats a duplicated caption
+  // (for example, "hellohello") as valid and hides a second insertion.
+  return actual === normalizedExpected;
 }
 
 function insertCaption(field: HTMLElement, content: string): boolean {
+  if (captionVerified(field, content)) return true;
+  instagramCaptionTransactions.delete(field);
+  field.focus();
+
   if (field instanceof HTMLTextAreaElement) {
-    field.value = content;
+    // React tracks assignments through the instance setter. Calling the
+    // browser's prototype setter lets the following input event reach onChange
+    // with a changed value instead of being discarded by React's tracker.
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+    if (!setter) return false;
+    setter.call(field, content);
+    field.dispatchEvent(new InputEvent('input', {
+      bubbles: true,
+      composed: true,
+      inputType: 'insertText',
+      data: content,
+    }));
   } else {
-    field.focus();
     const selection = window.getSelection?.();
     const range = document.createRange?.();
-    if (range) {
-      range.selectNodeContents(field);
-      selection?.removeAllRanges();
-      selection?.addRange(range);
+    if (!selection || !range || !document.execCommand) return false;
+    // Replace the entire selection, including any previous or duplicated
+    // caption, through the browser's editing transaction. Never mutate
+    // textContent/children: that can look correct while Lexical stays empty.
+    range.selectNodeContents(field);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    let receivedInput = false;
+    const onInput = () => { receivedInput = true; };
+    field.addEventListener('input', onInput);
+    let inserted = false;
+    try {
+      inserted = document.execCommand('insertText', false, content);
+    } finally {
+      field.removeEventListener('input', onInput);
     }
-    const inserted = document.execCommand?.('insertText', false, content) === true;
-    if (!inserted || !captionMatches(field, content)) {
-      field.textContent = '';
-      const paragraph = document.createElement('p');
-      paragraph.textContent = content;
-      field.appendChild(paragraph);
-    }
+    if (!inserted || !receivedInput) return false;
   }
-  field.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: content }));
-  field.dispatchEvent(new Event('change', { bubbles: true }));
-  return captionMatches(field, content);
+  if (!captionMatches(field, content)) return false;
+  instagramCaptionTransactions.set(field, normalizeCaptionText(content));
+  return true;
+}
+
+function captionVerified(field: HTMLElement, expected: string): boolean {
+  return instagramCaptionTransactions.get(field) === normalizeCaptionText(expected) &&
+    captionMatches(field, expected);
 }
 
 function readCaption(post?: InstagramCaptionPost): { text: string; source: 'content' | 'caption' | 'text' | 'none' } {
@@ -64,4 +94,5 @@ function readCaption(post?: InstagramCaptionPost): { text: string; source: 'cont
   read: readCaption,
   insert: insertCaption,
   matches: captionMatches,
+  verified: captionVerified,
 };

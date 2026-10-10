@@ -9,6 +9,7 @@ export enum PublishingTargetType {
   INSTAGRAM_FEED = 'INSTAGRAM_FEED',
   INSTAGRAM_REEL = 'INSTAGRAM_REEL',
   TIKTOK_VIDEO = 'TIKTOK_VIDEO',
+  TIKTOK_PHOTO = 'TIKTOK_PHOTO',
 }
 
 type PublishingTargetFields = {
@@ -42,6 +43,7 @@ export function getPublishingPlatformForTargetType(
     case PublishingTargetType.INSTAGRAM_REEL:
       return PublishingPlatform.INSTAGRAM;
     case PublishingTargetType.TIKTOK_VIDEO:
+    case PublishingTargetType.TIKTOK_PHOTO:
       return PublishingPlatform.TIKTOK;
   }
 }

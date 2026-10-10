@@ -11,6 +11,7 @@ Facebook Profile Feeds
 Instagram Feed
 Instagram Reels
 TikTok Video Posts
+TikTok Photo Posts
 ```
 
 Publishing to Instagram and TikTok must be performed by the browser extension
@@ -25,7 +26,7 @@ The implementation order is mandatory:
 2. Preserve and verify existing Facebook publishing
 3. Deliver an Instagram MVP
 4. Stabilize Instagram in real browser testing
-5. Deliver a TikTok MVP using the same platform adapter contract
+5. Deliver a TikTok video and photo MVP using the same platform adapter contract
 ```
 
 ---
@@ -112,8 +113,14 @@ TikTok publishing APIs. It does not mean removing the existing PostFlow API.
 ### Instagram MVP
 
 - detect and connect the currently authenticated Instagram account
-- publish a text caption with one image to Instagram Feed
+- publish a text caption with one image or a 2–4 image Feed carousel
 - publish one supported video as an Instagram Reel
+- provide one Instagram account selector in the dashboard; infer Photo,
+  Carousel, or Reel from the attached media and show the inferred type
+- preserve account selection when media changes; accept one image, 2–4 images,
+  or one video, and reject mixed media or multiple videos before job creation
+- keep explicit INSTAGRAM_FEED/INSTAGRAM_REEL jobs and backend validation;
+  share the existing stage-aware composer rather than duplicate flows
 - support immediate and scheduled jobs
 - verify the expected Instagram account before submission
 - report success, uncertain success, logout, account mismatch, platform
@@ -123,7 +130,7 @@ TikTok publishing APIs. It does not mean removing the existing PostFlow API.
 ### TikTok MVP
 
 - detect and connect the currently authenticated TikTok account
-- publish one supported video with a caption
+- publish one supported video or a photo post with 1 to 4 images and a caption
 - support immediate and scheduled jobs
 - verify the expected TikTok account before submission
 - preserve the current TikTok publishing options unless PostFlow explicitly
@@ -132,14 +139,48 @@ TikTok publishing APIs. It does not mean removing the existing PostFlow API.
   mismatch, platform interruption, and failure
 - save a stable post URL when it can be detected reliably
 
+### Published-post engagement sync
+
+Extend the existing published-post engagement maintenance flow to support
+TikTok Video and Photo posts when a stable permalink is available. The Chrome
+extension must use the authenticated TikTok session in the same Chrome Profile
+to open the specific post and read its visible action bar. It must not click or
+toggle any engagement control.
+
+Collect these visible counters when TikTok exposes them:
+
+```text
+like-count      -> engagement.reactionCount (displayed as likes for TikTok)
+comment-count   -> engagement.commentCount
+favorite-count  -> engagement.favoriteCount
+share-count     -> engagement.shareCount
+```
+
+Prefer TikTok's stable `data-e2e` attributes and semantic labels over generated
+CSS class names. Normalize supported compact counts such as `1.2K`; a button
+whose label is only `Share` has no confirmed share count and must remain
+unknown. Missing or unreadable values must not be stored as zero, and partial
+updates must preserve the last known value for every undetected counter.
+
+Use the existing engagement queue, scheduling, retry/backoff, single-flight
+locking, and manual refresh path. Process posts sequentially and isolate a
+failed TikTok post from the rest of the batch. Only successfully published
+posts with a valid TikTok permalink are eligible. Automatic TikTok analytics
+must have a platform-specific rollout control independent of TikTok publishing;
+manual refresh must use the same extractor and persistence path.
+
+This extends the current engagement record with optional favorite and share
+counts. The post details UI must label TikTok's `reactionCount` as likes and
+show favorites and shares when known; Facebook and Instagram labels retain
+their existing meaning.
+
 ---
 
 ## Non-Goals
 
 - Instagram or TikTok official publishing API integration
 - Instagram Stories in the first release
-- Instagram carousel posts in the first release
-- TikTok photo or slideshow posts in the first release
+- TikTok Stories in the first release
 - editing published posts
 - deleting posts from a platform
 - automatically adding music, filters, stickers, tags, locations, products,
@@ -150,7 +191,9 @@ TikTok publishing APIs. It does not mean removing the existing PostFlow API.
 - hiding automation, defeating platform detection, or bypassing platform
   limits
 - parallel publishing inside one extension installation in the first release
-- cross-platform engagement analytics in the first release
+- a separate analytics subsystem, historical engagement charts, comment
+  bodies/authors/replies, reaction-type breakdowns, or sentiment analysis;
+  platform counters use the existing engagement maintenance flow
 - replacing the existing Facebook pending-approval or engagement flows
 
 ---
@@ -178,6 +221,7 @@ enum PublishingTargetType {
   INSTAGRAM_FEED = "INSTAGRAM_FEED",
   INSTAGRAM_REEL = "INSTAGRAM_REEL",
   TIKTOK_VIDEO = "TIKTOK_VIDEO",
+  TIKTOK_PHOTO = "TIKTOK_PHOTO",
 }
 ```
 
@@ -295,6 +339,7 @@ apps/extension/src/
 │       ├── selectors.ts
 │       ├── composer.ts
 │       ├── result.ts
+│       ├── engagement.ts          # published-post counter extraction
 │       └── index.ts
 ├── maintenance/                  # non-publishing maintenance workers
 ├── phone-collector/               # isolated existing feature
@@ -511,11 +556,35 @@ platforms/instagram/
 └── worker.ts     # validated background-to-API session bridge
 ```
 
-The detector may use the canonical profile URL, Open Graph profile URL, or a
-visible profile link. A username is a fallback identity only; it must be
-normalized and never treated as a numeric account ID. The content script sends
-only `{ platform, sessionDetected, externalUsername }` through a typed runtime
-message. It must not receive PostFlow credentials or call the API directly.
+Session state and background coordination live in reusable `session-state.ts`
+and `session-manager.ts` modules; `worker.ts` remains a thin runtime bridge.
+The detector must identify the signed-in viewer, not a public profile or post
+owner. English/Arabic own-profile navigation is supported; canonical/Open
+Graph/pathname fallback requires a self-profile Edit profile control. A username
+is normalized and never treated as a numeric account ID.
+
+The content script emits an observation trigger and answers
+`INSTAGRAM_GET_SESSION_EVIDENCE` with sanitized current-document evidence.
+It must not receive PostFlow credentials or call the API directly. The background
+re-queries the sending top-level document by Chrome document ID, validates its
+current URL/navigation generation, and serializes all backend session writes.
+Closed, replaced, or navigated documents cannot authorize publishing.
+
+State distinguishes VERIFIED, CHECKING, LOGIN_REQUIRED, ACCOUNT_MISMATCH, and
+STALE. CHECKING is not negative authentication evidence and cannot erase a fresh
+verified session. Only an explicit login route establishes LOGIN_REQUIRED.
+Previously observed documents are revoked after logout/mismatch and must reload
+before restoring verification. Cached proof lasts at most 60 seconds; a single
+minute alarm expires persisted proof after worker restarts or when tabs close.
+Content observations refresh every 15 seconds. Backend evidence metadata is
+stored separately from existing connection/worker enums; STALE blocks claims
+using PENDING, not LOGIN_REQUIRED. Legacy Instagram false reports are treated as
+CHECKING, while Facebook/TikTok boolean behavior remains unchanged.
+
+Before Share, the publishing document itself must provide current matching
+evidence both before and after the asynchronous job-status check. A fresh cache
+from an unrelated analytics tab is never sufficient authorization. Failure to
+read/persist proof fails closed; uncertain authentication is not auto-login.
 
 The worker validates that the message originated from an Instagram tab, then
 reports it to `POST /api/extensions/platform-session`. The backend verifies
@@ -571,7 +640,8 @@ type CreatePostTarget =
   | { type: "PROFILE_FEED"; connectionId: string }
   | { type: "INSTAGRAM_FEED"; connectionId: string }
   | { type: "INSTAGRAM_REEL"; connectionId: string }
-  | { type: "TIKTOK_VIDEO"; connectionId: string };
+  | { type: "TIKTOK_VIDEO"; connectionId: string }
+  | { type: "TIKTOK_PHOTO"; connectionId: string };
 ```
 
 The backend derives `platform` from the validated target type and persisted
@@ -735,7 +805,7 @@ INSTAGRAM_REEL
 
 The first release supports:
 
-- one image
+- one image or a 2–4 image carousel (images only)
 - an optional caption
 - the existing schedule and cancellation flow
 
@@ -745,7 +815,7 @@ The adapter must:
 2. verify the active account
 3. open the create flow
 4. choose the correct Feed/Post surface
-5. attach the image and wait for a visible preview
+5. attach the image set and wait for every visible preview
 6. advance only through the expected composer steps
 7. insert and verify the caption
 8. re-check cancellation and account identity
@@ -783,11 +853,14 @@ can be established, report `UNKNOWN` and do not automatically publish again.
 
 ```text
 TIKTOK_VIDEO
+TIKTOK_PHOTO
 ```
 
 The first release supports:
 
 - one video
+- or 1 to 4 images in one photo post (the current PostFlow attachment limit)
+- mixed video/image selections are rejected
 - an optional caption
 - the platform's currently available default publishing options
 - immediate and scheduled PostFlow jobs
@@ -922,6 +995,9 @@ After the final publish action:
 - accepted, processing, unknown, and published states are non-retryable without
   an explicit recovery decision
 - retryable failures must prove that the final action was not accepted
+- an owner may manually requeue a failed, never-submitted job after the
+  platform account is freshly verified; the retry is claimed once by the
+  owning extension and does not override uncertain-submission safeguards
 - execution messages must include job and tab identity so a replacement
   document cannot execute a stale job
 
@@ -1019,7 +1095,9 @@ milestones.
 - paused or mismatched platform connections receive no jobs
 - platform interruption does not pause another platform connection
 - uncertain/processing submissions cannot be blindly reclaimed
-- existing Facebook pending and engagement queues remain Facebook-scoped
+- existing Facebook pending sync remains Facebook-scoped
+- engagement eligibility and extraction are platform-aware; a TikTok analytics
+  flag does not enable or disable TikTok publishing
 
 ### Extension orchestration
 
@@ -1049,12 +1127,26 @@ milestones.
 - rejects an account mismatch
 - finds the supported upload surface
 - attaches one video and detects upload progress
+- selects the Photos tab and attaches 1 to 4 images in one photo job
 - inserts caption without duplication
 - preserves controls that PostFlow does not manage
 - requires an enabled, expected Post control
 - distinguishes processing from published
 - detects success, interruption, and uncertain results
 - normalizes supported TikTok post URLs
+
+### TikTok engagement fixtures
+
+- matches the exact published TikTok post before reading counters
+- extracts likes, comments, favorites, and shares from the action bar's
+  `data-e2e` attributes and accessible labels
+- parses zero and compact counts such as `1.2K` without treating parse failure
+  as zero
+- returns partial results when a counter is absent, including Share controls
+  that expose no numeric count
+- preserves previously stored values for counters omitted from a partial result
+- verifies manual and automatic sync use the same extraction and persistence
+  path
 
 All DOM tests should use sanitized fixtures. Tests must not depend on live user
 cookies or credentials.
@@ -1076,11 +1168,13 @@ variant, locale, browser version, extension version, and result.
 
 1. Connect an Instagram account in the same Chrome Profile.
 2. Publish one image to Feed.
-3. Publish one supported video as a Reel.
-4. Validate Arabic and English UI where supported.
-5. Switch to another Instagram account and confirm safe mismatch handling.
-6. Test logout, interruption, cancellation, timeout, and extension restart.
-7. Confirm an uncertain result never creates a duplicate post.
+3. Publish a 2-image Feed carousel with one caption.
+4. Confirm mixed image/video and multiple-video selections are blocked.
+5. Publish one supported video as a Reel.
+6. Validate Arabic and English UI where supported.
+7. Switch to another Instagram account and confirm safe mismatch handling.
+8. Test logout, interruption, cancellation, timeout, and extension restart.
+9. Confirm an uncertain result never creates a duplicate post.
 
 ### TikTok MVP
 
@@ -1091,6 +1185,18 @@ variant, locale, browser version, extension version, and result.
 5. Test logout, interruption, cancellation, timeout, and extension restart.
 6. Confirm privacy and advanced controls are not changed unexpectedly.
 7. Confirm an accepted or uncertain upload is never blindly repeated.
+
+### TikTok engagement sync
+
+1. Sync a published video with zero likes and comments; store confirmed zeros.
+2. Sync a post with compact counters such as `1.2K` likes.
+3. Confirm favorites and shares are stored when numeric counts are present.
+4. Confirm a Share label without a count stays unknown and retains any previous
+   value.
+5. Refresh one TikTok post manually and confirm it uses the same result path as
+   scheduled sync.
+6. Confirm an unavailable or mismatched post records a sync error without
+   changing its published status or stopping later posts in the batch.
 
 Live platform publishing cannot be marked passed solely from automated tests.
 
@@ -1132,10 +1238,19 @@ Live platform publishing cannot be marked passed solely from automated tests.
 
 - add TikTok host permission and content script
 - implement session and identity detection
-- implement video upload, caption, processing, and result tracking
+- implement video and photo upload, caption, processing, and result tracking
 - enable only for internal test connections
 
-### Phase 6: Controlled rollout
+### Phase 6: TikTok engagement sync
+
+- add TikTok published-permalink eligibility to the existing engagement queue
+- extract like, comment, favorite, and numeric share counts from the exact post
+- persist optional counters with partial-update semantics
+- add TikTok labels and counters to the existing post details UI
+- reuse existing scheduling, retry/backoff, locking, and manual refresh
+- enable analytics independently for internal test connections
+
+### Phase 7: Controlled rollout
 
 - enable each platform independently
 - monitor failure and unknown-result rates
@@ -1162,6 +1277,10 @@ Disabling a platform must:
 - preserve connections, jobs, schedules, and history
 - leave other platforms operational
 
+Engagement sync has independent platform controls. Disabling TikTok engagement
+must stop TikTok analytics claims while leaving TikTok publishing and other
+platform engagement syncs available.
+
 Rollback must never delete jobs or convert an uncertain submission back to a
 retryable pending job.
 
@@ -1184,11 +1303,19 @@ retryable pending job.
 ### Instagram MVP
 
 - a user can connect and verify the active Instagram account
-- a user can select Instagram Feed or Reel in the create-post form
+- a user selects Instagram accounts once in the create-post form; one image
+  resolves to Feed and one video resolves to Reel automatically
+- the inferred type is visible before submission and account selection survives
+  media replacement/removal; invalid Instagram media cannot be submitted
 - the API creates a correctly owned and scheduled Instagram job
 - the extension publishes one image to Feed
 - the extension publishes one video as a Reel
 - account identity is rechecked before the final Share action
+- Instagram publishing controls, caption selection, and completed-share notices
+  support English and Arabic for both Feed images and Reels. A localized
+  success notice confirms publishing without requiring a URL in the dialog;
+  permalink recovery remains separate. Progress text and Done alone must not
+  count as success.
 - logout, mismatch, challenge, changed DOM, and cancellation fail safely
 - reliable post URLs are saved when available
 - uncertain submissions are not automatically retried
@@ -1197,14 +1324,32 @@ retryable pending job.
 
 - a user can connect and verify the active TikTok account
 - a user can select TikTok Video in the create-post form
+- a user can select a TikTok Photo post by attaching 1 to 4 images
 - the API creates a correctly owned and scheduled TikTok job
 - the extension fetches and attaches one video without repeatedly messaging a
   large Base64 payload
+- the extension switches to TikTok Studio's Photos tab and attaches all images
+  in one file-input change
 - the extension inserts the caption and preserves unmanaged settings
 - account identity is rechecked before the final Post action
 - upload, processing, published, failed, and unknown states are distinguished
 - logout, mismatch, challenge, changed DOM, and cancellation fail safely
 - accepted or uncertain uploads are not automatically retried
+
+### Published-post engagement sync
+
+- only successfully published posts with a supported platform permalink enter
+  the engagement queue
+- TikTok likes, comments, favorites, and numeric shares are extracted from the
+  exact post's visible action bar without triggering an interaction
+- unrecognized values remain unknown; confirmed zero remains distinct from a
+  missing counter
+- partial updates preserve all previously known counters that were not read
+- manual refresh and scheduled sync share the same TikTok extraction and update
+  path
+- the post details UI labels TikTok reactions as likes and shows known favorite
+  and share counts
+- TikTok engagement scheduling can be disabled independently of publishing
 
 ---
 
@@ -1216,7 +1361,9 @@ This feature is complete when:
 - Facebook remains fully operational through the adapter-based architecture
 - Instagram Feed image and Reel video publishing pass automated and recorded
   live validation
-- TikTok video publishing passes automated and recorded live validation
+- TikTok video and photo publishing passes automated and recorded live validation
+- TikTok published-post engagement sync stores available counters and passes
+  automated and recorded live validation
 - all platforms verify account identity before submission
 - media transport is safe for the supported TikTok video size
 - platform failures are isolated and observable
@@ -1227,6 +1374,70 @@ This feature is complete when:
 ---
 
 ## Required Implementation Process
+
+### Instagram engagement localization follow-up
+
+Existing Instagram engagement extraction must recognize English and Arabic
+Like/Unlike/Comment labels and normalize Arabic-Indic/Persian digits and Arabic
+numeric separators. Photo counters adjacent to the action wrapper and Reel
+counters inside or next to their own buttons use the same bounded extractor.
+Never cross another action icon or read virtualized neighboring Reel counters.
+Retain the existing loaded-control zero policy; an unknown photo comment count
+remains unknown rather than being inferred from the Like count. Cover both
+languages and supplied DOM structures with regression fixtures. This change
+must not alter publishing, session evidence, scheduling, or Facebook maintenance.
+
+### Extension = Connection (clarified and approved 2026-10-09)
+
+The registered ExtensionInstallation IS the product Connection, not a child of
+another Connection or Chrome Profile entity. Do not introduce a separate root
+collection, registry, or automatic initialization/migration on page load. Store the
+shared display name there, with a read fallback to the existing Facebook label;
+preserve legacy Facebook names for recovery compatibility. Group platform records
+only by explicit installation binding, never by matching names or usernames.
+Retain the original Connections UI: Active/Archived tabs, summary metrics,
+search/filter, expandable rows, diagnostics, and action dialogs. Show Facebook,
+Instagram, and TikTok inside each connection's expanded details, including
+not-detected slots; do not replace this screen with a separate card dashboard.
+Actual account identifiers remain distinct per platform.
+Active lists only current non-archived, non-revoked installations; disconnected
+historical or unbound legacy records must not inflate its counts. Current paused,
+offline, or gracefully disconnecting connections remain visible for management.
+Connections without Facebook must support naming, pause/resume, graceful and
+forced disconnect, and Remove/Archive. Force disconnect immediately revokes the
+installation credential across platforms; Remove also archives the installation
+without deleting/rebinding accounts or jobs. These actions must be owner-scoped,
+race-guarded and audited, independent of a Facebook record. Archived installation
+records appear in Archived, not Active. Do not imply generic account recovery is
+implemented: retain existing explicit Facebook recovery; generic reinstall
+recovery remains gated until a verified account/credential handshake exists.
+Lifecycle controls apply to the whole installation; account health remains
+independent. Keep credentials private and dashboard mutations owner-scoped.
+Do not retarget jobs, rebind accounts, migrate data destructively, enable TikTok
+publishing, or change session verification merely to group the UI. Preserve the
+legacy Facebook record IDs and recovery behavior as compatibility data, not a
+second visible product connection. Keep Facebook recovery inside the relevant
+connection card, with disconnected cards accessible; generic multi-platform
+reinstall recovery is deferred until implemented and validated. Stale heartbeat
+names must not undo a dashboard rename. New platforms must use the explicit
+installation binding and the same reusable grouping/identity helpers.
+
+### Installation-bound Instagram session parity
+
+Instagram uses the same ExtensionInstallation ownership boundary as Facebook:
+the first verified account observed in that installation is auto-connected under
+the installation, and every later publish/analytics request is scoped to that
+binding. Before an Instagram publish, the extension must re-read fresh identity
+evidence from a top-level Instagram document and verify the expected account
+ID from the authenticated cookie session. A
+loading page or expired cached evidence is a transient `CHECKING`/`STALE` state,
+not proof of logout; it must not downgrade a connected platform record or cause
+the worker to oscillate between Connected and Login required. Explicit
+`LOGIN_REQUIRED`, account mismatch, challenge, or failed pre-share verification
+must still block Share and update the platform health state. Instagram cannot
+reuse Facebook's `c_user` cookie; it uses its own `ds_user_id` + `sessionid`
+pair for stable account identity and the current top-level document as the
+fresh pre-Share proof, persisted against the same installation binding.
 
 Before each phase:
 
@@ -1241,3 +1452,28 @@ Before each phase:
    test accounts.
 9. Update `progress.md` with files changed, decisions, checks, live-validation
    status, limitations, and the next safe phase.
+
+## Instagram identity policy
+
+Instagram connections must use the authenticated account ID exposed by the
+browser session (`ds_user_id` with a live `sessionid`) as their durable
+identity. A username is display metadata only and must not be required,
+persisted, or used for pre-share authorization for new ID-backed connections.
+Legacy username-only records remain readable while they are migrated to the
+ID-backed path. On startup, heartbeat, cookie changes, and publish refresh, the
+extension checks these cookies itself. If no Instagram tab is open, it opens
+one inactive top-level Instagram tab so the session can be checked without
+requiring the user to navigate there first. A missing cookie keeps the account
+unbound/waiting for login; it never creates a connection from a username alone.
+
+### Instagram publishing tab policy
+
+Before opening the composer, Instagram publishing must resolve the authenticated
+account's own profile URL and navigate the publishing tab to that profile. It
+must not start from an arbitrary open Reel, post detail, or another profile.
+For ID-backed connections, the profile URL is discovered ephemerally from the
+current authenticated document and is not persisted as account identity. The
+profile page must finish loading before the baseline permalink probe and media
+upload begin; if it cannot be resolved, the job fails safely without opening
+the composer. Permalink recovery must refresh this same profile page so a
+previous post URL cannot be mistaken for the new post.

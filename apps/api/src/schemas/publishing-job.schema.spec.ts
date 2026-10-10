@@ -22,6 +22,7 @@ describe('PublishingJob target validation', () => {
     [PublishingTargetType.INSTAGRAM_FEED, PublishingPlatform.INSTAGRAM],
     [PublishingTargetType.INSTAGRAM_REEL, PublishingPlatform.INSTAGRAM],
     [PublishingTargetType.TIKTOK_VIDEO, PublishingPlatform.TIKTOK],
+    [PublishingTargetType.TIKTOK_PHOTO, PublishingPlatform.TIKTOK],
   ])('maps %s to %s', (targetType, platform) => {
     expect(getPublishingPlatformForTargetType(targetType)).toBe(platform);
   });
@@ -72,6 +73,7 @@ describe('PublishingJob target validation', () => {
     [PublishingTargetType.INSTAGRAM_FEED, PublishingPlatform.INSTAGRAM],
     [PublishingTargetType.INSTAGRAM_REEL, PublishingPlatform.INSTAGRAM],
     [PublishingTargetType.TIKTOK_VIDEO, PublishingPlatform.TIKTOK],
+    [PublishingTargetType.TIKTOK_PHOTO, PublishingPlatform.TIKTOK],
   ])(
     'accepts a %s job with its platform connection',
     (targetType, platform) => {

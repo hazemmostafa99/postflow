@@ -10,6 +10,7 @@ import {
 import type { PublishJob } from '../../publishing-target.js';
 import {
   clearFacebookExecution,
+  getFacebookProfileVideoBaselineUrls,
   prepareFacebookExecution,
   refreshFacebookSession,
   verifyProfileTargetIdentity,
@@ -70,6 +71,9 @@ export class FacebookAdapter implements PlatformPublisherAdapter {
   async execute(tabId: number, job: PublishJob): Promise<PublishResult> {
     const profileVideoNotificationBaselineKeys =
       await prepareFacebookExecution(job, tabId);
+    const profileVideoProfileBaselineUrls =
+      getFacebookProfileVideoBaselineUrls(job.id);
+    let terminalMessageReceived = false;
     try {
       const resultPromise = this.waitForFacebookResult(tabId, job.id);
       const response = await chrome.tabs.sendMessage(tabId, {
@@ -78,9 +82,12 @@ export class FacebookAdapter implements PlatformPublisherAdapter {
         post: job.post,
         target: job.target,
         profileVideoNotificationBaselineKeys,
+        profileVideoProfileBaselineUrls,
       });
       if (response?.accepted === true) {
-        return resultPromise;
+        const result = await resultPromise;
+        terminalMessageReceived = true;
+        return result;
       }
       return {
         success: false,
@@ -94,9 +101,16 @@ export class FacebookAdapter implements PlatformPublisherAdapter {
         reason: error instanceof Error ? error.message : String(error),
       };
     } finally {
-      // The legacy background result listener may clear this earlier after it
-      // records the result; this is harmless and protects timeout/error paths.
-      clearFacebookExecution(job.id);
+      // JOB_SUCCESS/JOB_FAILED is consumed by both this adapter and the
+      // legacy background result listener. Keep activeExecution alive until
+      // that listener has had a chance to process the same terminal message;
+      // otherwise it can report "no active execution" and skip its
+      // post-publish reconciliation work.
+      if (!terminalMessageReceived) {
+        clearFacebookExecution(job.id, true);
+      } else {
+        setTimeout(() => clearFacebookExecution(job.id), 10_000);
+      }
     }
   }
 

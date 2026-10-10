@@ -26,9 +26,14 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { TopbarPortal } from "@/components/topbar-portal";
+import { connectionRows, connectionActionPath, isCurrentConnection, type ConnectionPlatform, type ExtensionConnection } from "./connection-platforms";
+import { PlatformDetails } from "./platform-details";
 
 export interface FacebookConnection {
   _id: string;
+  installationId?: string;
+  legacyFacebookConnectionId?: string | null;
+  platformAccounts?: ConnectionPlatform[];
   extensionInstanceId?: string;
   extensionInstanceIdMasked?: string;
   activeExtensionInstallationId?: string | null;
@@ -175,6 +180,19 @@ export function getConnectionView(connection: FacebookConnection, now: number): 
     return { ...base, state: "OFFLINE", stateLabel: "Offline", message: offlineMessage };
   }
 
+  if (connection.platformAccounts) {
+    const accounts = connection.platformAccounts.filter((account) => account.connectionId);
+    if (accounts.some((account) => account.workerStatus === "PUBLISHING")) {
+      return { ...base, state: "PUBLISHING", stateLabel: "Publishing", message: "This extension is processing a publishing job." };
+    }
+    if (accounts.some((account) => account.status === "CONNECTED" && account.sessionDetected && ["IDLE", "ONLINE", "READY"].includes(account.workerStatus))) {
+      return { ...base, state: "READY", stateLabel: "Ready", message: "Connected and available for publishing. See platform details for individual account health." };
+    }
+    return accounts.length
+      ? { ...base, state: "ATTENTION", stateLabel: "Needs attention", message: "Check the platform details below for login or verification requirements." }
+      : { ...base, state: "SETUP", stateLabel: "Setup incomplete", message: "Sign in to a platform in this Chrome profile to detect its account." };
+  }
+
   if (rawStatus === "ACCOUNT_MISMATCH" || workerStatus === "ACCOUNT_MISMATCH") {
     return { ...base, state: "ATTENTION", stateLabel: "Account mismatch", message: "The signed-in Facebook account does not match this connection." };
   }
@@ -218,6 +236,12 @@ export function getConnectionView(connection: FacebookConnection, now: number): 
 
 export function availableActions(connection: FacebookConnection): LifecycleAction[] {
   const lifecycle = normalizeLifecycle(connection);
+  if (connection.installationId && connection.legacyFacebookConnectionId === null) {
+    if (connection.archivedAt) return [];
+    if (lifecycle === "REVOKED") return ["remove"];
+    if (lifecycle === "REVOKE_PENDING") return ["force-disconnect", "remove"];
+    return lifecycle === "PAUSED" ? ["rename", "resume", "disconnect", "force-disconnect", "remove"] : ["rename", "pause", "disconnect", "force-disconnect", "remove"];
+  }
   if (connection.archivedAt) return ["rename", "restore"];
   if (lifecycle === "REVOKED") return ["rename", "remove"];
   if (lifecycle === "REVOKE_PENDING") return ["rename", "force-disconnect"];
@@ -305,6 +329,8 @@ export function getConfirmSpec(action: Exclude<LifecycleAction, "rename" | "rest
 
 function accountName(connection: FacebookConnection): string {
   if (connection.displayName?.trim()) return connection.displayName.trim();
+  const extensionId = connection.extensionInstanceIdMasked?.trim() || connection.extensionInstanceId?.trim();
+  if (extensionId) return extensionId;
   if (connection.facebookUserId) return `Facebook account ••••${connection.facebookUserId.slice(-4)}`;
   return "Unnamed Facebook connection";
 }
@@ -316,7 +342,7 @@ function accountIdentity(connection: FacebookConnection): string {
 }
 
 function browserLabel(connection: FacebookConnection): string {
-  return connection.extensionInstanceId ? "iPostFlow extension connected" : "Legacy installation";
+  return connection.installationId || connection.extensionInstanceId ? "iPostFlow extension connected" : "Legacy installation";
 }
 
 function maskedId(connection: FacebookConnection): string {
@@ -434,6 +460,8 @@ interface ConnectionsDashboardProps {
   connections: FacebookConnection[];
   unavailable: boolean;
   refreshedAt: string;
+  scopeConnectionId?: string;
+  extensionConnections?: ExtensionConnection[];
 }
 
 type DialogState =
@@ -445,8 +473,10 @@ export function ConnectionsDashboard({
   connections: initialConnections,
   unavailable: initiallyUnavailable,
   refreshedAt,
+  scopeConnectionId,
+  extensionConnections,
 }: ConnectionsDashboardProps) {
-  const [connections, setConnections] = useState(initialConnections);
+  const [connections, setConnections] = useState(() => extensionConnections ? connectionRows(initialConnections, extensionConnections) : initialConnections.filter(isCurrentConnection));
   const [unavailable, setUnavailable] = useState(initiallyUnavailable);
   const [lastRefreshedAt, setLastRefreshedAt] = useState(refreshedAt);
   const [filter, setFilter] = useState<ConnectionFilter>("ALL");
@@ -466,13 +496,17 @@ export function ConnectionsDashboard({
   const refresh = useCallback(async (showSpinner = true) => {
     if (showSpinner) setIsRefreshing(true);
     try {
-      const response = await fetch("/api/extensions/connections", { cache: "no-store" });
+      const [response, platformsResponse] = await Promise.all([
+        fetch("/api/extensions/connections", { cache: "no-store" }),
+        fetch("/api/extensions/browser-connections", { cache: "no-store" }),
+      ]);
       const data: unknown = await response.json();
-      if (!response.ok || !Array.isArray(data)) {
+      const extensions: unknown = await platformsResponse.json();
+      if (!response.ok || !Array.isArray(data) || !platformsResponse.ok || !Array.isArray(extensions)) {
         setUnavailable(true);
         return;
       }
-      setConnections(data as FacebookConnection[]);
+      setConnections(connectionRows(data as FacebookConnection[], extensions as ExtensionConnection[]).filter((connection) => !scopeConnectionId || connection._id === scopeConnectionId));
       setUnavailable(false);
       setLastRefreshedAt(new Date().toISOString());
     } catch {
@@ -480,25 +514,30 @@ export function ConnectionsDashboard({
     } finally {
       if (showSpinner) setIsRefreshing(false);
     }
-  }, []);
+  }, [scopeConnectionId]);
 
   const refreshArchived = useCallback(async () => {
     setArchivedLoading(true);
     setArchivedError(null);
     try {
-      const response = await fetch("/api/extensions/connections/archived", { cache: "no-store" });
-      const data: unknown = await response.json();
-      if (!response.ok || !Array.isArray(data)) {
+      const responses = await Promise.all([
+        fetch("/api/extensions/connections/archived", { cache: "no-store" }),
+        fetch("/api/extensions/connections", { cache: "no-store" }),
+        fetch("/api/extensions/browser-connections", { cache: "no-store" }),
+      ]);
+      const [data, active, extensions] = await Promise.all(responses.map((response) => response.json()));
+      if (responses.some((response) => !response.ok) || ![data, active, extensions].every(Array.isArray)) {
         setArchivedError("Archived connections could not be loaded.");
         return;
       }
-      setArchived(data as FacebookConnection[]);
+      setArchived(connectionRows([...data, ...active] as FacebookConnection[], extensions as ExtensionConnection[], Date.now(), true)
+        .filter((connection) => connection.archivedAt && (!scopeConnectionId || connection._id === scopeConnectionId)));
     } catch {
       setArchivedError(BACKEND_UNAVAILABLE_MESSAGE);
     } finally {
       setArchivedLoading(false);
     }
-  }, []);
+  }, [scopeConnectionId]);
 
   const hasPendingTransition = useMemo(
     () => connections.some((connection) => normalizeLifecycle(connection) === "REVOKE_PENDING"),
@@ -554,6 +593,8 @@ export function ConnectionsDashboard({
           accountName(connection),
           connection.facebookUserId,
           connection.extensionInstanceId,
+          connection.extensionInstanceIdMasked,
+          ...(connection.platformAccounts ?? []).flatMap((account) => [account.platform, account.username, account.status]),
           statusLabel(connection.status),
           statusLabel(connection.workerStatus),
           lifecycleLabel,
@@ -648,7 +689,7 @@ export function ConnectionsDashboard({
     setDialogBusy(true);
     setDialogError(null);
     const result = await callConnectionApi(
-      `/api/extensions/connections/${dialog.connection._id}`,
+      connectionActionPath(dialog.connection, "rename"),
       {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -674,12 +715,12 @@ export function ConnectionsDashboard({
 
     let result: { ok: boolean; status: number; data: Record<string, unknown> };
     if (action === "remove") {
-      result = await callConnectionApi(`/api/extensions/connections/${connection._id}`, {
-        method: "DELETE",
+      result = await callConnectionApi(connectionActionPath(connection, action), {
+        method: connection.installationId ? "POST" : "DELETE",
       });
     } else {
       result = await callConnectionApi(
-        `/api/extensions/connections/${connection._id}/${action}`,
+        connectionActionPath(connection, action),
         { method: "POST" },
       );
     }
@@ -778,7 +819,7 @@ export function ConnectionsDashboard({
         <section className="surface overflow-hidden" aria-label="Archived connections">
           <div className="border-b border-border bg-muted/50 px-4 py-3">
             <p className="text-xs font-semibold uppercase tracking-normal text-muted-foreground">Archived connections</p>
-            <p className="mt-1 text-xs text-muted-foreground">Removed connections keep their ownership and audit history. Restore one to issue a reconnect approval.</p>
+            <p className="mt-1 text-xs text-muted-foreground">Removed connections keep their accounts, jobs, and audit history. Existing Facebook recovery uses a verified reconnect approval.</p>
           </div>
           {archivedError && (
             <div role="alert" className="flex items-start gap-2 border-b border-border bg-red-50 px-4 py-3 text-sm text-red-700">
@@ -813,14 +854,14 @@ export function ConnectionsDashboard({
                   <span className="inline-flex rounded-full border px-2.5 py-1 text-xs font-medium border-red-200 bg-red-50 text-red-700">
                     {connection.hasPendingReconnectApproval ? "Reconnect approval pending" : "Archived"}
                   </span>
-                  <button
+                  {(!connection.installationId || connection.legacyFacebookConnectionId) ? <button
                     type="button"
                     onClick={() => handleAction(connection, "restore")}
                     className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
                   >
                     <RotateCcw className="h-3.5 w-3.5" />
                     Restore / reconnect
-                  </button>
+                  </button> : <p className="max-w-56 text-xs text-muted-foreground">Archived safely. Multi-platform reconnect is not yet available; accounts and jobs are retained.</p>}
                 </div>
               ))}
             </div>
@@ -839,11 +880,11 @@ export function ConnectionsDashboard({
             <SummaryCard label="Needs attention" value={counts.attention} description={`${counts.offline} offline`} icon={<AlertTriangle className="h-4 w-4 text-amber-600" />} active={filter === "ATTENTION"} onClick={() => setFilter("ATTENTION")} />
           </section>
 
-          <section className="surface overflow-hidden" aria-label="Facebook connections">
+          <section className="surface overflow-hidden" aria-label="Connections">
             <div className="hidden grid-cols-[minmax(240px,1.45fr)_minmax(250px,1.4fr)_minmax(190px,1fr)_minmax(120px,.7fr)_24px] gap-4 border-b border-border bg-muted/50 px-4 py-3 text-xs font-semibold uppercase tracking-normal text-muted-foreground lg:grid">
               <span>Account and browser</span>
               <span>Lifecycle and health</span>
-              <span>Facebook session</span>
+              <span>Platform sessions</span>
               <span>Last activity</span>
               <span className="sr-only">Details</span>
             </div>
@@ -1037,6 +1078,9 @@ function ConnectionRow({
 }) {
   const { connection, state, stateLabel, message, lifecycle, lifecycleLabel, lifecycleMessage } = item;
   const identityMatches = Boolean(connection.facebookUserId && connection.detectedFacebookUserId && connection.facebookUserId === connection.detectedFacebookUserId);
+  const platformVerified = connection.platformAccounts
+    ? connection.platformAccounts.some((account) => account.status === "CONNECTED" && account.sessionDetected)
+    : identityMatches;
   const lifecycleStyle = lifecycle ? LIFECYCLE_STYLES[lifecycle] : LIFECYCLE_STYLES.ACTIVE;
 
   return (
@@ -1062,10 +1106,10 @@ function ConnectionRow({
         </div>
 
         <div className="flex items-start gap-2 pl-[52px] text-sm lg:pl-0">
-          {identityMatches ? <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" /> : <UserRound className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />}
+          {platformVerified ? <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" /> : <UserRound className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />}
           <div className="min-w-0">
-            <p className="font-medium text-foreground">{identityMatches ? "Identity verified" : "Not verified"}</p>
-            <p className="mt-0.5 truncate text-xs text-muted-foreground">{accountIdentity(connection)}</p>
+            <p className="font-medium text-foreground">{connection.platformAccounts ? `${connection.platformAccounts.filter((account) => account.status === "CONNECTED" && account.sessionDetected).length} / ${connection.platformAccounts.length} detected` : identityMatches ? "Identity verified" : "Not verified"}</p>
+            <p className="mt-0.5 truncate text-xs text-muted-foreground">{connection.platformAccounts ? "Platform details below" : accountIdentity(connection)}</p>
           </div>
         </div>
 
@@ -1089,8 +1133,8 @@ function ConnectionRow({
         </div>
 
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-          <Diagnostic label="Connection status" value={statusLabel(connection.status)} />
-          <Diagnostic label="Worker status" value={statusLabel(connection.workerStatus)} />
+          <Diagnostic label={connection.platformAccounts ? "Facebook status" : "Connection status"} value={statusLabel(connection.status)} />
+          <Diagnostic label={connection.platformAccounts ? "Facebook worker status" : "Worker status"} value={statusLabel(connection.workerStatus)} />
           <Diagnostic label="Facebook session" value={connection.facebookSessionDetected ? "Detected" : "Not detected"} />
           <Diagnostic label="Installation" value={statusLabel(connection.installationStatus ?? (connection.extensionInstanceId ? "ACTIVE" : "LEGACY"))} />
           <Diagnostic label="Expected account" value={connection.facebookUserId ? `••••${connection.facebookUserId.slice(-4)}` : "Not available"} />
@@ -1108,6 +1152,7 @@ function ConnectionRow({
             )}
           </div>
         </div>
+        {connection.platformAccounts && <PlatformDetails accounts={connection.platformAccounts} />}
       </div>
     </details>
   );

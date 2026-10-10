@@ -21,21 +21,32 @@ type PlatformConnection = {
   _id: string;
   platform: string;
   displayName?: string;
+  externalAccountId?: string;
+  detectedExternalAccountId?: string;
   externalUsername?: string;
   detectedExternalUsername?: string;
   status: string;
   workerStatus: string;
   sessionDetected: boolean;
   lastSeenAt?: string | null;
+  sessionEvidenceState?: string;
+  sessionVerifiedAt?: string | null;
 };
 
 function isReady(connection: PlatformConnection): boolean {
+  const idVerified = Boolean(
+    connection.externalAccountId &&
+      connection.externalAccountId === connection.detectedExternalAccountId,
+  );
+  const legacyUsernameVerified = Boolean(
+    connection.externalUsername &&
+      connection.externalUsername.toLowerCase() ===
+        connection.detectedExternalUsername?.toLowerCase(),
+  );
   return Boolean(
     connection.status === "CONNECTED" &&
       connection.sessionDetected &&
-      connection.externalUsername &&
-      connection.externalUsername.toLowerCase() ===
-        connection.detectedExternalUsername?.toLowerCase(),
+      (idVerified || legacyUsernameVerified),
   );
 }
 
@@ -64,6 +75,15 @@ function getConnectionState(connection: PlatformConnection) {
       detail: "Sign in at instagram.com in this Chrome profile",
       className: "border-amber-200 bg-amber-50 text-amber-700",
       Icon: AlertCircle,
+    };
+  }
+
+  if (connection.sessionEvidenceState === "STALE") {
+    return {
+      label: "Verification expired",
+      detail: "Open Instagram to refresh account verification; this does not mean you signed out",
+      className: "border-amber-200 bg-amber-50 text-amber-700",
+      Icon: Clock3,
     };
   }
 
@@ -221,8 +241,8 @@ export function PlatformConnectionsPanel() {
           ) : connections.map((connection) => {
             const state = getConnectionState(connection);
             const StateIcon = state.Icon;
-            const expectedUsername = connection.externalUsername ? `@${connection.externalUsername}` : "Not bound yet";
-            const detectedUsername = connection.detectedExternalUsername ? `@${connection.detectedExternalUsername}` : "Not detected";
+            const expectedIdentity = connection.externalAccountId ? "Account identity linked" : connection.externalUsername ? `@${connection.externalUsername}` : "Not bound yet";
+            const detectedIdentity = connection.detectedExternalAccountId ? "Account identity detected" : connection.detectedExternalUsername ? `@${connection.detectedExternalUsername}` : "Not detected";
             return (
               <article key={connection._id} className="rounded-xl border border-border bg-card p-4 transition-colors hover:border-primary/30">
                 <div className="flex items-start justify-between gap-3">
@@ -230,7 +250,7 @@ export function PlatformConnectionsPanel() {
                     <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-pink-50 text-pink-700 ring-1 ring-pink-100"><Camera className="h-4 w-4" aria-hidden="true" /></span>
                     <div className="min-w-0">
                       <p className="truncate text-sm font-semibold text-foreground">{connection.displayName || "Instagram account"}</p>
-                      <p className="mt-0.5 truncate text-xs text-muted-foreground">{expectedUsername}</p>
+                      <p className="mt-0.5 truncate text-xs text-muted-foreground">{expectedIdentity}</p>
                     </div>
                   </div>
                   <span className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium ${state.className}`}>
@@ -240,9 +260,9 @@ export function PlatformConnectionsPanel() {
                 </div>
 
                 <div className="mt-4 grid gap-2 rounded-lg bg-muted/40 px-3 py-2.5 text-xs sm:grid-cols-3">
-                  <div><p className="text-muted-foreground">Expected</p><p className="mt-0.5 font-medium text-foreground">{expectedUsername}</p></div>
-                  <div><p className="text-muted-foreground">Detected</p><p className="mt-0.5 font-medium text-foreground">{detectedUsername}</p></div>
-                  <div><p className="text-muted-foreground">Last seen</p><p className="mt-0.5 font-medium text-foreground">{formatLastSeen(connection.lastSeenAt)}</p></div>
+                  <div><p className="text-muted-foreground">Expected</p><p className="mt-0.5 font-medium text-foreground">{expectedIdentity}</p></div>
+                  <div><p className="text-muted-foreground">Detected</p><p className="mt-0.5 font-medium text-foreground">{detectedIdentity}</p></div>
+                  <div><p className="text-muted-foreground">{connection.sessionVerifiedAt ? "Last verified" : "Last seen"}</p><p className="mt-0.5 font-medium text-foreground">{formatLastSeen(connection.sessionVerifiedAt ?? connection.lastSeenAt)}</p></div>
                 </div>
 
                 <p className={`mt-3 flex items-start gap-1.5 text-xs ${isReady(connection) ? "text-emerald-700" : "text-amber-700"}`}>

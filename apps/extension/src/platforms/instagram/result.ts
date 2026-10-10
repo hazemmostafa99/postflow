@@ -5,9 +5,10 @@ export function normalizeInstagramPostUrl(value: string): string | null {
     if (hostname !== 'instagram.com' && !hostname.endsWith('.instagram.com')) {
       return null;
     }
-    const match = url.pathname.match(/^\/(?:[^/]+\/)?(p|reel)\/([^/]+)\/?$/i);
+    const match = url.pathname.match(/^\/(?:[^/]+\/)?(p|reels?)\/([^/]+)\/?$/i);
     if (!match) return null;
-    return `https://www.instagram.com/${match[1].toLowerCase()}/${match[2]}/`;
+    const kind = match[1].toLowerCase() === 'p' ? 'p' : 'reel';
+    return `https://www.instagram.com/${kind}/${match[2]}/`;
   } catch {
     return null;
   }

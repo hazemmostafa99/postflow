@@ -14,7 +14,7 @@ export interface AccountVerificationResult {
 
 export interface PublishResult {
   success: boolean;
-  status: 'PUBLISHED' | 'PENDING_APPROVAL' | 'UNKNOWN' | 'FAILED';
+  status: 'PUBLISHED' | 'PENDING_APPROVAL' | 'PROCESSING' | 'UNKNOWN' | 'FAILED';
   canceled?: boolean;
   postUrl?: string;
   externalPostId?: string;
@@ -22,6 +22,7 @@ export interface PublishResult {
   reason?: string;
   shouldPauseQueue?: boolean;
   detector?: string;
+  diagnostics?: Record<string, unknown>;
 }
 
 export interface ValidationResult {

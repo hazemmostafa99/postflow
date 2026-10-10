@@ -96,7 +96,7 @@ interface PublishedPlatformPost {
   id: string;
   status: "PUBLISHED";
   platform?: "FACEBOOK" | "INSTAGRAM" | "TIKTOK";
-  targetType?: "GROUP" | "PROFILE_FEED" | "INSTAGRAM_FEED" | "INSTAGRAM_REEL" | "TIKTOK_VIDEO";
+  targetType?: "GROUP" | "PROFILE_FEED" | "INSTAGRAM_FEED" | "INSTAGRAM_REEL" | "TIKTOK_VIDEO" | "TIKTOK_PHOTO";
   postUrl: string;
   lastEngagementSyncAt?: string;
   claimToken?: string;
@@ -111,6 +111,6 @@ interface FacebookPostEngagement {
 }
 
 type PostEngagementSyncResult =
-  | { status: "SUCCESS"; reactionCount: number; commentCount: number }
-  | { status: "PARTIAL"; reactionCount?: number; commentCount?: number; reason?: string }
+  | { status: "SUCCESS"; reactionCount?: number; commentCount?: number; favoriteCount?: number; shareCount?: number }
+  | { status: "PARTIAL"; reactionCount?: number; commentCount?: number; favoriteCount?: number; shareCount?: number; reason?: string }
   | { status: "CHECK_FAILED"; reason?: string; emptySurface?: boolean };

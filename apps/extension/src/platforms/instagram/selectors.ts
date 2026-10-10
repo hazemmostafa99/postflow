@@ -10,6 +10,7 @@ type InstagramElementFinder = {
 const CREATE_LABEL = /new post|create|إنشاء|منشور جديد/i;
 const NEXT_LABEL = /next|التالي/i;
 const SHARE_LABEL = /share|مشاركة/i;
+const CAPTION_LABEL = /caption|(?:شرحا?|تسمية)\s+توضيحي[ةا]?|(?:أضف|إضافة|اكتب)\s+(?:وصف|تعليق)/i;
 
 function visible(element: Element): boolean {
   const node = element as HTMLElement;
@@ -23,18 +24,23 @@ function visible(element: Element): boolean {
 
 function labelFor(element: Element): string {
   const descendantLabels = Array.from(
-    element.querySelectorAll<HTMLElement>('[aria-label], [title], svg title'),
+    element.querySelectorAll<HTMLElement>('[aria-label], [aria-placeholder], [data-placeholder], [title], svg title'),
   ).flatMap((descendant) => [
     descendant.getAttribute('aria-label'),
+    descendant.getAttribute('aria-placeholder'),
+    descendant.getAttribute('data-placeholder'),
     descendant.getAttribute('title'),
     descendant.textContent,
   ]);
   return [
     element.getAttribute('aria-label'),
+    element.getAttribute('aria-placeholder'),
+    element.getAttribute('data-placeholder'),
     element.getAttribute('title'),
     element.textContent,
     ...descendantLabels,
-  ].filter(Boolean).join(' ');
+  ].filter(Boolean).join(' ')
+    .replace(/[\u064B-\u065F\u0670\u0640\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, '');
 }
 
 function isDisabled(element: Element): boolean {
@@ -54,7 +60,12 @@ const instagramSelectors: InstagramElementFinder = {
   },
   findDialog(documentRef) {
     const dialogs = Array.from(documentRef.querySelectorAll<HTMLElement>('[role="dialog"], dialog'));
-    return dialogs.find(visible) ?? null;
+    const visibleDialogs = dialogs.filter(visible);
+    // During a modal transition the outgoing dialog can coexist with the
+    // upload composer. Prefer the actual upload form, not the first dialog.
+    return visibleDialogs.find((dialog) => dialog.querySelector('input[type="file"]'))
+      ?? visibleDialogs.find((dialog) => CREATE_LABEL.test(labelFor(dialog)))
+      ?? visibleDialogs[0] ?? null;
   },
   findMediaInput(root) {
     return root.querySelector<HTMLInputElement>('input[type="file"]');
@@ -64,9 +75,15 @@ const instagramSelectors: InstagramElementFinder = {
       root.querySelectorAll<HTMLElement>('textarea, [contenteditable="true"]'),
     );
     const captionCandidates = candidates.filter((candidate) =>
-      /caption/i.test(labelFor(candidate)),
+      CAPTION_LABEL.test(labelFor(candidate)),
     );
-    return captionCandidates.find(visible) ?? candidates.find(visible) ?? null;
+    const visibleCaption = captionCandidates.find(visible);
+    if (visibleCaption) return visibleCaption;
+    const visibleCandidates = candidates.filter(visible);
+    // Do not guess when Instagram has multiple editors (for example caption,
+    // alt text, or accessibility fields) and the caption label has not
+    // hydrated yet. A single visible editor is a safe legacy fallback.
+    return visibleCandidates.length === 1 ? visibleCandidates[0] : null;
   },
   findNextButton(root) {
     return findButton(root, NEXT_LABEL);

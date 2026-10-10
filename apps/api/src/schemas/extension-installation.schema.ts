@@ -26,6 +26,23 @@ export class ExtensionInstallation {
   @Prop({ index: true, unique: true, sparse: true })
   extensionInstanceId?: string;
 
+  /** This installation is the product Connection; its name is shared across platforms. */
+  @Prop()
+  displayName?: string;
+
+  @Prop()
+  displayNameKey?: string;
+
+  /** Product Connection archive; account records and scheduled jobs are retained. */
+  @Prop()
+  archivedAt?: Date;
+
+  @Prop()
+  archivedByClerkUserId?: string;
+
+  @Prop()
+  archiveReason?: string;
+
   @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'FacebookConnection', index: true })
   facebookConnectionId?: Types.ObjectId;
 

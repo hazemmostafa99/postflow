@@ -5,7 +5,8 @@ export type PublishingTargetType =
   | 'PROFILE_FEED'
   | 'INSTAGRAM_FEED'
   | 'INSTAGRAM_REEL'
-  | 'TIKTOK_VIDEO';
+  | 'TIKTOK_VIDEO'
+  | 'TIKTOK_PHOTO';
 
 export function getPlatformForTargetType(targetType: PublishingTargetType): PublishingPlatform {
   switch (targetType) {
@@ -16,6 +17,7 @@ export function getPlatformForTargetType(targetType: PublishingTargetType): Publ
     case 'INSTAGRAM_REEL':
       return 'INSTAGRAM';
     case 'TIKTOK_VIDEO':
+    case 'TIKTOK_PHOTO':
       return 'TIKTOK';
   }
 }
@@ -39,6 +41,7 @@ export type ProfileFeedPublishTarget = {
 export type InstagramFeedPublishTarget = {
   type: 'INSTAGRAM_FEED';
   platformConnectionId: string;
+  instagramAccountId?: string;
   instagramUsername?: string;
   url: string;
 };
@@ -46,6 +49,7 @@ export type InstagramFeedPublishTarget = {
 export type InstagramReelPublishTarget = {
   type: 'INSTAGRAM_REEL';
   platformConnectionId: string;
+  instagramAccountId?: string;
   instagramUsername?: string;
   url: string;
 };
@@ -57,12 +61,17 @@ export type TikTokVideoPublishTarget = {
   url: string;
 };
 
+export type TikTokPhotoPublishTarget = Omit<TikTokVideoPublishTarget, 'type'> & {
+  type: 'TIKTOK_PHOTO';
+};
+
 export type PublishTarget =
   | GroupPublishTarget
   | ProfileFeedPublishTarget
   | InstagramFeedPublishTarget
   | InstagramReelPublishTarget
-  | TikTokVideoPublishTarget;
+  | TikTokVideoPublishTarget
+  | TikTokPhotoPublishTarget;
 
 export type PublishJob = {
   id: string;
@@ -116,6 +125,7 @@ function instagramFeedTargetFrom(value: unknown): InstagramFeedPublishTarget | n
   return {
     type: 'INSTAGRAM_FEED',
     platformConnectionId,
+    ...(stringValue(value.instagramAccountId) ? { instagramAccountId: stringValue(value.instagramAccountId)! } : {}),
     ...(stringValue(value.instagramUsername) ? { instagramUsername: stringValue(value.instagramUsername)! } : {}),
     url,
   };
@@ -129,6 +139,7 @@ function instagramReelTargetFrom(value: unknown): InstagramReelPublishTarget | n
   return {
     type: 'INSTAGRAM_REEL',
     platformConnectionId,
+    ...(stringValue(value.instagramAccountId) ? { instagramAccountId: stringValue(value.instagramAccountId)! } : {}),
     ...(stringValue(value.instagramUsername) ? { instagramUsername: stringValue(value.instagramUsername)! } : {}),
     url,
   };
@@ -145,6 +156,11 @@ function tiktokVideoTargetFrom(value: unknown): TikTokVideoPublishTarget | null 
     ...(stringValue(value.tiktokUsername) ? { tiktokUsername: stringValue(value.tiktokUsername)! } : {}),
     url,
   };
+}
+
+function tiktokPhotoTargetFrom(value: unknown): TikTokPhotoPublishTarget | null {
+  const target = tiktokVideoTargetFrom(value);
+  return target ? { ...target, type: 'TIKTOK_PHOTO' } : null;
 }
 
 // Normalizes the new queue payload while keeping already-claimed group jobs usable.
@@ -176,6 +192,9 @@ export function normalizePublishJob(value: unknown): PublishJob | null {
         break;
       case 'TIKTOK_VIDEO':
         target = tiktokVideoTargetFrom(targetValue);
+        break;
+      case 'TIKTOK_PHOTO':
+        target = tiktokPhotoTargetFrom(targetValue);
         break;
     }
   }

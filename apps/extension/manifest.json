@@ -15,6 +15,7 @@
     "https://www.facebook.com/*",
     "https://instagram.com/*",
     "https://www.instagram.com/*",
+    "https://www.tiktok.com/*",
     "http://localhost:8000/*",
     "http://127.0.0.1:8000/*",
     "https://api.fitcure.online/*",
@@ -32,7 +33,7 @@
     {
       "matches": ["https://www.facebook.com/*"],
       "js": [
-        "dist/posting-config.js",
+        "dist/posting-timing.js",
         "dist/post-tracking/types.js",
         "dist/post-tracking/detect-pending-approval.js",
         "dist/post-tracking/facebook-interruption-detector.js",
@@ -63,6 +64,18 @@
         "dist/platforms/instagram/composer.js",
         "dist/platforms/instagram/engagement.js",
         "dist/platforms/instagram/content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.tiktok.com/*"],
+      "js": [
+        "dist/platforms/tiktok/identity.js",
+        "dist/shared/media/media-runtime.js",
+        "dist/platforms/tiktok/selectors.js",
+        "dist/platforms/tiktok/composer.js",
+        "dist/platforms/tiktok/engagement.js",
+        "dist/platforms/tiktok/content.js"
       ],
       "run_at": "document_idle"
     },

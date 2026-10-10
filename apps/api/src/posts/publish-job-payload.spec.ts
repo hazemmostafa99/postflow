@@ -139,6 +139,74 @@ describe('toPublishJobPayload', () => {
       url: 'https://www.instagram.com/brand.account/',
     });
   });
+
+  it('externalizes TikTok video bytes behind a lease-scoped media reference', () => {
+    const expiresAt = new Date('2026-10-09T03:00:00.000Z');
+    const payload = toPublishJobPayload(
+      {
+        _id: id('job-tiktok-1'),
+        platform: PublishingPlatform.TIKTOK,
+        targetType: PublishingTargetType.TIKTOK_VIDEO,
+        claimExpiresAt: expiresAt,
+        postId: {
+          content: 'TikTok caption',
+          mediaUrls: ['data:video/mp4;base64,SGVsbG8='],
+        },
+        platformConnectionId: {
+          _id: id('platform-connection-tiktok-1'),
+          platform: PublishingPlatform.TIKTOK,
+          externalUsername: 'creator',
+        },
+      },
+      { mediaAccessToken: 'a'.repeat(43) },
+    );
+
+    expect(payload?.post.mediaUrls).toEqual([]);
+    expect(payload?.post.media).toEqual([
+      {
+        index: 0,
+        contentType: 'video/mp4',
+        sizeBytes: 5,
+        fileName: 'postflow-media.mp4',
+        fetchPath: '/api/jobs/job-tiktok-1/media/0',
+        accessToken: 'a'.repeat(43),
+        expiresAt: expiresAt.toISOString(),
+      },
+    ]);
+    expect(JSON.stringify(payload)).not.toContain('SGVsbG8');
+  });
+
+  it('externalizes every TikTok photo behind lease-scoped media references', () => {
+    const expiresAt = new Date('2026-10-09T03:00:00.000Z');
+    const payload = toPublishJobPayload({
+      _id: id('job-tiktok-photos'), platform: PublishingPlatform.TIKTOK,
+      targetType: PublishingTargetType.TIKTOK_PHOTO, claimExpiresAt: expiresAt,
+      postId: { content: 'Photo caption', mediaUrls: [
+        'data:image/png;base64,SGVsbG8=', 'data:image/jpeg;base64,V29ybGQ=',
+      ] },
+      platformConnectionId: { _id: id('platform-connection-tiktok-1'),
+        platform: PublishingPlatform.TIKTOK, externalUsername: 'creator' },
+    }, { mediaAccessToken: 'a'.repeat(43) });
+    expect(payload?.target.type).toBe(PublishingTargetType.TIKTOK_PHOTO);
+    expect(payload?.post.media).toHaveLength(2);
+    expect(payload?.post.mediaUrls).toEqual([]);
+  });
+
+  it('fails closed for a TikTok job without a live media grant', () => {
+    expect(
+      toPublishJobPayload({
+        _id: id('job-tiktok-2'),
+        platform: PublishingPlatform.TIKTOK,
+        targetType: PublishingTargetType.TIKTOK_VIDEO,
+        postId: { mediaUrls: ['data:video/mp4;base64,SGVsbG8='] },
+        platformConnectionId: {
+          _id: id('platform-connection-tiktok-1'),
+          platform: PublishingPlatform.TIKTOK,
+          externalUsername: 'creator',
+        },
+      }),
+    ).toBeNull();
+  });
 });
 
 describe('getFacebookProfileUrl', () => {

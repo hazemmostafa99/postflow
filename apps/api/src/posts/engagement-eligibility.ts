@@ -1,7 +1,7 @@
 type EngagementSubmissionStatus = 'PUBLISHED' | 'PENDING_APPROVAL' | 'UNKNOWN';
 
 export interface EngagementQueueCandidate {
-  platform?: 'FACEBOOK' | 'INSTAGRAM';
+  platform?: 'FACEBOOK' | 'INSTAGRAM' | 'TIKTOK';
   status?: string;
   submissionStatus?: EngagementSubmissionStatus;
   postUrl?: string;
@@ -19,7 +19,11 @@ export const FACEBOOK_ENGAGEMENT_PERMALINK_PATTERN =
 
 /** Instagram profile and canonical post/reel permalinks accepted by the worker. */
 export const INSTAGRAM_ENGAGEMENT_PERMALINK_PATTERN =
-  /^(?:\[[^\]]+\]\()?https:\/\/(?:www\.)?instagram\.com\/(?:[a-z0-9._-]+\/)?(?:p|reel)\/[A-Za-z0-9_-]+\/?(?:[?#][^)]*)?\)?$/i;
+  /^(?:\[[^\]]+\]\()?https:\/\/(?:www\.)?instagram\.com\/(?:[a-z0-9._-]+\/)?(?:p|reels?)\/[A-Za-z0-9_-]+\/?(?:[?#][^)]*)?\)?$/i;
+
+/** TikTok video/photo post permalinks accepted by the engagement worker. */
+export const TIKTOK_ENGAGEMENT_PERMALINK_PATTERN =
+  /^(?:\[[^\]]+\]\()?https:\/\/(?:www\.)?tiktok\.com\/@[a-z0-9._]{1,24}\/(?:video|photo)\/\d+\/?(?:[?#][^)]*)?\)?$/i;
 
 export function isFacebookEngagementPermalink(value?: string): boolean {
   return Boolean(
@@ -33,6 +37,12 @@ export function isInstagramEngagementPermalink(value?: string): boolean {
   );
 }
 
+export function isTikTokEngagementPermalink(value?: string): boolean {
+  return Boolean(
+    value && TIKTOK_ENGAGEMENT_PERMALINK_PATTERN.test(value.trim()),
+  );
+}
+
 export function isEligibleForEngagementSync(
   job: EngagementQueueCandidate,
   now = new Date(),
@@ -42,7 +52,9 @@ export function isEligibleForEngagementSync(
     job.submissionStatus === 'PUBLISHED' &&
     (job.platform === 'INSTAGRAM'
       ? isInstagramEngagementPermalink(job.postUrl)
-      : isFacebookEngagementPermalink(job.postUrl)) &&
+      : job.platform === 'TIKTOK'
+        ? isTikTokEngagementPermalink(job.postUrl)
+        : isFacebookEngagementPermalink(job.postUrl)) &&
     (!job.nextEngagementSyncAt || job.nextEngagementSyncAt <= now)
   );
 }
@@ -61,12 +73,14 @@ export function getEngagementQueueFilter(now = new Date()) {
 }
 
 export function getPlatformEngagementQueueFilter(
-  platform: 'FACEBOOK' | 'INSTAGRAM',
+  platform: 'FACEBOOK' | 'INSTAGRAM' | 'TIKTOK',
   now = new Date(),
 ) {
   const permalinkPattern = platform === 'INSTAGRAM'
     ? INSTAGRAM_ENGAGEMENT_PERMALINK_PATTERN
-    : FACEBOOK_ENGAGEMENT_PERMALINK_PATTERN;
+    : platform === 'TIKTOK'
+      ? TIKTOK_ENGAGEMENT_PERMALINK_PATTERN
+      : FACEBOOK_ENGAGEMENT_PERMALINK_PATTERN;
   return {
     status: 'SUCCESS',
     submissionStatus: 'PUBLISHED' as const,

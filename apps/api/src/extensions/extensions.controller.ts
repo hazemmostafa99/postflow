@@ -9,6 +9,8 @@ import {
   HttpStatus,
   Headers,
   Param,
+  Query,
+  BadRequestException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { FacebookConnectionWorkerStatus } from '../schemas/facebook-connection.schema';
@@ -36,13 +38,16 @@ class PlatformSessionDto {
   sessionDetected: boolean;
   externalAccountId?: string;
   externalUsername?: string;
+  evidenceState?: 'VERIFIED' | 'CHECKING' | 'LOGIN_REQUIRED' | 'STALE';
+  evidenceSource?: string;
 }
 
 class PlatformConnectionCreateDto {
   platform: 'INSTAGRAM' | 'TIKTOK';
   installationId: string;
   displayName: string;
-  externalUsername: string;
+  externalUsername?: string;
+  externalAccountId?: string;
 }
 
 class ExtensionIdentityDto {
@@ -92,11 +97,41 @@ export class ExtensionsController {
     );
   }
 
+  @Get('browser-connections')
+  async browserConnections(@Headers('x-clerk-user-id') clerkUserId?: string) {
+    return this.extensionsService.listBrowserConnections(this.requireClerkUserId(clerkUserId));
+  }
+
+  @Patch('browser-connections/:installationId')
+  async renameBrowserConnection(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('installationId') installationId: string,
+    @Body() body: { name?: unknown },
+  ) {
+    return this.extensionsService.updateBrowserConnection(this.requireClerkUserId(clerkUserId), installationId, body.name);
+  }
+
+  @Post('browser-connections/:installationId/:action')
+  async browserConnectionAction(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('installationId') installationId: string,
+    @Param('action') action: string,
+  ) {
+    return this.extensionsService.browserConnectionAction(this.requireClerkUserId(clerkUserId), installationId, action);
+  }
+
   @Get('platform-connections')
-  async platformConnections(@Headers('x-clerk-user-id') clerkUserId?: string) {
+  async platformConnections(
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+    @Query('platform') platform?: string,
+  ) {
+    const selectedPlatform = platform?.toUpperCase();
+    if (selectedPlatform && !['INSTAGRAM', 'TIKTOK'].includes(selectedPlatform)) {
+      throw new BadRequestException('Unsupported platform connection query');
+    }
     return this.extensionsService.listPlatformConnections(
       this.requireClerkUserId(clerkUserId),
-      'INSTAGRAM',
+      (selectedPlatform as 'INSTAGRAM' | 'TIKTOK' | undefined) ?? 'INSTAGRAM',
     );
   }
 
@@ -329,6 +364,13 @@ export class ExtensionsController {
     @Headers('x-extension-credential') credential?: string,
     @Body() body: PlatformSessionDto = new PlatformSessionDto(),
   ) {
+    if (body.evidenceState) {
+      return this.extensionsService.updatePlatformSession(
+        body.platform, this.requireClerkUserId(clerkUserId), extensionInstanceId,
+        credential, body.sessionDetected, body.externalAccountId, body.externalUsername,
+        { state: body.evidenceState, source: body.evidenceSource },
+      );
+    }
     return this.extensionsService.updatePlatformSession(
       body.platform,
       this.requireClerkUserId(clerkUserId),

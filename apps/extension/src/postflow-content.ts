@@ -222,6 +222,14 @@ window.addEventListener('postflow:check-jobs', () => {
   safeSend({ type: 'TRIGGER_JOB_CHECK' });
 });
 
+// The dashboard queues maintenance through the API first, then asks the
+// extension to claim it immediately instead of waiting for the one-minute
+// manual-maintenance alarm.
+window.addEventListener('postflow:refresh-analytics', () => {
+  console.log('[PostFlow] Analytics refresh requested from Web App');
+  safeSend({ type: 'TRIGGER_ANALYTICS_SYNC' });
+});
+
 // Carries a short-lived reconnect approval directly from the authenticated
 // dashboard to this browser profile's extension worker. The token is never
 // rendered into the page or written to local/session storage.

@@ -1,7 +1,15 @@
 // Shared Job Orchestration
 // Platform-agnostic job execution flow using platform adapters.
 
-import { apiFetch, updateJobStatus, getExtensionInstanceId, canClaimNewWork, reportWorkerStatus } from './background.js';
+import {
+  apiFetch,
+  updateJobStatus,
+  getExtensionInstanceId,
+  canClaimNewWork,
+  reportWorkerStatus,
+  waitForFacebookExecutionSettled,
+  waitForExtensionRegistration,
+} from './background.js';
 import { maskExtensionInstanceId } from './maintenance-diagnostics.js';
 import { normalizePublishJob } from './publishing-target.js';
 import type { PublishJob } from './publishing-target.js';
@@ -47,6 +55,13 @@ export function resumePlatformQueue(platform: string): void {
 }
 
 export async function checkPendingJobs(): Promise<void> {
+  // Registration performs the installation-bound TikTok identity refresh.
+  // Never claim a job while that refresh is still racing in the background.
+  const registrationReady = await waitForExtensionRegistration();
+  if (!registrationReady) {
+    console.info('[PostFlow] Skipping pending-job check until extension registration is ready');
+    return;
+  }
   // Check if any platform is enabled
   const enabledPlatforms = Object.entries(PLATFORM_FEATURE_FLAGS)
     .filter(([, enabled]) => enabled)
@@ -62,13 +77,6 @@ export async function checkPendingJobs(): Promise<void> {
     return;
   }
 
-  // Check if any platform queue is paused
-  const allPaused = enabledPlatforms.every((p) => isPlatformQueuePaused(p));
-  if (allPaused) {
-    console.warn('[PostFlow] All platform publishing queues are paused; skipping job check');
-    return;
-  }
-
   if (isProcessingJob) {
     return;
   }
@@ -76,6 +84,29 @@ export async function checkPendingJobs(): Promise<void> {
   isProcessingJob = true;
 
   try {
+    // Owner-triggered retries are allowed to bypass an in-memory platform
+    // pause after the owner has explicitly requeued a never-submitted job.
+    // The API consumes the retry marker atomically when claiming it.
+    const manualRetry = normalizePublishJob(await apiFetch('/api/jobs/next?manualRetry=true'));
+    if (manualRetry) {
+      resumePlatformQueue(manualRetry.platform);
+      console.info('[PostFlow] Executing manually retried job', {
+        jobId: manualRetry.id,
+        platform: manualRetry.platform,
+        targetType: manualRetry.target.type,
+      });
+      await executeJob(manualRetry);
+      return;
+    }
+
+    // A manual retry is checked first so it can clear a platform pause. Only
+    // ordinary background work should be blocked by the paused-queue guard.
+    const allPaused = enabledPlatforms.every((p) => isPlatformQueuePaused(p));
+    if (allPaused) {
+      console.warn('[PostFlow] All platform publishing queues are paused; skipping job check');
+      return;
+    }
+
     const job = normalizePublishJob(await apiFetch('/api/jobs/next'));
     if (!job) {
       console.log('[PostFlow] No pending jobs');
@@ -146,18 +177,48 @@ async function executeJob(job: PublishJob): Promise<void> {
   const accountVerification = await adapter.verifyActiveAccount(job);
   if (!accountVerification.verified) {
     const reason = accountVerification.reason || 'Account verification failed';
-    console.warn(`[PostFlow] Account verification failed for ${platform}:`, reason);
-    
-    // Report platform-specific worker status
-    await reportPlatformWorkerStatus(platform, 'ACCOUNT_MISMATCH', reason);
+    const extensionInstanceId = await getExtensionInstanceId();
+    console.warn(`[PostFlow] Account verification failed for ${platform}:`, {
+      jobId: job.id,
+      reason,
+      extensionInstanceId: maskExtensionInstanceId(extensionInstanceId),
+      platformConnectionId: 'platformConnectionId' in job.target ? job.target.platformConnectionId : null,
+    });
     
     // Pause only this platform's queue
     pausePlatformQueue(platform, reason, 'ACCOUNT_MISMATCH', job.id);
-    
-    await updateJobStatus(job.id, { 
-      status: 'FAILED', 
-      error: reason 
-    });
+    // Persist the job result while the platform connection still satisfies
+    // the normal ownership check. Reporting ACCOUNT_MISMATCH first changes
+    // that connection status and makes this final status update look like a
+    // different installation to the API.
+    try {
+      const statusResult = await updateJobStatus(job.id, {
+        status: 'FAILED',
+        error: reason,
+      });
+      if (!statusResult) {
+        console.warn(`[PostFlow][${platform}] Account-verification failure could not be attached to job`, {
+          jobId: job.id,
+          reason,
+        });
+      }
+    } catch (error) {
+      console.warn(`[PostFlow][${platform}] Could not report account-verification failure`, {
+        jobId: job.id,
+        reason,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    try {
+      // Report platform-specific worker status after the job lease has been
+      // closed; this intentionally moves the connection to ACCOUNT_MISMATCH.
+      await reportPlatformWorkerStatus(platform, 'ACCOUNT_MISMATCH', reason);
+    } catch (error) {
+      console.warn(`[PostFlow][${platform}] Could not report account-mismatch worker status`, {
+        jobId: job.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
     return;
   }
 
@@ -192,11 +253,16 @@ async function executeJob(job: PublishJob): Promise<void> {
   console.log(`[PostFlow] Executing ${platform} job`, { jobId: job.id, targetType: job.target.type });
   
   const result = await adapter.execute(tabId, job);
+  // Profile videos may receive a terminal composer response before Facebook
+  // exposes the canonical reel URL. Keep the shared one-job queue occupied
+  // until that background reconciliation has finished (or its safety timeout
+  // is reached), preventing a scheduled job from overlapping the scan.
+  await waitForFacebookExecutionSettled(job.id);
 
   // Handle result
   if (result.success) {
     // When success is true, status is guaranteed to be PUBLISHED, PENDING_APPROVAL, or UNKNOWN
-    const successStatus = result.status as 'PUBLISHED' | 'PENDING_APPROVAL' | 'UNKNOWN';
+    const successStatus = result.status as 'PUBLISHED' | 'PENDING_APPROVAL' | 'PROCESSING' | 'UNKNOWN';
     await updateJobStatus(job.id, {
       status: 'SUCCESS',
       submissionResult: {
@@ -212,16 +278,28 @@ async function executeJob(job: PublishJob): Promise<void> {
       return;
     }
 
-    // Check if we should pause this platform's queue
+    // Check if we should pause this platform's queue. Defer the API connection
+    // status mutation until after the job result is persisted; otherwise the
+    // ownership check for the final FAILED update sees BLOCKED/CAPTCHA instead
+    // of the connected account that claimed the lease.
     if (result.shouldPauseQueue) {
       pausePlatformQueue(platform, result.reason || 'Platform error', result.detector, job.id);
-      await reportPlatformWorkerStatus(platform, mapFailureToWorkerStatus(result.detector), result.reason);
     }
 
     await updateJobStatus(job.id, {
       status: 'FAILED',
       error: result.reason || 'Publishing failed',
     });
+    if (result.shouldPauseQueue) {
+      try {
+        await reportPlatformWorkerStatus(platform, mapFailureToWorkerStatus(result.detector), result.reason);
+      } catch (error) {
+        console.warn(`[PostFlow][${platform}] Could not report paused worker status`, {
+          jobId: job.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
   }
 }
 

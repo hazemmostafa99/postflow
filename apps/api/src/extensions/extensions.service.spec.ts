@@ -99,6 +99,13 @@ function createHarness(options: HarnessOptions = {}) {
     options.connection === undefined ? connectionDoc() : options.connection;
 
   const extensionModel = {
+    findOneAndUpdate: jest.fn().mockImplementation((_query: unknown, update: { $set: Record<string, unknown>; $unset?: Record<string, unknown> }) => {
+      if (installation) {
+        Object.assign(installation, update.$set);
+        for (const key of Object.keys(update.$unset ?? {})) delete installation[key];
+      }
+      return { exec: jest.fn().mockResolvedValue(installation) };
+    }),
     findOne: jest
       .fn()
       .mockReturnValue({ exec: jest.fn().mockResolvedValue(installation) }),
@@ -216,6 +223,155 @@ function createHarness(options: HarnessOptions = {}) {
 
 const credential = 'cred-secret';
 const credentialHash = hashInstallationCredential(credential);
+
+describe('neutral browser connection actions', () => {
+  it('rejects concurrent lifecycle changes instead of overwriting them', async () => {
+    const { service, installation, extensionModel } = createHarness();
+    extensionModel.findOneAndUpdate.mockReturnValue({ exec: jest.fn().mockResolvedValue(null) });
+    await expect(service.browserConnectionAction('clerk-user-1', String(installation!._id), 'pause'))
+      .rejects.toThrow('Browser connection changed');
+    expect(extensionModel.findOneAndUpdate).toHaveBeenCalledWith(
+      { _id: String(installation!._id), clerkUserId: 'clerk-user-1', status: 'ACTIVE' },
+      expect.any(Object), { returnDocument: 'after' },
+    );
+  });
+  it('ignores a cached popup name on heartbeat after a dashboard rename', async () => {
+    const installation = installationDoc({ displayName: 'Dashboard name', credentialHash });
+    const { service, extensionModel, connectionModel } = createHarness({ installation, connection: null });
+    connectionModel.findOne.mockReturnValue({
+      select: jest.fn().mockReturnThis(), lean: jest.fn().mockReturnThis(), exec: jest.fn().mockResolvedValue(null),
+    } as never);
+    await service.heartbeat('clerk-user-1', 'extension-1', 'Old popup name', credential);
+    expect(extensionModel.updateOne).toHaveBeenCalledWith(
+      { clerkUserId: 'clerk-user-1', extensionInstanceId: 'extension-1' },
+      { $set: { displayName: 'Dashboard name', displayNameKey: 'dashboard name' } },
+    );
+  });
+  it('allows an explicit popup rename without Facebook', async () => {
+    const installation = installationDoc({ displayName: 'Old', credentialHash });
+    const { service, extensionModel, connectionModel } = createHarness({ installation, connection: null });
+    connectionModel.findOne.mockReturnValue({
+      select: jest.fn().mockReturnThis(), lean: jest.fn().mockReturnThis(), exec: jest.fn().mockResolvedValue(null),
+    } as never);
+    await expect(service.rename('clerk-user-1', 'extension-1', credential, 'New')).resolves.toEqual({ displayName: 'New' });
+    expect(extensionModel.updateOne).toHaveBeenCalledWith(
+      { clerkUserId: 'clerk-user-1', extensionInstanceId: 'extension-1' },
+      { $set: { displayName: 'New', displayNameKey: 'new' } },
+    );
+  });
+  it('renames an installation without a Facebook account', async () => {
+    const { service, installation } = createHarness({ connection: null });
+    await expect(service.updateBrowserConnection('clerk-user-1', String(installation!._id), ' Work  Profile '))
+      .resolves.toEqual({ displayName: 'Work Profile' });
+    expect(installation!.displayName).toBe('Work Profile');
+  });
+  it('scopes dashboard mutations to the owner', async () => {
+    const { service, extensionModel } = createHarness({ installation: null });
+    const id = String(new Types.ObjectId());
+    await expect(service.updateBrowserConnection('another-user', id, 'Work')).rejects.toThrow('Browser connection not found');
+    expect(extensionModel.findOne).toHaveBeenCalledWith({ _id: id, clerkUserId: 'another-user' });
+  });
+  it('does not rename a disconnected installation or its former Facebook account', async () => {
+    const installation = installationDoc({ status: ExtensionLifecycleStatus.REVOKED, facebookConnectionId: new Types.ObjectId() });
+    const { service, connectionModel } = createHarness({ installation });
+    await expect(service.updateBrowserConnection('clerk-user-1', String((installation as Record<string, unknown>)._id), 'Old'))
+      .rejects.toThrow('disconnecting or disconnected');
+    expect(connectionModel.findOne).not.toHaveBeenCalled();
+  });
+  it('lists existing bindings read-only with the installation as the connection', async () => {
+    const { service, extensionModel, connectionModel } = createHarness();
+    jest.spyOn(service, 'listInstallations').mockResolvedValue([{ _id: 'installation', status: 'ACTIVE' }] as never);
+    jest.spyOn(service, 'listConnections').mockResolvedValue([]);
+    jest.spyOn(service, 'listArchivedConnections').mockResolvedValue([]);
+    jest.spyOn(service, 'listPlatformConnections').mockResolvedValue([
+      { _id: 'instagram', platform: 'INSTAGRAM', activeExtensionInstallationId: 'installation' },
+    ] as never);
+    const [connection] = await service.listBrowserConnections('clerk-user-1');
+    expect(connection._id).toBe('installation');
+    expect(connection.accounts[1].connectionId).toBe('instagram');
+    expect(extensionModel.create).not.toHaveBeenCalled();
+    expect(extensionModel.updateOne).not.toHaveBeenCalled();
+    expect(connectionModel.updateOne).not.toHaveBeenCalled();
+  });
+  it('pauses and resumes all platform work without requiring Facebook', async () => {
+    const { service, installation, auditModel } = createHarness({ connection: null });
+    const id = String(installation!._id);
+    await expect(service.browserConnectionAction('clerk-user-1', id, 'pause')).resolves.toEqual({ status: 'PAUSED' });
+    await expect(service.browserConnectionAction('clerk-user-1', id, 'resume')).resolves.toEqual({ status: 'ACTIVE' });
+    expect(auditModel.create).toHaveBeenCalledTimes(2);
+  });
+  it('cannot resume an installation during graceful disconnect', async () => {
+    const installation = installationDoc({ status: ExtensionLifecycleStatus.REVOKE_PENDING });
+    const { service } = createHarness({ installation });
+    await expect(service.browserConnectionAction('clerk-user-1', String((installation as Record<string, unknown>)._id), 'resume'))
+      .rejects.toThrow('disconnecting or disconnected');
+  });
+  it('keeps active work running when disconnect is requested', async () => {
+    const { service, installation } = createHarness({ hasActiveClaim: true, connection: null });
+    await expect(service.browserConnectionAction('clerk-user-1', String(installation!._id), 'disconnect'))
+      .resolves.toEqual({ status: 'REVOKE_PENDING' });
+  });
+  it('force disconnect immediately revokes a publishing installation without Facebook', async () => {
+    const { service, installation, extensionModel, connectionModel, auditModel } = createHarness({ hasActiveClaim: true, connection: null });
+    await expect(service.browserConnectionAction('clerk-user-1', String(installation!._id), 'force-disconnect'))
+      .resolves.toEqual({ status: 'REVOKED', archivedAt: null });
+    expect(extensionModel.findOneAndUpdate).toHaveBeenCalledWith(
+      { _id: installation!._id, clerkUserId: 'clerk-user-1', status: 'ACTIVE', archivedAt: null },
+      expect.objectContaining({ $set: expect.objectContaining({ status: 'REVOKED', credentialRevokedAt: expect.any(Date) }), $inc: { credentialVersion: 1 } }),
+      { returnDocument: 'after' },
+    );
+    expect(auditModel.create).toHaveBeenCalledTimes(1);
+    expect(connectionModel.updateOne).not.toHaveBeenCalled();
+    await expect(service.verifyWorkerIdentity('clerk-user-1', 'extension-1', credential)).rejects.toThrow('has been revoked');
+  });
+  it('archives and revokes the installation while retaining platform bindings and jobs', async () => {
+    const { service, installation, extensionModel, connectionModel, auditModel } = createHarness({ connection: null });
+    const result = await service.browserConnectionAction('clerk-user-1', String(installation!._id), 'remove');
+    expect(result).toEqual({ status: 'REVOKED', archivedAt: expect.any(Date) });
+    expect(installation!.archiveReason).toBe('REMOVED');
+    expect(installation!.archivedByClerkUserId).toBe('clerk-user-1');
+    expect(auditModel.create).toHaveBeenCalledTimes(2);
+    expect(extensionModel.deleteOne).not.toHaveBeenCalled();
+    expect(connectionModel.deleteOne).not.toHaveBeenCalled();
+    expect(connectionModel.updateOne).not.toHaveBeenCalled();
+    await expect(service.browserConnectionAction('clerk-user-1', String(installation!._id), 'resume')).rejects.toThrow('disconnecting or disconnected');
+  });
+  it('can force a pending graceful disconnect and then archive once without reissuing credentials', async () => {
+    const installation = installationDoc({ status: ExtensionLifecycleStatus.REVOKE_PENDING });
+    const { service, extensionModel, auditModel } = createHarness({ installation });
+    const id = String((installation as Record<string, unknown>)._id);
+    await service.browserConnectionAction('clerk-user-1', id, 'force-disconnect');
+    await service.browserConnectionAction('clerk-user-1', id, 'remove');
+    expect(extensionModel.findOneAndUpdate.mock.calls[1][1]).not.toHaveProperty('$inc');
+    await service.browserConnectionAction('clerk-user-1', id, 'remove');
+    expect(extensionModel.findOneAndUpdate).toHaveBeenCalledTimes(2);
+    expect(auditModel.create).toHaveBeenCalledTimes(2);
+  });
+  it('cannot force or archive another owner installation', async () => {
+    const { service, extensionModel } = createHarness({ installation: null });
+    const id = String(new Types.ObjectId());
+    for (const action of ['force-disconnect', 'remove']) {
+      await expect(service.browserConnectionAction('another-user', id, action)).rejects.toThrow('Browser connection not found');
+    }
+    expect(extensionModel.findOneAndUpdate).not.toHaveBeenCalled();
+  });
+  it('fails safely when a competing lifecycle mutation wins before revocation', async () => {
+    const { service, installation, extensionModel, auditModel } = createHarness();
+    extensionModel.findOneAndUpdate.mockReturnValue({ exec: jest.fn().mockResolvedValue(null) });
+    await expect(service.browserConnectionAction('clerk-user-1', String(installation!._id), 'remove')).rejects.toThrow('Connection changed');
+    expect(auditModel.create).not.toHaveBeenCalled();
+  });
+  it('does not revoke or archive a Facebook account rebound to another installation', async () => {
+    const facebookId = new Types.ObjectId();
+    const connection = connectionDoc({ _id: facebookId, activeExtensionInstallationId: new Types.ObjectId() });
+    const installation = installationDoc({ facebookConnectionId: facebookId });
+    const { service, connectionModel } = createHarness({ connection, installation });
+    await service.browserConnectionAction('clerk-user-1', String((installation as Record<string, unknown>)._id), 'remove');
+    expect(connectionModel.findOne).not.toHaveBeenCalled();
+    expect(connectionModel.updateOne).not.toHaveBeenCalled();
+    expect((connection as Record<string, unknown>).archivedAt).toBeUndefined();
+  });
+});
 
 describe('ExtensionsService.verifyWorkerIdentity', () => {
   it('rejects requests without a clerk user id', async () => {
@@ -752,6 +908,61 @@ describe('ExtensionsService.updateSession recovery', () => {
 });
 
 describe('ExtensionsService.updatePlatformSession', () => {
+  function evidenceHarness(status = PlatformConnectionStatus.CONNECTED) {
+    const harness = createHarness();
+    const connection = {
+      _id: new Types.ObjectId(), platform: 'INSTAGRAM', externalUsername: 'brand.account',
+      status, workerStatus: PlatformConnectionWorkerStatus.PUBLISHING,
+      sessionDetected: true, lastSeenAt: new Date(),
+      save: jest.fn().mockResolvedValue(undefined),
+    };
+    const model = { findOne: jest.fn(() => ({ exec: jest.fn().mockResolvedValue(connection) })) };
+    const service = new ExtensionsService(harness.extensionModel as never, harness.connectionModel as never, harness.jobModel as never, harness.auditModel as never, model as never);
+    return { connection, service };
+  }
+
+  it('preserves verified publishing state when analytics identity is still loading', async () => {
+    const { connection, service } = evidenceHarness();
+    await service.updatePlatformSession('INSTAGRAM', 'clerk-user-1', 'extension-1', undefined, false, undefined, undefined, { state: 'CHECKING' });
+    expect(connection.status).toBe(PlatformConnectionStatus.CONNECTED);
+    expect(connection.workerStatus).toBe(PlatformConnectionWorkerStatus.PUBLISHING);
+    expect(connection.sessionDetected).toBe(true);
+  });
+
+  it('does not turn legacy negative Instagram booleans into a logout', async () => {
+    const { connection, service } = evidenceHarness();
+    await service.updatePlatformSession('INSTAGRAM', 'clerk-user-1', 'extension-1', undefined, false);
+    expect(connection.status).toBe(PlatformConnectionStatus.CONNECTED);
+  });
+
+  it('expired evidence keeps the installation-bound account connected until a fresh check', async () => {
+    const { connection, service } = evidenceHarness();
+    await service.updatePlatformSession('INSTAGRAM', 'clerk-user-1', 'extension-1', undefined, false, undefined, undefined, { state: 'STALE' });
+    expect(connection.status).toBe(PlatformConnectionStatus.CONNECTED);
+    expect(connection.sessionDetected).toBe(true);
+    expect(connection.sessionEvidenceState).toBe('STALE');
+  });
+
+  it('explicit login evidence revokes verification', async () => {
+    const { connection, service } = evidenceHarness();
+    await service.updatePlatformSession('INSTAGRAM', 'clerk-user-1', 'extension-1', undefined, false, undefined, undefined, { state: 'LOGIN_REQUIRED' });
+    expect(connection.status).toBe(PlatformConnectionStatus.LOGIN_REQUIRED);
+    expect(connection.sessionDetected).toBe(false);
+  });
+
+  it('checking/stale evidence never restores a login-required or mismatched connection', async () => {
+    for (const status of [PlatformConnectionStatus.LOGIN_REQUIRED, PlatformConnectionStatus.ACCOUNT_MISMATCH]) {
+      const { connection, service } = evidenceHarness(status);
+      await service.updatePlatformSession('INSTAGRAM', 'clerk-user-1', 'extension-1', undefined, false, undefined, undefined, { state: 'STALE' });
+      expect(connection.status).toBe(status);
+    }
+  });
+
+  it('rejects incomplete verified evidence', async () => {
+    const { service } = evidenceHarness();
+    await expect(service.updatePlatformSession('INSTAGRAM', 'clerk-user-1', 'extension-1', undefined, false, undefined, undefined, { state: 'VERIFIED' })).rejects.toThrow('requires an account identity');
+  });
+
   it('auto-creates a first-time Instagram connection from the detected session', async () => {
     const harness = createHarness();
     const createdConnection = {
@@ -806,6 +1017,109 @@ describe('ExtensionsService.updatePlatformSession', () => {
     expect(result).toEqual(expect.objectContaining({
       platform: 'INSTAGRAM',
       externalUsername: 'brand.account',
+      status: PlatformConnectionStatus.CONNECTED,
+    }));
+    expect(harness.installation.save).toHaveBeenCalled();
+  });
+
+  it('auto-creates a first-time TikTok connection from the detected session', async () => {
+    const harness = createHarness();
+    const createdConnection = {
+      _id: new Types.ObjectId(),
+      clerkUserId: 'clerk-user-1',
+      platform: 'TIKTOK',
+      activeExtensionInstallationId: harness.installation._id,
+      displayName: 'TikTok @creator.account',
+      displayNameKey: 'tiktok @creator.account',
+      externalUsername: 'creator.account',
+      detectedExternalUsername: 'creator.account',
+      status: PlatformConnectionStatus.CONNECTED,
+      workerStatus: PlatformConnectionWorkerStatus.IDLE,
+      sessionDetected: true,
+      lastSeenAt: new Date(),
+    };
+    const platformConnectionModel = {
+      findOne: jest
+        .fn()
+        .mockReturnValueOnce({ exec: jest.fn().mockResolvedValue(null) })
+        .mockReturnValueOnce({ exec: jest.fn().mockResolvedValue(null) }),
+      create: jest.fn().mockResolvedValue(createdConnection),
+    };
+    const service = new ExtensionsService(
+      harness.extensionModel as never,
+      harness.connectionModel as never,
+      harness.jobModel as never,
+      harness.auditModel as never,
+      platformConnectionModel as never,
+    );
+
+    const result = await service.updatePlatformSession(
+      'TIKTOK',
+      'clerk-user-1',
+      'extension-1',
+      undefined,
+      true,
+      undefined,
+      '@Creator.Account',
+    );
+
+    expect(platformConnectionModel.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        platform: 'TIKTOK',
+        displayName: 'TikTok @creator.account',
+        externalUsername: 'creator.account',
+        status: PlatformConnectionStatus.CONNECTED,
+      }),
+    );
+    expect(result).toEqual(expect.objectContaining({
+      platform: 'TIKTOK',
+      externalUsername: 'creator.account',
+    }));
+  });
+
+  it('recovers a concurrent TikTok auto-connect instead of returning a duplicate-key 500', async () => {
+    const harness = createHarness();
+    const winner = {
+      _id: new Types.ObjectId(),
+      clerkUserId: 'clerk-user-1',
+      platform: 'TIKTOK',
+      activeExtensionInstallationId: harness.installation._id,
+      displayName: 'TikTok @creator.account',
+      externalUsername: 'creator.account',
+      status: PlatformConnectionStatus.CONNECTED,
+      workerStatus: PlatformConnectionWorkerStatus.IDLE,
+      sessionDetected: true,
+      lastSeenAt: new Date(),
+    };
+    const platformConnectionModel = {
+      findOne: jest
+        .fn()
+        .mockReturnValueOnce({ exec: jest.fn().mockResolvedValue(null) })
+        .mockReturnValueOnce({ exec: jest.fn().mockResolvedValue(null) })
+        .mockReturnValueOnce({ exec: jest.fn().mockResolvedValue(winner) }),
+      create: jest.fn().mockRejectedValue({ code: 11000 }),
+    };
+    const service = new ExtensionsService(
+      harness.extensionModel as never,
+      harness.connectionModel as never,
+      harness.jobModel as never,
+      harness.auditModel as never,
+      platformConnectionModel as never,
+    );
+
+    const result = await service.updatePlatformSession(
+      'TIKTOK',
+      'clerk-user-1',
+      'extension-1',
+      undefined,
+      true,
+      undefined,
+      '@Creator.Account',
+    );
+
+    expect(result).toEqual(expect.objectContaining({
+      platform: 'TIKTOK',
+      externalUsername: 'creator.account',
       status: PlatformConnectionStatus.CONNECTED,
     }));
     expect(harness.installation.save).toHaveBeenCalled();
@@ -948,6 +1262,44 @@ describe('ExtensionsService.createPlatformConnection', () => {
       platform: 'INSTAGRAM',
       externalUsername: 'brand.account',
     }));
+  });
+
+  it('creates an explicit TikTok recovery binding', async () => {
+    const harness = createHarness();
+    const createdConnection = {
+      _id: new Types.ObjectId(),
+      platform: 'TIKTOK',
+      externalUsername: 'creator.account',
+      status: PlatformConnectionStatus.PENDING,
+      workerStatus: PlatformConnectionWorkerStatus.OFFLINE,
+      sessionDetected: false,
+      lastSeenAt: new Date(),
+    };
+    const platformConnectionModel = {
+      findOne: jest.fn(() => ({ exec: jest.fn().mockResolvedValue(null) })),
+      create: jest.fn().mockResolvedValue(createdConnection),
+    };
+    const service = new ExtensionsService(
+      harness.extensionModel as never,
+      harness.connectionModel as never,
+      harness.jobModel as never,
+      harness.auditModel as never,
+      platformConnectionModel as never,
+    );
+
+    await service.createPlatformConnection('clerk-user-1', {
+      platform: 'TIKTOK',
+      installationId: String(harness.installation._id),
+      displayName: 'Creator TikTok',
+      externalUsername: '@creator.account',
+    });
+
+    expect(platformConnectionModel.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        platform: 'TIKTOK',
+        externalUsername: 'creator.account',
+      }),
+    );
   });
 });
 

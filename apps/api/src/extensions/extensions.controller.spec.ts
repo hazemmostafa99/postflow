@@ -32,6 +32,9 @@ describe('ExtensionsController', () => {
     updatePlatformConnectionWorkerStatus: jest.fn(),
     updatePlatformSession: jest.fn(),
     listInstallations: jest.fn(),
+    listBrowserConnections: jest.fn(),
+    updateBrowserConnection: jest.fn(),
+    browserConnectionAction: jest.fn(),
     createPlatformConnection: jest.fn(),
   };
 
@@ -51,6 +54,9 @@ describe('ExtensionsController', () => {
 
   it('requires a clerk user id for dashboard routes', async () => {
     const controller = createController();
+    await expect(controller.browserConnections(undefined)).rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(controller.renameBrowserConnection('', 'installation-1', { name: 'Work' })).rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(controller.browserConnectionAction('', 'installation-1', 'pause')).rejects.toBeInstanceOf(UnauthorizedException);
     await expect(controller.connections(undefined)).rejects.toBeInstanceOf(
       UnauthorizedException,
     );
@@ -153,6 +159,40 @@ describe('ExtensionsController', () => {
       true,
       undefined,
       'brand.account',
+    );
+  });
+
+  it('forwards TikTok session identity to the generic connection service', async () => {
+    const controller = createController();
+    const internal = controller as unknown as { extensionsService: Service };
+
+    await controller.platformSession('user-1', 'extension-1', 'credential-1', {
+      platform: 'TIKTOK',
+      sessionDetected: true,
+      externalUsername: 'creator.account',
+    });
+
+    expect(internal.extensionsService.updatePlatformSession).toHaveBeenCalledWith(
+      'TIKTOK',
+      'user-1',
+      'extension-1',
+      'credential-1',
+      true,
+      undefined,
+      'creator.account',
+    );
+  });
+
+  it('forwards explicit Instagram evidence state and source', async () => {
+    const controller = createController();
+    const internal = controller as unknown as { extensionsService: Service };
+    await controller.platformSession('user-1', 'extension-1', 'credential-1', {
+      platform: 'INSTAGRAM', sessionDetected: false,
+      evidenceState: 'CHECKING', evidenceSource: 'none',
+    });
+    expect(internal.extensionsService.updatePlatformSession).toHaveBeenCalledWith(
+      'INSTAGRAM', 'user-1', 'extension-1', 'credential-1', false,
+      undefined, undefined, { state: 'CHECKING', source: 'none' },
     );
   });
 

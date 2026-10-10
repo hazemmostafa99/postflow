@@ -27,6 +27,7 @@ export function RefreshPostEngagementButton({ postId }: { postId: string }) {
         setMessage(detail.error ?? "Could not queue analytics refresh.");
         return;
       }
+      window.dispatchEvent(new CustomEvent("postflow:refresh-analytics"));
       setMessage("Refresh requested for the owning extension.");
     } catch {
       setMessage("Could not queue analytics refresh.");
@@ -65,6 +66,9 @@ export function RefreshAllPostEngagementButton({ jobIds }: { jobIds: string[] })
       }));
       const queued = results.filter((result) => result.ok).length;
       const firstError = results.find((result) => !result.ok)?.error;
+      if (queued > 0) {
+        window.dispatchEvent(new CustomEvent("postflow:refresh-analytics"));
+      }
       setMessage(queued
         ? `${queued} analytics refresh${queued === 1 ? "" : "es"} queued for the owning extension${firstError ? "; some could not be queued" : "."}`
         : firstError ?? "Could not queue analytics refresh.");

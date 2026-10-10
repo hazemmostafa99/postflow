@@ -18,7 +18,7 @@ function extractInstagramPermalinks(values: unknown[]): string[] {
   return [...new Set(
     values
       .flatMap((value) => String(value).replace(/\\/g, '').match(
-        /(?:https?:\/\/(?:www\.)?instagram\.com)?\/(?:[^/]+\/)?(?:p|reel)\/[A-Za-z0-9_-]+\/?/gi,
+        /(?:https?:\/\/(?:www\.)?instagram\.com)?\/(?:[^/]+\/)?(?:p|reels?)\/[A-Za-z0-9_-]+\/?/gi,
       ) ?? [])
       .map((value) => normalizeInstagramPostUrl(new URL(value, 'https://www.instagram.com/').toString()))
       .filter((value): value is string => Boolean(value)),
@@ -35,7 +35,7 @@ export async function probeInstagramPostUrls(tabId: number): Promise<InstagramPo
           .filter((href): href is string => Boolean(href));
         const markup = document.documentElement?.outerHTML ?? '';
         const markupUrls = markup.match(
-          /(?:https?:\/\/(?:www\.)?instagram\.com)?\/(?:[^/]+\/)?(?:p|reel)\/[A-Za-z0-9_-]+\/?/gi,
+          /(?:https?:\/\/(?:www\.)?instagram\.com)?\/(?:[^/]+\/)?(?:p|reels?)\/[A-Za-z0-9_-]+\/?/gi,
         ) ?? [];
         return [...hrefs, ...markupUrls];
       },

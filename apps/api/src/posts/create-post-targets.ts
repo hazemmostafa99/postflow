@@ -10,7 +10,8 @@ export type CreatePostTarget =
       facebookConnectionId: string;
     }
   | {
-      type: PublishingTargetType.INSTAGRAM_FEED | PublishingTargetType.INSTAGRAM_REEL;
+      type: PublishingTargetType.INSTAGRAM_FEED | PublishingTargetType.INSTAGRAM_REEL |
+        PublishingTargetType.TIKTOK_VIDEO | PublishingTargetType.TIKTOK_PHOTO;
       platformConnectionId: string;
     };
 
@@ -25,6 +26,8 @@ export type VerifiablePlatformConnection = {
   platform: string;
   status: string;
   sessionDetected: boolean;
+  externalAccountId?: string;
+  detectedExternalAccountId?: string;
   externalUsername?: string;
   detectedExternalUsername?: string;
 };
@@ -76,10 +79,12 @@ export function normalizeCreatePostTargets(
 
     if (
       candidate.type === PublishingTargetType.INSTAGRAM_FEED ||
-      candidate.type === PublishingTargetType.INSTAGRAM_REEL
+      candidate.type === PublishingTargetType.INSTAGRAM_REEL ||
+      candidate.type === PublishingTargetType.TIKTOK_VIDEO ||
+      candidate.type === PublishingTargetType.TIKTOK_PHOTO
     ) {
       if (candidate.groupId !== undefined || candidate.facebookConnectionId !== undefined) {
-        throw new Error('Instagram targets must not include Facebook destinations');
+        throw new Error('Platform targets must not include Facebook destinations');
       }
       normalizedTargets.push({
         type: candidate.type,
@@ -138,14 +143,29 @@ export function isVerifiedProfileConnection(
 export function isVerifiedInstagramConnection(
   connection: VerifiablePlatformConnection,
 ): boolean {
-  return Boolean(
-    connection.platform === 'INSTAGRAM' &&
-    connection.status === 'CONNECTED' &&
-    connection.sessionDetected &&
+  return isVerifiedPlatformConnection(connection, 'INSTAGRAM');
+}
+
+export function isVerifiedPlatformConnection(
+  connection: VerifiablePlatformConnection,
+  platform: 'INSTAGRAM' | 'TIKTOK',
+): boolean {
+  const idVerified = Boolean(
+    connection.externalAccountId &&
+    connection.detectedExternalAccountId &&
+    connection.externalAccountId === connection.detectedExternalAccountId,
+  );
+  const usernameVerified = Boolean(
     connection.externalUsername &&
     connection.detectedExternalUsername &&
     connection.externalUsername.toLowerCase() ===
       connection.detectedExternalUsername.toLowerCase(),
+  );
+  return Boolean(
+    connection.platform === platform &&
+    connection.status === 'CONNECTED' &&
+    connection.sessionDetected &&
+    (platform === 'INSTAGRAM' ? idVerified || usernameVerified : usernameVerified),
   );
 }
 

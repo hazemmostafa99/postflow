@@ -9,6 +9,7 @@ import {
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { ClientSession, Model, Types } from 'mongoose';
+import { groupBrowserConnections } from './browser-connections';
 import {
   ExtensionInstallation,
   ExtensionInstallationDocument,
@@ -62,7 +63,7 @@ export type RecoveryCandidate = {
  * The explicit outcome returned to the extension after registration. A revoked
  * or removed installation is never reactivated by ordinary worker traffic.
  */
-export type RegistrationOutcome =
+export type RegistrationOutcome = (
   | { status: 'ACTIVE'; connectionId: string | null; credentialIssued?: string }
   | { status: 'PAUSED'; connectionId: string | null; credentialIssued?: string }
   | { status: 'REVOKE_PENDING'; connectionId: string | null }
@@ -76,7 +77,7 @@ export type RegistrationOutcome =
       status: 'RECOVERY_AVAILABLE';
       candidates: RecoveryCandidate[];
       credentialIssued?: string;
-    };
+    }) & { installationId?: string; connectionDisplayName?: string | null };
 
 export type ConnectionConnectivity = {
   isOnline: boolean;
@@ -227,6 +228,12 @@ export class ExtensionsService {
     return normalizedInstanceId
       ? { clerkUserId, extensionInstanceId: normalizedInstanceId }
       : { clerkUserId };
+  }
+
+  private async installationMetadata(installation: ExtensionInstallationDocument) {
+    const current = await this.extensionModel.findOne({ _id: installation._id, clerkUserId: installation.clerkUserId }).exec();
+    // Do not turn the UI's unnamed fallback into a persisted name on heartbeat.
+    return { installationId: String(installation._id), connectionDisplayName: current?.displayName || null };
   }
 
   private getConnectionFilter(
@@ -433,6 +440,112 @@ export class ExtensionsService {
       .exec();
   }
 
+  async listBrowserConnections(clerkUserId: string) {
+    const [installations, facebook, archivedFacebook, platforms] = await Promise.all([
+      this.listInstallations(clerkUserId),
+      this.listConnections(clerkUserId),
+      this.listArchivedConnections(clerkUserId),
+      this.listPlatformConnections(clerkUserId),
+    ]);
+    return groupBrowserConnections(installations, [...facebook, ...archivedFacebook], platforms, true);
+  }
+
+  async updateBrowserConnection(clerkUserId: string, installationId: string, name: unknown) {
+    if (typeof name !== 'string' || !normalizeExtensionName(name) || normalizeExtensionName(name).length > 60) {
+      throw new BadRequestException('Enter a connection name between 1 and 60 characters.');
+    }
+    if (!Types.ObjectId.isValid(installationId)) throw new BadRequestException('Invalid installation id.');
+    const installation = await this.extensionModel.findOne({ _id: installationId, clerkUserId }).exec();
+    if (!installation) throw new NotFoundException('Browser connection not found.');
+    if (installation.archivedAt || [ExtensionLifecycleStatus.REVOKED, ExtensionLifecycleStatus.REVOKE_PENDING].includes(installation.status)) {
+      throw new ConflictException('This connection is disconnecting or disconnected.');
+    }
+    // Keep the legacy durable recovery label synchronized when Facebook is bound.
+    if (installation.facebookConnectionId) {
+      await this.renameConnection(clerkUserId, String(installation.facebookConnectionId), name);
+    }
+    installation.displayName = normalizeExtensionName(name);
+    installation.displayNameKey = normalizeExtensionNameKey(name);
+    await installation.save();
+    return { displayName: installation.displayName };
+  }
+
+  async browserConnectionAction(clerkUserId: string, installationId: string, action: string) {
+    if (!['pause', 'resume', 'disconnect', 'force-disconnect', 'remove'].includes(action)) throw new BadRequestException('Invalid browser action.');
+    if (!Types.ObjectId.isValid(installationId)) throw new BadRequestException('Invalid installation id.');
+    const installation = await this.extensionModel.findOne({ _id: installationId, clerkUserId }).exec();
+    if (!installation) throw new NotFoundException('Browser connection not found.');
+    if (action === 'force-disconnect' || action === 'remove') {
+      return this.revokeBrowserConnection(clerkUserId, installation, action === 'remove');
+    }
+    if (installation.archivedAt || installation.status === ExtensionLifecycleStatus.REVOKED || installation.status === ExtensionLifecycleStatus.REVOKE_PENDING) {
+      throw new ConflictException('This browser connection is disconnecting or disconnected.');
+    }
+    const previous = installation.status;
+    const nextStatus = action === 'pause' ? ExtensionLifecycleStatus.PAUSED : action === 'resume'
+      ? ExtensionLifecycleStatus.ACTIVE : ExtensionLifecycleStatus.REVOKE_PENDING;
+    // A stale Pause/Resume must never undo a disconnect from another dashboard.
+    const updated = await this.extensionModel.findOneAndUpdate({
+      _id: installationId, clerkUserId, status: previous,
+    }, {
+      $set: {
+        status: nextStatus, statusChangedAt: new Date(), statusChangedByClerkUserId: clerkUserId,
+        ...(action === 'disconnect' ? { statusReason: ExtensionRevocationReason.USER_DISCONNECTED } : {}),
+      },
+      ...(action !== 'disconnect' ? { $unset: { statusReason: 1 } } : {}),
+    }, { returnDocument: 'after' }).exec();
+    if (!updated) throw new ConflictException('Browser connection changed. Refresh and try again.');
+    await this.recordAudit(action === 'pause' ? ExtensionLifecycleAuditEventName.INSTALLATION_PAUSED
+      : action === 'resume' ? ExtensionLifecycleAuditEventName.INSTALLATION_RESUMED : ExtensionLifecycleAuditEventName.DISCONNECT_REQUESTED, {
+      clerkUserId, installation: updated, connectionId: updated.facebookConnectionId,
+      actor: ExtensionLifecycleActor.DASHBOARD, previousLifecycle: previous, nextLifecycle: updated.status,
+    });
+    if (action === 'disconnect') await this.maybeFinalizeRevocation(updated);
+    return { status: updated.status };
+  }
+
+  /** Atomically revoke this installation, never a Facebook account's newer binding. */
+  private async revokeBrowserConnection(
+    clerkUserId: string,
+    installation: ExtensionInstallationDocument,
+    archive: boolean,
+  ) {
+    const previous = installation.status;
+    const revoke = previous !== ExtensionLifecycleStatus.REVOKED;
+    const archiveNow = archive && !installation.archivedAt;
+    if (!revoke && !archiveNow) return { status: installation.status, archivedAt: installation.archivedAt ?? null };
+    const now = new Date();
+    const reason = archive ? ExtensionRevocationReason.REMOVED : ExtensionRevocationReason.USER_DISCONNECTED;
+    const updated = await this.extensionModel.findOneAndUpdate({
+      _id: installation._id, clerkUserId, status: previous,
+      archivedAt: installation.archivedAt ?? null,
+    }, {
+      $set: {
+        ...(revoke ? {
+          status: ExtensionLifecycleStatus.REVOKED, statusChangedAt: now,
+          statusChangedByClerkUserId: clerkUserId, statusReason: reason,
+          revokedAt: now, revokedByClerkUserId: clerkUserId, revocationReason: reason,
+          credentialRevokedAt: now,
+        } : {}),
+        ...(archiveNow ? { archivedAt: now, archivedByClerkUserId: clerkUserId, archiveReason: reason } : {}),
+      },
+      ...(revoke ? { $inc: { credentialVersion: 1 } } : {}),
+    }, { returnDocument: 'after' }).exec();
+    if (!updated) throw new ConflictException('Connection changed. Refresh and try again.');
+    if (revoke) await this.recordAudit(ExtensionLifecycleAuditEventName.INSTALLATION_REVOKED, {
+      clerkUserId, installation: updated, connectionId: updated.facebookConnectionId,
+      actor: ExtensionLifecycleActor.DASHBOARD, previousLifecycle: previous,
+      nextLifecycle: ExtensionLifecycleStatus.REVOKED, reason,
+    });
+    if (archiveNow) await this.recordAudit(ExtensionLifecycleAuditEventName.CONNECTION_ARCHIVED, {
+      clerkUserId, installation: updated, connectionId: updated.facebookConnectionId,
+      actor: ExtensionLifecycleActor.DASHBOARD, reason,
+    });
+    // Keep account FKs as historical evidence. Worker identity checks revoke
+    // access across every platform; jobs/history must not be deleted or rebound.
+    return { status: updated.status, archivedAt: updated.archivedAt ?? null };
+  }
+
   async listInstallations(clerkUserId: string) {
     const installations = await this.extensionModel
       .find({ clerkUserId })
@@ -441,6 +554,11 @@ export class ExtensionsService {
       .exec();
     return (installations as unknown as Array<Record<string, unknown>>).map((installation) => ({
       _id: String(installation._id),
+      displayName: installation.displayName ?? null,
+      archivedAt: installation.archivedAt ?? null,
+      archivedByClerkUserId: installation.archivedByClerkUserId ?? null,
+      archiveReason: installation.archiveReason ?? null,
+      facebookConnectionId: installation.facebookConnectionId ?? null,
       extensionInstanceId: installation.extensionInstanceId ?? null,
       status: installation.status ?? null,
       lastHeartbeat: installation.lastHeartbeat ?? null,
@@ -450,7 +568,7 @@ export class ExtensionsService {
 
   /**
    * Manual/recovery binding for a new platform connection. Normal first-time
-   * Instagram setup is handled by the verified session report below.
+   * Instagram/TikTok setup is handled by the verified session report below.
    */
   async createPlatformConnection(
     clerkUserId: string,
@@ -458,17 +576,20 @@ export class ExtensionsService {
       platform?: 'INSTAGRAM' | 'TIKTOK';
       installationId?: string;
       displayName?: string;
+      externalAccountId?: string;
       externalUsername?: string;
     },
   ) {
     if (!this.platformConnectionModel) {
       throw new NotFoundException('Platform connections are not enabled');
     }
-    if (options.platform !== 'INSTAGRAM') {
+    if (!options.platform || !['INSTAGRAM', 'TIKTOK'].includes(options.platform)) {
       throw new BadRequestException(
-        'Only Instagram connections can be created in the current phase.',
+        'Only Instagram and TikTok connections are supported.',
       );
     }
+    const platform = options.platform;
+    const platformName = platform === 'INSTAGRAM' ? 'Instagram' : 'TikTok';
     if (!options.installationId || !Types.ObjectId.isValid(options.installationId)) {
       throw new BadRequestException('A valid extension installation is required.');
     }
@@ -491,45 +612,49 @@ export class ExtensionsService {
         'A connection name between 1 and 60 characters is required.',
       );
     }
+    const externalAccountId = options.externalAccountId?.trim() || undefined;
+    if (platform === 'INSTAGRAM' && externalAccountId && !/^\d+$/.test(externalAccountId)) {
+      throw new BadRequestException('A valid Instagram account ID is required.');
+    }
     const externalUsername = normalizePlatformUsername(options.externalUsername);
-    if (!externalUsername) {
-      throw new BadRequestException('A valid Instagram username is required.');
+    if (!externalAccountId && !externalUsername) {
+      throw new BadRequestException(`A valid ${platformName} account identity is required.`);
     }
 
     const activeBinding = await this.platformConnectionModel
       .findOne({
         clerkUserId,
-        platform: 'INSTAGRAM' as any,
+        platform: platform as any,
         activeExtensionInstallationId: installation._id,
         archivedAt: { $exists: false },
       })
       .exec();
     if (activeBinding) {
       throw new ConflictException(
-        'This extension installation already has an Instagram connection.',
+        `This extension installation already has a ${platformName} connection.`,
       );
     }
     const duplicateAccount = await this.platformConnectionModel
       .findOne({
         clerkUserId,
-        platform: 'INSTAGRAM' as any,
-        externalUsername,
+        platform: platform as any,
+        ...(externalAccountId ? { externalAccountId } : { externalUsername }),
         archivedAt: { $exists: false },
       })
       .exec();
     if (duplicateAccount) {
       throw new ConflictException(
-        'This Instagram account is already connected to PostFlow.',
+        `This ${platformName} account is already connected to PostFlow.`,
       );
     }
 
     const created = (await this.platformConnectionModel.create({
       clerkUserId,
-      platform: 'INSTAGRAM' as any,
+      platform: platform as any,
       activeExtensionInstallationId: installation._id,
       displayName,
       displayNameKey: normalizeExtensionNameKey(displayName),
-      externalUsername,
+      ...(externalAccountId ? { externalAccountId } : { externalUsername }),
       status: PlatformConnectionStatus.PENDING,
       workerStatus: PlatformConnectionWorkerStatus.OFFLINE,
       sessionDetected: false,
@@ -708,12 +833,13 @@ export class ExtensionsService {
     if (installation.status === ExtensionLifecycleStatus.PAUSED) {
       return {
         status: 'PAUSED',
+        ...(await this.installationMetadata(installation)),
         connectionId,
         ...(credentialIssued ? { credentialIssued } : {}),
       };
     }
     if (installation.status === ExtensionLifecycleStatus.REVOKE_PENDING) {
-      return { status: 'REVOKE_PENDING', connectionId };
+      return { status: 'REVOKE_PENDING', connectionId, ...(await this.installationMetadata(installation)) };
     }
 
     // An unbound installation whose Facebook identity was already verified
@@ -734,6 +860,7 @@ export class ExtensionsService {
       if (candidates.length > 0) {
         return {
           status: 'RECOVERY_AVAILABLE',
+          ...(await this.installationMetadata(installation)),
           candidates,
           ...(credentialIssued ? { credentialIssued } : {}),
         };
@@ -742,6 +869,7 @@ export class ExtensionsService {
 
     return {
       status: 'ACTIVE',
+      ...(await this.installationMetadata(installation)),
       connectionId,
       ...(credentialIssued ? { credentialIssued } : {}),
     };
@@ -772,8 +900,7 @@ export class ExtensionsService {
       credentialIssuedAt: now,
     });
 
-    // Validates the name (type/length) without requiring a connection; the
-    // name is applied to the connection once one exists.
+    // Store the shared name on the installation, without requiring Facebook.
     await this.updateConnectionName(
       clerkUserId,
       extensionInstanceId,
@@ -793,6 +920,7 @@ export class ExtensionsService {
 
     return {
       status: 'NEW_INSTALLATION',
+      ...(await this.installationMetadata(installation)),
       connectionId: null,
       credentialIssued: credential,
     };
@@ -913,6 +1041,7 @@ export class ExtensionsService {
 
     return {
       status: installation.status,
+      ...(await this.installationMetadata(installation)),
       connectionId: installation.facebookConnectionId
         ? String(installation.facebookConnectionId)
         : null,
@@ -1014,10 +1143,10 @@ export class ExtensionsService {
   }
 
   /**
-   * Update one platform's detected session identity. Instagram's first
+   * Update one platform's detected session identity. A platform's first
    * verified session follows the same hands-off flow as Facebook: when this
    * installation has no connection yet, create a new connection from the
-   * detected username. Existing connections are never stolen from another
+   * detected platform account identity. Existing connections are never stolen from another
    * installation; those still require an explicit recovery action.
    */
   async updatePlatformSession(
@@ -1028,10 +1157,18 @@ export class ExtensionsService {
     sessionDetected?: boolean,
     detectedExternalAccountId?: string,
     detectedExternalUsername?: string,
+    evidence?: { state: 'VERIFIED' | 'CHECKING' | 'LOGIN_REQUIRED' | 'STALE'; source?: string },
   ) {
     if (!['FACEBOOK', 'INSTAGRAM', 'TIKTOK'].includes(platform)) {
       throw new BadRequestException('Invalid publishing platform');
     }
+    if (evidence && (platform !== 'INSTAGRAM' || !['VERIFIED', 'CHECKING', 'LOGIN_REQUIRED', 'STALE'].includes(evidence.state))) {
+      throw new BadRequestException('Invalid platform session evidence');
+    }
+    if (evidence?.state === 'VERIFIED' && (!sessionDetected || (!detectedExternalAccountId?.trim() && !detectedExternalUsername?.trim()))) {
+      throw new BadRequestException('Verified Instagram evidence requires an account identity');
+    }
+    if (evidence?.state === 'LOGIN_REQUIRED') sessionDetected = false;
     if (!this.platformConnectionModel) {
       throw new NotFoundException('Platform connections are not enabled');
     }
@@ -1050,32 +1187,59 @@ export class ExtensionsService {
       .exec()) as PlatformConnectionDocument | null;
 
     const normalizedAccountId = detectedExternalAccountId?.trim() || undefined;
+    if (platform === 'INSTAGRAM' && normalizedAccountId && !/^\d+$/.test(normalizedAccountId)) {
+      throw new BadRequestException('Invalid Instagram account ID');
+    }
     const normalizedUsername = normalizePlatformUsername(detectedExternalUsername);
+    // Loading/unknown is not a logout. Legacy Instagram false reports also
+    // remain non-destructive until the worker sends explicit login evidence.
+    const checking = platform === 'INSTAGRAM' && (evidence?.state === 'CHECKING' || (!evidence && !sessionDetected));
+    if (checking || evidence?.state === 'STALE') {
+      if (!platformConnection) return null;
+      platformConnection.sessionEvidenceState = evidence?.state ?? 'CHECKING';
+      // CHECKING/STALE means the document is unavailable or the cached proof
+      // expired. It is not logout evidence. Keep the installation-bound
+      // account connected until the page explicitly reports LOGIN_REQUIRED or
+      // ACCOUNT_MISMATCH, then refresh it before publishing.
+      platformConnection.lastSeenAt = new Date();
+      await platformConnection.save();
+      return sanitizePlatformConnection(platformConnection);
+    }
     this.logger.log(
-      `[${platform}] session report: detected=${Boolean(sessionDetected)} username=${normalizedUsername ?? 'none'} installation=${maskExtensionInstanceId(installation.extensionInstanceId)}`,
+      `[${platform}] session report: detected=${Boolean(sessionDetected)} accountId=${normalizedAccountId ?? 'none'} installation=${maskExtensionInstanceId(installation.extensionInstanceId)}`,
     );
 
     if (!platformConnection) {
-      return this.autoConnectPlatformSession(
-        clerkUserId,
-        platform,
-        installation,
-        Boolean(sessionDetected),
-        normalizedAccountId,
-        normalizedUsername,
-      );
+      try {
+        return await this.autoConnectPlatformSession(
+          clerkUserId,
+          platform,
+          installation,
+          Boolean(sessionDetected),
+          normalizedAccountId,
+          normalizedUsername,
+        );
+      } catch (error) {
+        // Keep the worker response actionable. A Mongo/index failure here used
+        // to surface as an opaque HTTP 500, which made a valid TikTok session
+        // look like a logout in the extension.
+        this.logger.error(
+          `[${platform}] automatic session binding failed for installation ${maskExtensionInstanceId(installation.extensionInstanceId)}`,
+          error instanceof Error ? error.stack : String(error),
+        );
+        throw error;
+      }
     }
 
     const expectedAccountId = platformConnection.externalAccountId?.trim();
     const expectedUsername = platformConnection.externalUsername?.trim();
     const identityMismatch = Boolean(
-      sessionDetected &&
-        ((expectedAccountId &&
+      sessionDetected && (
+        Boolean(expectedAccountId &&
           (!normalizedAccountId || expectedAccountId !== normalizedAccountId)) ||
-          (!expectedAccountId &&
-            expectedUsername &&
-            (!normalizedUsername ||
-              expectedUsername.toLowerCase() !== normalizedUsername.toLowerCase()))),
+        Boolean(!expectedAccountId && expectedUsername && !normalizedAccountId &&
+          (!normalizedUsername || expectedUsername.toLowerCase() !== normalizedUsername.toLowerCase()))
+      ),
     );
 
     const persistentStatuses = new Set([
@@ -1086,6 +1250,11 @@ export class ExtensionsService {
       PlatformConnectionWorkerStatus.MANUAL_INTERVENTION_REQUIRED,
     ]);
     platformConnection.sessionDetected = Boolean(sessionDetected);
+    if (platform === 'INSTAGRAM') {
+      platformConnection.sessionEvidenceState = evidence?.state ?? (sessionDetected ? 'VERIFIED' : 'LOGIN_REQUIRED');
+      platformConnection.sessionEvidenceSource = evidence?.source;
+      if (sessionDetected) platformConnection.sessionVerifiedAt = new Date();
+    }
     platformConnection.status = !sessionDetected
       ? PlatformConnectionStatus.LOGIN_REQUIRED
       : identityMismatch
@@ -1104,7 +1273,12 @@ export class ExtensionsService {
     if (normalizedAccountId) {
       platformConnection.detectedExternalAccountId = normalizedAccountId;
     }
-    if (normalizedUsername) {
+    // Instagram identity is intentionally ID-only. Do not persist or refresh
+    // a username when the stable ds_user_id is available.
+    if (platform === 'INSTAGRAM' && normalizedAccountId) {
+      platformConnection.externalUsername = undefined;
+      platformConnection.detectedExternalUsername = undefined;
+    } else if (normalizedUsername) {
       platformConnection.detectedExternalUsername = normalizedUsername;
     }
     platformConnection.lastSeenAt = new Date();
@@ -1123,9 +1297,9 @@ export class ExtensionsService {
   ): Promise<Record<string, unknown> | null> {
     installation.lastHeartbeat = new Date();
 
-    if (!sessionDetected || !externalUsername) {
+    if (!sessionDetected || (!externalAccountId && !externalUsername)) {
       this.logger.log(
-        `[${platform}] no automatic connection: session or username was not detected`,
+        `[${platform}] no automatic connection: session or account identity was not detected`,
       );
       await installation.save();
       return null;
@@ -1133,12 +1307,18 @@ export class ExtensionsService {
 
     // A matching account on another installation is a recovery case, not an
     // implicit rebind. This preserves the same safety boundary as Facebook's
-    // reconnect flow while keeping first-time Instagram setup automatic.
+    // reconnect flow while keeping first-time platform setup automatic.
+    const accountIdentity = externalAccountId
+      ? { externalAccountId }
+      : { externalUsername };
+    // Include archived records in this lookup. The account/display-name
+    // indexes intentionally remain unique across the user's history, so an
+    // archived connection must not cause a second automatic create (and a
+    // Mongo duplicate-key 500) during a fresh extension install.
     const existingAccount = await this.platformConnectionModel!.findOne({
       clerkUserId,
       platform: platform as any,
-      externalUsername,
-      archivedAt: { $exists: false },
+      ...accountIdentity,
     }).exec() as PlatformConnectionDocument | null;
     if (existingAccount) {
       this.logger.warn(
@@ -1148,27 +1328,71 @@ export class ExtensionsService {
       return null;
     }
 
-    const displayName = `${platform === 'INSTAGRAM' ? 'Instagram' : platform} @${externalUsername}`
+    const platformName = platform === 'INSTAGRAM'
+      ? 'Instagram'
+      : platform === 'TIKTOK'
+        ? 'TikTok'
+        : platform;
+    const displayName = externalAccountId && platform === 'INSTAGRAM'
+      ? 'Instagram account'
+      : `${platformName} @${externalUsername}`
       .slice(0, 60);
-    const connection = (await this.platformConnectionModel!.create({
-      clerkUserId,
-      platform: platform as any,
-      activeExtensionInstallationId: installation._id,
-      displayName,
-      displayNameKey: normalizeExtensionNameKey(displayName),
-      ...(externalAccountId ? { externalAccountId } : {}),
-      externalUsername,
-      detectedExternalUsername: externalUsername,
-      ...(externalAccountId ? { detectedExternalAccountId: externalAccountId } : {}),
-      status: PlatformConnectionStatus.CONNECTED,
-      workerStatus: PlatformConnectionWorkerStatus.IDLE,
-      sessionDetected: true,
-      lastSeenAt: new Date(),
-    })) as PlatformConnectionDocument;
+    let connection: PlatformConnectionDocument;
+    try {
+      connection = (await this.platformConnectionModel!.create({
+        clerkUserId,
+        platform: platform as any,
+        activeExtensionInstallationId: installation._id,
+        displayName,
+        displayNameKey: normalizeExtensionNameKey(displayName),
+        ...(externalAccountId ? { externalAccountId, detectedExternalAccountId: externalAccountId } : {}),
+        ...(externalUsername && !externalAccountId ? { externalUsername, detectedExternalUsername: externalUsername } : {}),
+        status: PlatformConnectionStatus.CONNECTED,
+        workerStatus: PlatformConnectionWorkerStatus.IDLE,
+        sessionDetected: true,
+        lastSeenAt: new Date(),
+        ...(platform === 'INSTAGRAM' ? { sessionEvidenceState: 'VERIFIED', sessionVerifiedAt: new Date() } : {}),
+      })) as PlatformConnectionDocument;
+    } catch (error) {
+      if (!isDuplicateKeyError(error)) throw error;
+
+      // Two startup probes can report the same session concurrently. Recover
+      // the connection created by the winner instead of turning that normal
+      // race into a 500.
+      const winner = await this.platformConnectionModel!.findOne({
+        clerkUserId,
+        platform: platform as any,
+        activeExtensionInstallationId: installation._id,
+        archivedAt: { $in: [null] },
+      }).exec() as PlatformConnectionDocument | null;
+      if (winner) {
+        await installation.save();
+        this.logger.warn(`[${platform}] automatic connection race recovered`);
+        return sanitizePlatformConnection(winner);
+      }
+
+      // A historical/other-installation account owns the unique key. Keep the
+      // explicit reconnect boundary and return a normal no-op outcome.
+      const owner = await this.platformConnectionModel!.findOne({
+        clerkUserId,
+        platform: platform as any,
+        ...accountIdentity,
+      }).exec() as PlatformConnectionDocument | null;
+      if (owner) {
+        await installation.save();
+        this.logger.warn(
+          `[${platform}] automatic connection blocked after duplicate-key race: account is already bound`,
+        );
+        return null;
+      }
+      throw new ConflictException(
+        `The ${platform.toLowerCase()} account is already linked to another connection.`,
+      );
+    }
 
     await installation.save();
     this.logger.log(
-      `[${platform}] automatic connection created for @${externalUsername}`,
+      `[${platform}] automatic connection created for account ${externalAccountId ?? 'legacy username'}`,
     );
     return sanitizePlatformConnection(connection);
   }
@@ -1424,9 +1648,6 @@ export class ExtensionsService {
     credential?: string,
     extensionName?: unknown,
   ) {
-    if (!this.platformConnectionModel) {
-      throw new NotFoundException('Platform connections are not enabled');
-    }
     const installation = await this.verifyWorkerIdentity(
       clerkUserId,
       extensionInstanceId,
@@ -1441,14 +1662,13 @@ export class ExtensionsService {
       clerkUserId,
       normalizedInstanceId,
       extensionName,
+      true,
     );
     const connection = await this.resolveWorkerConnection(
       clerkUserId,
       installation,
     );
-    if (!connection)
-      throw new NotFoundException('Facebook connection not found.');
-    return { displayName: connection.displayName ?? null };
+    return { displayName: connection?.displayName ?? (typeof extensionName === 'string' ? normalizeExtensionName(extensionName) || null : installation.displayName ?? null) };
   }
 
   // ── Reinstall recovery (worker, explicit user decision) ───────────────────
@@ -1731,6 +1951,10 @@ export class ExtensionsService {
       }
 
       installation.facebookConnectionId = target._id;
+      if (claimed.displayName) {
+        installation.displayName = claimed.displayName;
+        installation.displayNameKey = normalizeExtensionNameKey(claimed.displayName);
+      }
       await installation.save(session ? { session } : undefined);
 
       await this.recordAudit(
@@ -2038,8 +2262,52 @@ export class ExtensionsService {
       .sort({ lastSeenAt: -1, createdAt: -1 })
       .lean()
       .exec();
+    const installationIds = (connections as unknown as PlatformConnectionDocument[])
+      .map((connection) => connection.activeExtensionInstallationId)
+      .filter((id): id is Types.ObjectId => Boolean(id));
+    const installations = installationIds.length
+      ? await this.extensionModel
+          .find({ clerkUserId, _id: { $in: installationIds } })
+          .lean()
+          .exec()
+      : [];
+    // The shared Chrome Profile name is historically stored on the durable
+    // Facebook connection (the installation only received a name when the
+    // profile was created without Facebook). Resolve that parent label once
+    // so Instagram/TikTok rows use the same name in Create Post.
+    const facebookConnectionIds = (installations as unknown as Array<Record<string, unknown>>)
+      .map((installation) => installation.facebookConnectionId)
+      .filter((id): id is Types.ObjectId => Boolean(id));
+    const facebookConnections = facebookConnectionIds.length
+      ? await this.connectionModel
+          .find({ clerkUserId, _id: { $in: facebookConnectionIds } })
+          .select('_id displayName')
+          .lean()
+          .exec()
+      : [];
+    const facebookNameById = new Map(
+      (facebookConnections as unknown as Array<Record<string, unknown>>).map((connection) => [
+        String(connection._id),
+        typeof connection.displayName === 'string' ? connection.displayName : null,
+      ]),
+    );
+    const installationById = new Map(
+      (installations as unknown as Array<Record<string, unknown>>).map((installation) => [
+        String(installation._id),
+        {
+          ...installation,
+          displayName:
+            (typeof installation.displayName === 'string' && installation.displayName.trim())
+              ? installation.displayName
+              : facebookNameById.get(String(installation.facebookConnectionId)) ?? null,
+        },
+      ]),
+    );
     return (connections as unknown as PlatformConnectionDocument[]).map(
-      (connection) => sanitizePlatformConnection(connection),
+      (connection) => sanitizePlatformConnection(
+        connection,
+        installationById.get(String(connection.activeExtensionInstallationId)),
+      ),
     );
   }
 
@@ -2335,13 +2603,14 @@ export class ExtensionsService {
     clerkUserId: string,
     extensionInstanceId: string | undefined,
     extensionName: unknown,
+    explicitRename = false,
   ) {
     if (extensionName === undefined) return;
     if (typeof extensionName !== 'string') {
       throw new BadRequestException('Extension name must be text.');
     }
 
-    const normalizedName = normalizeExtensionName(extensionName);
+    let normalizedName = normalizeExtensionName(extensionName);
     if (normalizedName.length > 60) {
       throw new BadRequestException(
         'Extension name must be 60 characters or fewer.',
@@ -2349,7 +2618,13 @@ export class ExtensionsService {
     }
 
     const filter = this.getConnectionFilter(clerkUserId, extensionInstanceId);
+    const installation = await this.extensionModel.findOne({ clerkUserId, extensionInstanceId }).exec();
+    // Heartbeats must not overwrite a dashboard rename with a cached popup label.
+    if (!explicitRename && installation?.displayName) normalizedName = installation.displayName;
     if (!normalizedName) {
+      if (explicitRename) await this.extensionModel.updateOne({ clerkUserId, extensionInstanceId }, {
+        $unset: { displayName: 1, displayNameKey: 1 },
+      });
       await this.connectionModel
         .findOneAndUpdate(filter, {
           $unset: { displayName: 1, displayNameKey: 1 },
@@ -2364,9 +2639,13 @@ export class ExtensionsService {
       .select('_id')
       .lean()
       .exec();
-    // An unbound installation has no connection to name yet. The name is
-    // applied by the next heartbeat or rename once a connection exists.
-    if (!current) return;
+    // An Instagram/TikTok-only profile can be named without a Facebook record.
+    if (!current) {
+      await this.extensionModel.updateOne({ clerkUserId, extensionInstanceId }, {
+        $set: { displayName: normalizedName, displayNameKey },
+      });
+      return;
+    }
 
     const duplicate = await this.connectionModel
       .findOne({
@@ -2389,6 +2668,9 @@ export class ExtensionsService {
           $set: { displayName: normalizedName, displayNameKey },
         })
         .exec();
+      await this.extensionModel.updateOne({ clerkUserId, extensionInstanceId }, {
+        $set: { displayName: normalizedName, displayNameKey },
+      });
     } catch (error) {
       if (isDuplicateKeyError(error)) {
         throw new ConflictException(
@@ -2451,6 +2733,11 @@ export class ExtensionsService {
         );
       }
       throw error;
+    }
+    if (connection.activeExtensionInstallationId) {
+      await this.extensionModel.updateOne({ _id: connection.activeExtensionInstallationId, clerkUserId }, {
+        $set: { displayName: normalizedName, displayNameKey },
+      });
     }
     return { displayName: connection.displayName ?? null };
   }
@@ -2517,12 +2804,22 @@ function mapPlatformWorkerStatusToConnectionStatus(
   }
 }
 
-function sanitizePlatformConnection(connection: PlatformConnectionDocument): Record<string, unknown> {
+function sanitizePlatformConnection(
+  connection: PlatformConnectionDocument,
+  installation?: Record<string, unknown>,
+): Record<string, unknown> {
   return {
     _id: connection._id,
     clerkUserId: connection.clerkUserId,
     platform: connection.platform,
     displayName: connection.displayName,
+    extensionName: installation?.displayName ?? null,
+    extensionInstanceIdMasked: installation?.extensionInstanceId
+      ? maskExtensionInstanceId(String(installation.extensionInstanceId))
+      : null,
+    activeExtensionInstallationId: connection.activeExtensionInstallationId
+      ? String(connection.activeExtensionInstallationId)
+      : null,
     externalAccountId: connection.externalAccountId,
     externalUsername: connection.externalUsername,
     detectedExternalAccountId: connection.detectedExternalAccountId,
@@ -2530,9 +2827,11 @@ function sanitizePlatformConnection(connection: PlatformConnectionDocument): Rec
     status: connection.status,
     workerStatus: connection.workerStatus,
     sessionDetected: connection.sessionDetected,
+    sessionEvidenceState: connection.sessionEvidenceState,
+    sessionVerifiedAt: connection.sessionVerifiedAt,
+    sessionEvidenceSource: connection.sessionEvidenceSource,
     lastSeenAt: connection.lastSeenAt,
     archivedAt: connection.archivedAt,
-    activeExtensionInstallationId: connection.activeExtensionInstallationId,
     legacyFacebookConnectionId: connection.legacyFacebookConnectionId,
     createdAt: connection.createdAt,
     updatedAt: connection.updatedAt,

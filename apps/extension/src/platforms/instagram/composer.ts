@@ -16,6 +16,7 @@ type InstagramSelectors = {
 type InstagramComposerBridgeApi = {
   execute: (message: {
     jobId?: string;
+    expectedAccountId?: string;
     expectedUsername?: string;
     targetType?: string;
     post?: { content?: string; caption?: string; text?: string; mediaUrls?: string[] };
@@ -41,6 +42,56 @@ async function waitForInstagramElement<T>(read: () => T | null, timeoutMs = 15_0
   return null;
 }
 
+function findInstagramCaptionFieldNow(): HTMLElement | null {
+  if (!instagramComposerSelectors) return null;
+  return instagramComposerSelectors.findCaptionField(
+    instagramComposerSelectors.findDialog(document) ?? document,
+  );
+}
+
+/**
+ * Instagram may replace the Lexical editor node immediately after an input
+ * event. Re-find the field after every attempt and require two consecutive
+ * reads before continuing to Share; checking one stale HTMLElement is what
+ * made caption insertion appear intermittent.
+ */
+async function insertAndVerifyInstagramCaption(caption: string): Promise<HTMLElement | null> {
+  for (let attempt = 1; attempt <= 8; attempt += 1) {
+    const field = findInstagramCaptionFieldNow();
+    if (!field) {
+      await instagramComposerDelay(150);
+      continue;
+    }
+    const inserted = instagramCaption?.insert(field, caption) === true;
+    console.info('[PostFlow][Instagram] Caption insertion attempt', {
+      attempt,
+      inserted,
+      fieldConnected: field.isConnected,
+      method: field instanceof HTMLTextAreaElement ? 'native_value_setter' : 'native_edit_transaction',
+    });
+    if (!inserted) {
+      await instagramComposerDelay(180);
+      continue;
+    }
+    // Give the framework a focus transition as it would receive when the
+    // user leaves the editor to press Share, then inspect the live field.
+    field.blur();
+
+    let consecutiveMatches = 0;
+    for (let check = 0; check < 3; check += 1) {
+      await instagramComposerDelay(180);
+      const currentField = findInstagramCaptionFieldNow();
+      if (currentField && instagramCaption?.verified(currentField, caption)) {
+        consecutiveMatches += 1;
+        if (consecutiveMatches >= 2) return currentField;
+      } else {
+        consecutiveMatches = 0;
+      }
+    }
+  }
+  return null;
+}
+
 function instagramDataUrlToFile(dataUrl: string): File | null {
   const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
   if (!match) return null;
@@ -52,11 +103,12 @@ function instagramDataUrlToFile(dataUrl: string): File | null {
   }
 }
 
-async function attachMedia(input: HTMLInputElement, dataUrl: string): Promise<boolean> {
-  const file = instagramDataUrlToFile(dataUrl);
-  if (!file) return false;
+async function attachMedia(input: HTMLInputElement, dataUrls: string[]): Promise<boolean> {
+  const files = dataUrls.map(instagramDataUrlToFile);
+  if (files.some((file) => file === null)) return false;
+  const validFiles = files as File[];
   const transfer = new DataTransfer();
-  transfer.items.add(file);
+  validFiles.forEach((file) => transfer.items.add(file));
   input.files = transfer.files;
   input.dispatchEvent(new Event('input', { bubbles: true }));
   input.dispatchEvent(new Event('change', { bubbles: true }));
@@ -69,9 +121,10 @@ function normalizeInstagramPostUrl(value: string): string | undefined {
     const url = new URL(value);
     const hostname = url.hostname.toLowerCase();
     if (hostname !== 'instagram.com' && !hostname.endsWith('.instagram.com')) return undefined;
-    const match = url.pathname.match(/^\/(?:[^/]+\/)?(p|reel)\/([^/]+)\/?$/i);
+    const match = url.pathname.match(/^\/(?:[^/]+\/)?(p|reels?)\/([^/]+)\/?$/i);
     if (!match) return undefined;
-    return `https://www.instagram.com/${match[1].toLowerCase()}/${match[2]}/`;
+    const kind = match[1].toLowerCase() === 'p' ? 'p' : 'reel';
+    return `https://www.instagram.com/${kind}/${match[2]}/`;
   } catch {
     return undefined;
   }
@@ -114,21 +167,35 @@ async function waitForInstagramPostUrl(
 }
 
 function hasInstagramSuccessNotice(): boolean {
-  const successPattern = /your (?:post|reel) has been shared|(?:post|reel) shared/i;
+  // Require a completed-share phrase, not the Share button or upload progress.
+  // Instagram can use the generic post dialog label even for a video/Reel.
+  const successPattern = /your\s+(?:post|reel)\s+has\s+been\s+shared|shared\s+(?:post|reel)|(?:post|reel)\s+shared|(?:^|\s)تمت?\s+مشاركة\s+(?:المنشور|منشورك|(?:مقطع\s+)?(?:ريلز|الريل|ريل)|الفيديو|فيديو[ك]?)/i;
+  const matchesSuccess = (text: string) => successPattern.test(
+    text.replace(/[\u064B-\u065F\u0670\u0640\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, ''),
+  );
   const dialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]'));
   return dialogs.some((dialog) => (
-    successPattern.test(dialog.getAttribute('aria-label') ?? '')
-    || successPattern.test(dialog.textContent ?? '')
-  )) || successPattern.test(document.body?.textContent ?? '');
+    matchesSuccess(dialog.getAttribute('aria-label') ?? '')
+    || matchesSuccess(dialog.textContent ?? '')
+  )) || matchesSuccess(document.body?.textContent ?? '');
 }
 
 async function waitForInstagramOutcome(
   existingPostUrls: Set<string>,
+  targetType: string | undefined,
 ): Promise<{ status: 'PUBLISHED' | 'UNKNOWN'; postUrl?: string }> {
+  // A Reel can remain in the upload/processing state well beyond the normal
+  // Feed confirmation window. We wait for a terminal DOM signal rather than
+  // treating the first short window as a failure. The cap is only a safety
+  // boundary so a broken tab cannot hold the worker forever.
+  const timeoutMs = targetType === 'INSTAGRAM_REEL' ? 90_000 : 45_000;
   const startedAt = Date.now();
-  // Instagram may upload and render the confirmation dialog asynchronously.
-  // Keep this window long enough to cover slower uploads without retrying the job.
-  while (Date.now() - startedAt < 15_000) {
+  let lastProgressLogAt = startedAt;
+  console.info('[PostFlow][Instagram] Waiting for publish confirmation', {
+    targetType,
+    timeoutMs,
+  });
+  while (Date.now() - startedAt < timeoutMs) {
     const postUrl = findPublishedInstagramUrl();
     if (postUrl || hasInstagramSuccessNotice()) {
       // Do not click Instagram's Done control here. Instagram may reload the
@@ -141,14 +208,27 @@ async function waitForInstagramOutcome(
       });
       return { status: 'PUBLISHED', ...(discoveredPostUrl ? { postUrl: discoveredPostUrl } : {}) };
     }
+    const now = Date.now();
+    if (now - lastProgressLogAt >= 5_000) {
+      console.info('[PostFlow][Instagram] Still waiting for publish confirmation', {
+        targetType,
+        elapsedMs: now - startedAt,
+      });
+      lastProgressLogAt = now;
+    }
     await instagramComposerDelay(500);
   }
+  console.warn('[PostFlow][Instagram] Publish confirmation timeout', {
+    targetType,
+    elapsedMs: Date.now() - startedAt,
+  });
   return { status: 'UNKNOWN' };
 }
 
 async function executeInstagramComposer(
   message: {
     jobId?: string;
+    expectedAccountId?: string;
     expectedUsername?: string;
     targetType?: string;
     post?: { content?: string; caption?: string; text?: string; mediaUrls?: string[] };
@@ -157,8 +237,13 @@ async function executeInstagramComposer(
   if (!instagramComposerSelectors) return { success: false, status: 'FAILED', reason: 'Instagram selectors are unavailable' };
   const mediaUrls = message.post?.mediaUrls ?? [];
   const isReel = message.targetType === 'INSTAGRAM_REEL';
-  if (mediaUrls.length !== 1 || (isReel ? !mediaUrls[0].startsWith('data:video/') : !mediaUrls[0].startsWith('data:image/'))) {
-    return { success: false, status: 'FAILED', reason: isReel ? 'Instagram Reel requires one video' : 'Instagram Feed requires one image' };
+  const imageCount = mediaUrls.filter((url) => url.startsWith('data:image/')).length;
+  const videoCount = mediaUrls.filter((url) => url.startsWith('data:video/')).length;
+  const validMedia = isReel
+    ? mediaUrls.length === 1 && videoCount === 1
+    : imageCount >= 1 && imageCount <= 4 && imageCount === mediaUrls.length;
+  if (!validMedia) {
+    return { success: false, status: 'FAILED', reason: isReel ? 'Instagram Reel requires one video' : 'Instagram Feed requires one to four images' };
   }
 
   const existingPostUrls = findInstagramPostUrls();
@@ -170,18 +255,43 @@ async function executeInstagramComposer(
   const dialog = await waitForInstagramElement(() => instagramComposerSelectors.findDialog(document));
   if (!dialog) return { success: false, status: 'FAILED', reason: 'Instagram composer did not open' };
   console.info('[PostFlow][Instagram] Composer dialog opened');
-  const input = await waitForInstagramElement(() => instagramComposerSelectors.findMediaInput(dialog));
-  if (!input || !(await attachMedia(input, mediaUrls[0]))) {
+  // Instagram can replace the entire dialog while hydrating the upload form.
+  // Re-resolve it on every poll; the original reference can be detached.
+  const input = await waitForInstagramElement(() => {
+    const liveDialog = instagramComposerSelectors.findDialog(document);
+    const candidate = liveDialog && instagramComposerSelectors.findMediaInput(liveDialog);
+    return candidate?.isConnected && !candidate.disabled ? candidate : null;
+  });
+  if (!input) {
+    console.warn('[PostFlow][Instagram] Media input readiness timed out', {
+      jobId: message.jobId,
+      dialogDetected: Boolean(instagramComposerSelectors.findDialog(document)),
+    });
     return { success: false, status: 'FAILED', reason: 'Instagram media input was not found' };
+  }
+  console.info('[PostFlow][Instagram] Media input ready', {
+    jobId: message.jobId,
+    accept: input.accept,
+    connected: input.isConnected,
+  });
+  if (!(await attachMedia(input, mediaUrls))) {
+    return { success: false, status: 'FAILED', reason: 'Instagram media could not be attached' };
   }
   console.info('[PostFlow][Instagram] Media attached');
 
-  for (let step = 0; step < 2; step += 1) {
+  for (let step = 0; step < 3; step += 1) {
+    const currentRoot = () => instagramComposerSelectors.findDialog(document) ?? document;
+    const currentDialog = currentRoot();
+    if (
+      instagramComposerSelectors.findCaptionField(currentDialog)
+      || instagramComposerSelectors.findShareButton(currentDialog)
+    ) {
+      console.info('[PostFlow][Instagram] Final composer stage detected', { step });
+      break;
+    }
     const next = await waitForInstagramElement(
-      () => instagramComposerSelectors.findNextButton(
-        instagramComposerSelectors.findDialog(document) ?? document,
-      ),
-      3_000,
+      () => instagramComposerSelectors.findNextButton(currentRoot()),
+      12_000,
     );
     if (!next) break;
     next.click();
@@ -198,24 +308,17 @@ async function executeInstagramComposer(
     length: caption.length,
   });
   if (caption) {
-    const field = await waitForInstagramElement(
-      () => instagramComposerSelectors.findCaptionField(
-        instagramComposerSelectors.findDialog(document) ?? document,
-      ),
-      5_000,
-    );
-    if (!field) return { success: false, status: 'FAILED', reason: 'Instagram caption field was not found' };
-    const captionInserted = instagramCaption?.insert(field, caption) === true;
-    if (!captionInserted) {
-      await instagramComposerDelay(250);
-      if (!instagramCaption?.matches(field, caption)) {
-        console.warn('[PostFlow][Instagram] Caption verification failed', {
-          targetType: message.targetType,
-          expectedLength: caption.length,
-          actualText: (field.innerText || field.textContent || '').slice(0, 120),
-        });
-        return { success: false, status: 'FAILED', reason: 'Instagram caption could not be inserted' };
-      }
+    const verifiedCaptionField = await insertAndVerifyInstagramCaption(caption);
+    if (!verifiedCaptionField) {
+      const currentField = findInstagramCaptionFieldNow();
+      console.warn('[PostFlow][Instagram] Caption verification failed', {
+        targetType: message.targetType,
+        expectedLength: caption.length,
+        fieldDetected: Boolean(currentField),
+        domMatches: Boolean(currentField && instagramCaption?.matches(currentField, caption)),
+        transactionVerified: Boolean(currentField && instagramCaption?.verified(currentField, caption)),
+      });
+      return { success: false, status: 'FAILED', reason: 'Instagram caption could not be inserted' };
     }
     console.info('[PostFlow][Instagram] Caption inserted', {
       targetType: message.targetType,
@@ -223,13 +326,29 @@ async function executeInstagramComposer(
     });
   }
 
-  const share = await waitForInstagramElement(
+  let share = await waitForInstagramElement(
     () => instagramComposerSelectors.findShareButton(
       instagramComposerSelectors.findDialog(document) ?? document,
     ),
     5_000,
   );
   if (!share) return { success: false, status: 'FAILED', reason: 'Instagram Share button was not ready' };
+  if (caption) {
+    const finalCaptionField = findInstagramCaptionFieldNow();
+    if (!finalCaptionField || !instagramCaption?.verified(finalCaptionField, caption)) {
+      console.warn('[PostFlow][Instagram] Caption changed before Share; repairing');
+      if (!(await insertAndVerifyInstagramCaption(caption))) {
+        return { success: false, status: 'FAILED', reason: 'Instagram caption could not be inserted' };
+      }
+      share = await waitForInstagramElement(
+        () => instagramComposerSelectors.findShareButton(
+          instagramComposerSelectors.findDialog(document) ?? document,
+        ),
+        5_000,
+      );
+      if (!share) return { success: false, status: 'FAILED', reason: 'Instagram Share button was not ready after caption repair' };
+    }
+  }
   console.info('[PostFlow][Instagram] Share control found');
   if (share.disabled || share.getAttribute('aria-disabled') === 'true') {
     return { success: false, status: 'FAILED', reason: 'Instagram Share button is disabled' };
@@ -244,6 +363,7 @@ async function executeInstagramComposer(
       {
         type: 'INSTAGRAM_PRE_SHARE_CHECK',
         jobId: message.jobId,
+        expectedAccountId: message.expectedAccountId,
         expectedUsername: message.expectedUsername,
       },
       (response) => {
@@ -266,8 +386,29 @@ async function executeInstagramComposer(
     };
   }
 
+  // Account/job checks are asynchronous; Instagram can re-render the editor
+  // during that wait. Validate its editing transaction again and re-acquire
+  // Share immediately before clicking it.
+  const finalCaptionField = caption ? findInstagramCaptionFieldNow() : null;
+  if (caption && (!finalCaptionField || !instagramCaption?.verified(finalCaptionField, caption))) {
+    console.warn('[PostFlow][Instagram] Caption verification lost after pre-share checks', {
+      jobId: message.jobId,
+      expectedLength: caption.length,
+    });
+    return { success: false, status: 'FAILED', reason: 'Instagram caption changed before Share; publishing stopped' };
+  }
+  share = instagramComposerSelectors.findShareButton(
+    instagramComposerSelectors.findDialog(document) ?? document,
+  );
+  if (!share || !share.isConnected || share.disabled || share.getAttribute('aria-disabled') === 'true') {
+    return { success: false, status: 'FAILED', reason: 'Instagram Share button changed before submission' };
+  }
+  console.info('[PostFlow][Instagram] Caption transaction verified before Share', {
+    jobId: message.jobId,
+    captionLength: caption.length,
+  });
   share.click();
-  const outcome = await waitForInstagramOutcome(existingPostUrls);
+  const outcome = await waitForInstagramOutcome(existingPostUrls, message.targetType);
 
   return {
     success: true,

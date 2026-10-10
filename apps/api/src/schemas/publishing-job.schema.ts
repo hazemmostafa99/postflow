@@ -24,6 +24,7 @@ export enum FacebookSubmissionStatus {
   PUBLISHED = 'PUBLISHED',
   PENDING_APPROVAL = 'PENDING_APPROVAL',
   UNKNOWN = 'UNKNOWN',
+  PROCESSING = 'PROCESSING',
 }
 
 export enum PublishingJobStatus {
@@ -92,6 +93,13 @@ export class PublishingJob {
   @Prop()
   claimExpiresAt?: Date;
 
+  /** Hash of the short-lived bearer token used to download this job's media. */
+  @Prop({ select: false })
+  mediaAccessTokenHash?: string;
+
+  @Prop()
+  mediaAccessExpiresAt?: Date;
+
   @Prop({ required: true, default: 0 })
   attempts: number;
 
@@ -139,13 +147,21 @@ export class PublishingJob {
   @Prop()
   publishedDetectedAt?: Date;
 
-  /** Latest visible Facebook engagement counters. Kept separate from approval-sync metadata. */
+  /** Latest visible platform engagement counters. Kept separate from approval-sync metadata. */
   @Prop({
-    type: { reactionCount: Number, commentCount: Number, lastSyncedAt: Date },
+    type: {
+      reactionCount: Number,
+      commentCount: Number,
+      favoriteCount: Number,
+      shareCount: Number,
+      lastSyncedAt: Date,
+    },
   })
   engagement?: {
     reactionCount?: number;
     commentCount?: number;
+    favoriteCount?: number;
+    shareCount?: number;
     lastSyncedAt: Date;
   };
 
@@ -183,6 +199,10 @@ export class PublishingJob {
 
   @Prop()
   scheduledFor?: Date;
+
+  /** Set by an owner-initiated retry and consumed atomically by the worker. */
+  @Prop()
+  manualRetryRequestedAt?: Date;
 
   @Prop()
   startedAt?: Date;

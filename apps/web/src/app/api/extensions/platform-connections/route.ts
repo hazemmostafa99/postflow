@@ -3,12 +3,16 @@ import { NextResponse } from "next/server";
 
 const API_BASE = process.env.API_URL || "http://localhost:8000";
 
-export async function GET() {
+export async function GET(request: Request) {
   const { userId } = await auth();
   if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   try {
-    const response = await fetch(`${API_BASE}/api/extensions/platform-connections`, {
+    const platform = new URL(request.url).searchParams.get("platform")?.toUpperCase();
+    const query = platform === "TIKTOK" || platform === "INSTAGRAM"
+      ? `?platform=${platform}`
+      : "";
+    const response = await fetch(`${API_BASE}/api/extensions/platform-connections${query}`, {
       headers: { "x-clerk-user-id": userId },
       cache: "no-store",
     });

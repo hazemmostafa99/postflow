@@ -46,6 +46,23 @@ const {
   matchesFilter,
 } = loadDashboard();
 
+test('an Instagram-only extension is ready in the original dashboard', () => {
+  const view = getConnectionView(makeConnection({ facebookSessionDetected: false, facebookUserId: undefined,
+    platformAccounts: [{ platform: 'INSTAGRAM', connectionId: 'ig', status: 'CONNECTED', workerStatus: 'IDLE', sessionDetected: true }] }), Date.now());
+  assert.equal(view.state, 'READY');
+});
+
+test('publishing on Instagram is visible even if Facebook needs login', () => {
+  const view = getConnectionView(makeConnection({ status: 'LOGIN_REQUIRED',
+    platformAccounts: [{ platform: 'INSTAGRAM', connectionId: 'ig', status: 'CONNECTED', workerStatus: 'PUBLISHING', sessionDetected: true }] }), Date.now());
+  assert.equal(view.state, 'PUBLISHING');
+});
+
+test('extensions without Facebook only offer implemented shared lifecycle controls', () => {
+  const actions = availableActions(makeConnection({ installationId: 'ext', legacyFacebookConnectionId: null }));
+  assert.deepEqual(Array.from(actions), ['rename', 'pause', 'disconnect', 'force-disconnect', 'remove']);
+});
+
 function makeConnection(overrides = {}) {
   return {
     _id: 'conn-1',
