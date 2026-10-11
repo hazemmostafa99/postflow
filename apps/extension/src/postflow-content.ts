@@ -6,6 +6,17 @@
  * This enables the background service worker to authenticate API calls.
  */
 
+// The background worker may reinject this bridge into an already-open
+// dashboard tab after a service-worker restart. Keep the script idempotent so
+// a second injection does not redeclare top-level constants or duplicate
+// observers/listeners.
+var postflowBridgeGlobal = globalThis as typeof globalThis & {
+  __postflowContentBridgeInstalled?: boolean;
+  __postflowContentBridgeAlive?: () => boolean;
+};
+if (!postflowBridgeGlobal.__postflowContentBridgeInstalled || !postflowBridgeGlobal.__postflowContentBridgeAlive?.()) {
+postflowBridgeGlobal.__postflowContentBridgeInstalled = true;
+
 const USER_ID_ATTR = 'data-postflow-user-id';
 const PENDING_SYNC_KEY = 'postflow:pending-sync-groups';
 const PENDING_JOB_CHECK_KEY = 'postflow:pending-job-check';
@@ -29,10 +40,28 @@ function isExtensionAlive(): boolean {
   }
 }
 
+postflowBridgeGlobal.__postflowContentBridgeAlive = isExtensionAlive;
+
 function safeSend(message: object) {
   if (!isExtensionAlive()) return;
   try {
     chrome.runtime.sendMessage(message);
+  } catch {
+    isContextValid = false;
+  }
+}
+
+function notifyAuthContextReady() {
+  if (!isExtensionAlive()) return;
+  try {
+    chrome.runtime.sendMessage({ type: 'AUTH_CONTEXT_READY' }, (response) => {
+      if (chrome.runtime.lastError) return;
+      if (response?.ok) {
+        // Registration and Facebook verification are complete, so group sync
+        // can start without racing the extension's one-minute retry alarm.
+        safeSend({ type: 'TRIGGER_GROUP_SYNC' });
+      }
+    });
   } catch {
     isContextValid = false;
   }
@@ -120,11 +149,12 @@ function extractAndStore() {
         }
         console.log('[PostFlow] User ID stored:', userId);
 
-        // If the user ID just became available (or changed), immediately
-        // re-sync all cached groups so nothing is lost from before login.
+        // Connect immediately when the authenticated user becomes available.
+        // The background worker starts group sync after registration succeeds.
         if (!previousId || previousId !== userId) {
           console.log('[PostFlow] User ID is new/changed — triggering group sync to flush cached groups');
-          safeSend({ type: 'TRIGGER_GROUP_SYNC' });
+          void chrome.storage.local.set({ extensionConnectionStage: 'user-found' });
+          notifyAuthContextReady();
         }
       });
     });
@@ -133,13 +163,25 @@ function extractAndStore() {
   }
 }
 
+function currentDashboardUserId(): string | null {
+  return document.getElementById('postflow-user-meta')?.getAttribute(USER_ID_ATTR)?.trim() || null;
+}
+
 // Run on load and observe DOM changes in case Next.js renders after script injection
 extractAndStore();
 consumePendingGroupSync();
 consumePendingJobCheck();
 
 const observer = new MutationObserver(() => extractAndStore());
-observer.observe(document.body, { childList: true, subtree: true });
+// Clerk may hydrate/update the user metadata attribute after the initial DOM
+// render. Observe attributes as well as inserted nodes so the ID is captured
+// immediately instead of waiting for an alarm or a full page refresh.
+observer.observe(document.body, {
+  childList: true,
+  subtree: true,
+  attributes: true,
+  attributeFilter: [USER_ID_ATTR],
+});
 
 const pendingSyncInterval = window.setInterval(() => {
   if (!isExtensionAlive()) {
@@ -155,12 +197,27 @@ const webAppPresenceInterval = window.setInterval(() => {
     window.clearInterval(webAppPresenceInterval);
     return;
   }
+  if (!currentDashboardUserId()) return;
   chrome.storage.local.set({
     webAppConnected: true,
     webAppLastSeenAt: Date.now(),
     webAppLastUrl: window.location.origin,
   });
 }, 30_000);
+
+// The popup can request an auth refresh directly instead of waiting for a
+// dashboard reload or the registration retry alarm.
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type !== 'REFRESH_AUTH_CONTEXT') return;
+  const userId = currentDashboardUserId();
+  if (!userId) {
+    sendResponse({ ok: false });
+    return;
+  }
+  extractAndStore();
+  notifyAuthContextReady();
+  sendResponse({ ok: true, userId });
+});
 
 // Listen for manual sync requests dispatched by the Web App dashboard
 window.addEventListener('postflow:sync-groups', () => {
@@ -177,3 +234,61 @@ window.addEventListener('postflow:check-jobs', () => {
   console.log('[PostFlow] Job check requested from Web App');
   safeSend({ type: 'TRIGGER_JOB_CHECK' });
 });
+
+// The dashboard queues maintenance through the API first, then asks the
+// extension to claim it immediately instead of waiting for the one-minute
+// manual-maintenance alarm.
+window.addEventListener('postflow:refresh-analytics', () => {
+  console.log('[PostFlow] Analytics refresh requested from Web App');
+  safeSend({ type: 'TRIGGER_ANALYTICS_SYNC' });
+});
+
+// Carries a short-lived reconnect approval directly from the authenticated
+// dashboard to this browser profile's extension worker. The token is never
+// rendered into the page or written to local/session storage.
+window.addEventListener('postflow:reconnect-approval', (event) => {
+  if (!isExtensionAlive()) return;
+  const detail = (event as CustomEvent).detail as Record<string, unknown> | null;
+  const connectionId = typeof detail?.connectionId === 'string'
+    ? detail.connectionId
+    : '';
+  const approvalToken = typeof detail?.approvalToken === 'string'
+    ? detail.approvalToken
+    : '';
+  const requestId = typeof detail?.requestId === 'string' ? detail.requestId : '';
+  if (!connectionId || !approvalToken || !requestId) return;
+
+  chrome.runtime.sendMessage(
+    {
+      type: 'RECONNECT_WITH_APPROVAL',
+      connectionId,
+      approvalToken,
+    },
+    (response) => {
+      const error = chrome.runtime.lastError?.message;
+      window.dispatchEvent(new CustomEvent('postflow:reconnect-result', {
+        detail: {
+          requestId,
+          ok: !error && response?.ok === true,
+          error: error || response?.error,
+        },
+      }));
+    },
+  );
+});
+
+window.addEventListener('postflow:restore-disconnected', (event) => {
+  if (!isExtensionAlive()) return;
+  const detail = (event as CustomEvent).detail as Record<string, unknown> | null;
+  const installationId = typeof detail?.installationId === 'string' ? detail.installationId : '';
+  const approvalToken = typeof detail?.approvalToken === 'string' ? detail.approvalToken : '';
+  const requestId = typeof detail?.requestId === 'string' ? detail.requestId : '';
+  if (!installationId || !approvalToken || !requestId) return;
+  chrome.runtime.sendMessage({ type: 'RESTORE_DISCONNECTED_INSTALLATION', installationId, approvalToken }, (response) => {
+    const error = chrome.runtime.lastError?.message;
+    window.dispatchEvent(new CustomEvent('postflow:restore-disconnected-result', {
+      detail: { requestId, ok: !error && response?.ok === true, error: error || response?.error },
+    }));
+  });
+});
+}

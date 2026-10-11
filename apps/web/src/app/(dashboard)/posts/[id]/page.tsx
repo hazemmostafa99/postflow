@@ -7,6 +7,9 @@ import { RefreshPostEngagementButton, RefreshAllPostEngagementButton } from "@/c
 import { ScheduledTime } from "@/components/scheduled-time";
 import { PostScheduleEditor } from "@/components/post-schedule-editor";
 import { PostControlButtons } from "@/components/post-control-buttons";
+import { TikTokReconciliationControls } from "@/components/tiktok-reconciliation-controls";
+import { RetryPublishingButton } from "@/components/retry-publishing-button";
+import { ForceRetryPublishingButton } from "@/components/force-retry-publishing-button";
 
 const API_BASE = process.env.API_URL || "http://localhost:8000";
 
@@ -25,11 +28,12 @@ interface FacebookConnection {
 
 interface Job {
   _id: string;
-  targetType?: "GROUP" | "PROFILE_FEED";
+  platform?: "FACEBOOK" | "INSTAGRAM" | "TIKTOK";
+  targetType?: "GROUP" | "PROFILE_FEED" | "INSTAGRAM_FEED" | "INSTAGRAM_REEL" | "TIKTOK_VIDEO" | "TIKTOK_PHOTO";
   groupId?: Group;
   facebookConnectionId?: FacebookConnection | string;
   status: string;
-  submissionStatus?: "PUBLISHED" | "PENDING_APPROVAL" | "UNKNOWN";
+  submissionStatus?: "PUBLISHED" | "PENDING_APPROVAL" | "PROCESSING" | "UNKNOWN";
   postUrl?: string;
   submissionReason?: string;
   attempts: number;
@@ -39,6 +43,8 @@ interface Job {
   engagement?: {
     reactionCount?: number;
     commentCount?: number;
+    favoriteCount?: number;
+    shareCount?: number;
     lastSyncedAt: string;
   };
   lastEngagementSyncAt?: string;
@@ -96,11 +102,33 @@ function getCreatorLabel(createdBy?: Post["createdBy"]): string {
 }
 
 function isProfileJob(job: Job): boolean {
-  return job.targetType === "PROFILE_FEED" || (!job.groupId && Boolean(job.facebookConnectionId));
+  return job.platform !== "INSTAGRAM" && job.platform !== "TIKTOK" && (
+    job.targetType === "PROFILE_FEED" || (!job.groupId && Boolean(job.facebookConnectionId))
+  );
 }
 
 function isGroupJob(job: Job): job is Job & { groupId: Group } {
-  return !isProfileJob(job) && Boolean(job.groupId);
+  return job.platform !== "INSTAGRAM" && job.platform !== "TIKTOK" && !isProfileJob(job) && Boolean(job.groupId);
+}
+
+function isInstagramJob(job: Job): boolean {
+  return job.platform === "INSTAGRAM" || job.targetType === "INSTAGRAM_FEED" || job.targetType === "INSTAGRAM_REEL" || Boolean(job.postUrl?.includes("instagram.com/"));
+}
+
+function isTikTokJob(job: Job): boolean {
+  return job.platform === "TIKTOK" || job.targetType === "TIKTOK_VIDEO" || job.targetType === "TIKTOK_PHOTO" || Boolean(job.postUrl?.includes("tiktok.com/"));
+}
+
+function isFacebookAnalyticsJob(job: Job): boolean {
+  return !isInstagramJob(job) && !isTikTokJob(job);
+}
+
+function isAnalyticsJob(job: Job): boolean {
+  return isFacebookAnalyticsJob(job) || isInstagramJob(job) || isTikTokJob(job);
+}
+
+function getReactionLabel(job: Job): string {
+  return isTikTokJob(job) ? "likes" : "reactions";
 }
 
 function getProfileLabel(connection?: FacebookConnection | string): string {
@@ -112,12 +140,30 @@ function getProfileLabel(connection?: FacebookConnection | string): string {
 }
 
 function getTargetLabel(job: Job): string {
+  if (isInstagramJob(job)) {
+    return job.targetType === "INSTAGRAM_REEL" ? "Instagram · Reel" : "Instagram · Feed";
+  }
+  if (job.platform === "TIKTOK" || job.targetType === "TIKTOK_VIDEO" || job.targetType === "TIKTOK_PHOTO") {
+    return job.targetType === "TIKTOK_PHOTO" ? "TikTok · Photo post" : "TikTok · Video";
+  }
   return isProfileJob(job) ? `${getProfileLabel(job.facebookConnectionId)} · Profile feed` : job.groupId?.name ?? "Facebook group";
 }
 
 function getTargetSummary(jobs: Job[]): string {
+  const instagramCount = jobs.filter(isInstagramJob).length;
+  const tiktokCount = jobs.filter((job) => job.platform === "TIKTOK" ||
+    job.targetType === "TIKTOK_VIDEO" || job.targetType === "TIKTOK_PHOTO").length;
+  const destinations = [
+    instagramCount ? `${instagramCount} Instagram post${instagramCount === 1 ? "" : "s"}` : "",
+    tiktokCount ? `${tiktokCount} TikTok post${tiktokCount === 1 ? "" : "s"}` : "",
+  ].filter(Boolean);
   const profileCount = jobs.filter(isProfileJob).length;
   const groupCount = jobs.filter(isGroupJob).length;
+  if (destinations.length) {
+    if (groupCount) destinations.push(`${groupCount} group${groupCount === 1 ? "" : "s"}`);
+    if (profileCount) destinations.push(`${profileCount} profile feed${profileCount === 1 ? "" : "s"}`);
+    return destinations.join(" · ");
+  }
   if (profileCount && groupCount) return `${groupCount} groups · ${profileCount} profile feeds`;
   if (profileCount) return `${profileCount} profile feed${profileCount === 1 ? "" : "s"}`;
   return `${groupCount} group${groupCount === 1 ? "" : "s"}`;
@@ -177,6 +223,9 @@ function JobStatusBadge({ job }: { job: Job }) {
       </span>
     );
   }
+  if (job.submissionStatus === "PROCESSING") {
+    return <span className="rounded-full border border-amber-500/20 bg-amber-500/10 px-2.5 py-0.5 text-xs text-amber-500">Processing on TikTok</span>;
+  }
   return (
     <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
       <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
@@ -197,6 +246,7 @@ function OverallStatusBadge({ jobs }: { jobs: Job[] }) {
   const cancelRequested = jobs.filter((j) => j.status === "CANCEL_REQUESTED").length;
   const pendingApproval = jobs.filter((j) => j.submissionStatus === "PENDING_APPROVAL").length;
   const unknown = jobs.filter((j) => j.submissionStatus === "UNKNOWN").length;
+  const processing = jobs.filter((j) => j.submissionStatus === "PROCESSING").length;
 
   if (cancelRequested > 0) {
     return <span className="text-red-500">Canceling current job</span>;
@@ -213,6 +263,7 @@ function OverallStatusBadge({ jobs }: { jobs: Job[] }) {
   if (unknown > 0) {
     return <span className="text-zinc-500">Submission status unknown</span>;
   }
+  if (processing > 0) return <span className="text-amber-500">Processing on TikTok ({processing})</span>;
   if (failed > 0 && success > 0) {
     return <span className="text-orange-500">Partial Success ({success}/{jobs.length})</span>;
   }
@@ -229,7 +280,7 @@ function OverallStatusBadge({ jobs }: { jobs: Job[] }) {
 }
 
 export const metadata = {
-  title: "Post Details — PostFlow",
+  title: "Post Details — iPostFlow",
 };
 
 export default async function PostDetailsPage({ params }: { params: Promise<{ id: string }> }) {
@@ -249,7 +300,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
   }
   const groupJobs = post.jobs.filter(isGroupJob);
   const publishedEngagementJobs = post.jobs.filter(
-    (job) => job.submissionStatus === "PUBLISHED" && job.postUrl,
+    (job) => job.submissionStatus === "PUBLISHED" && job.postUrl && isAnalyticsJob(job),
   );
   const pendingGroupJobs = groupJobs.filter(
     (job) => job.submissionStatus === "PENDING_APPROVAL",
@@ -376,7 +427,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                             rel="noopener noreferrer"
                             className="inline-flex items-center gap-1 text-xs text-amber-600 hover:underline"
                           >
-                            View Facebook post <ExternalLink className="h-3 w-3" />
+                            View post <ExternalLink className="h-3 w-3" />
                           </a>
                         )}
                       </div>
@@ -390,6 +441,13 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                       <span className="whitespace-pre-wrap break-words">{job.error}</span>
                     </div>
                   )}
+                  {job.platform === "TIKTOK" && (job.submissionStatus === "UNKNOWN" || job.submissionStatus === "PROCESSING") && (
+                    <TikTokReconciliationControls jobId={job._id} status={job.submissionStatus} postUrl={job.postUrl} reason={job.submissionReason} />
+                  )}
+                  {job.platform === "TIKTOK" && job.submissionStatus === "UNKNOWN" && !job.postUrl && (
+                    <ForceRetryPublishingButton jobId={job._id} />
+                  )}
+                  {job.status === "FAILED" && <RetryPublishingButton jobId={job._id} />}
 
                   <div className="mt-4 grid gap-3 text-xs sm:grid-cols-3">
                     <div>
@@ -400,14 +458,17 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                       <p className="font-medium text-muted-foreground">Engagement</p>
                       {job.engagement ? (
                         <div className="mt-1 space-y-1 text-foreground">
-                          <p>{job.engagement.reactionCount ?? "-"} reactions</p>
+                          <p>{job.engagement.reactionCount ?? "-"} {getReactionLabel(job)}</p>
                           <p>{job.engagement.commentCount ?? "-"} comments</p>
                           <p className="text-muted-foreground">Updated {timeAgo(job.engagement.lastSyncedAt)}</p>
                         </div>
                       ) : (
                         <p className="mt-1 text-foreground">Not synced</p>
                       )}
-                      {job.lastEngagementSyncError && (
+                      {(isInstagramJob(job) || isTikTokJob(job)) && job.submissionStatus === "PUBLISHED" && !job.engagement && (
+                        <p className="mt-1 text-muted-foreground">{isTikTokJob(job) ? "TikTok" : "Instagram"} analytics pending</p>
+                      )}
+                      {job.lastEngagementSyncError && isAnalyticsJob(job) && (
                         <p className="mt-1 break-words text-red-500">{job.lastEngagementSyncError}</p>
                       )}
                     </div>
@@ -418,7 +479,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                   </div>
 
                   <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-                    {job.submissionStatus === "PUBLISHED" && job.postUrl && (
+                    {job.submissionStatus === "PUBLISHED" && job.postUrl && isAnalyticsJob(job) && (
                       <RefreshPostEngagementButton postId={job._id} />
                     )}
                     {groupJob && (job.submissionStatus === "PENDING_APPROVAL" ||
@@ -484,10 +545,17 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                             rel="noopener noreferrer"
                             className="text-xs text-amber-500 hover:underline inline-flex items-center gap-1 mt-1"
                           >
-                            View Facebook post <ExternalLink className="w-3 h-3" />
+                            View post <ExternalLink className="w-3 h-3" />
                           </a>
                         )}
-                        {job.submissionStatus === "PUBLISHED" && job.postUrl && (
+                        {job.platform === "TIKTOK" && (job.submissionStatus === "UNKNOWN" || job.submissionStatus === "PROCESSING") && (
+                          <TikTokReconciliationControls jobId={job._id} status={job.submissionStatus} postUrl={job.postUrl} reason={job.submissionReason} />
+                        )}
+                        {job.platform === "TIKTOK" && job.submissionStatus === "UNKNOWN" && !job.postUrl && (
+                          <ForceRetryPublishingButton jobId={job._id} />
+                        )}
+                        {job.status === "FAILED" && <RetryPublishingButton jobId={job._id} />}
+                        {job.submissionStatus === "PUBLISHED" && job.postUrl && isAnalyticsJob(job) && (
                           <RefreshPostEngagementButton postId={job._id} />
                         )}
                         {groupJob && (job.submissionStatus === "PENDING_APPROVAL" ||
@@ -514,7 +582,7 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                       {job.engagement ? (
                         <div className="space-y-1 text-xs">
                           <div className="flex gap-3 text-foreground">
-                            <span>{job.engagement.reactionCount ?? "-"} reactions</span>
+                            <span>{job.engagement.reactionCount ?? "-"} {getReactionLabel(job)}</span>
                             <span>{job.engagement.commentCount ?? "-"} comments</span>
                           </div>
                           <div className="text-muted-foreground">
@@ -524,7 +592,10 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                       ) : (
                         <span className="text-xs text-muted-foreground">Not synced</span>
                       )}
-                      {job.lastEngagementSyncError && (
+                      {(isInstagramJob(job) || isTikTokJob(job)) && job.submissionStatus === "PUBLISHED" && !job.engagement && (
+                        <div className="mt-1 text-xs text-muted-foreground">{isTikTokJob(job) ? "TikTok" : "Instagram"} analytics pending</div>
+                      )}
+                      {job.lastEngagementSyncError && isAnalyticsJob(job) && (
                         <div className="mt-1 max-w-56 break-words text-xs text-red-500">{job.lastEngagementSyncError}</div>
                       )}
                     </td>

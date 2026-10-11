@@ -32,6 +32,10 @@ import {
   FacebookConnectionSchema,
 } from './schemas/facebook-connection.schema';
 import { ReportsModule } from './reports/reports.module';
+import {
+  PlatformConnection,
+  PlatformConnectionSchema,
+} from './schemas/platform-connection.schema';
 
 const envFilePath = [
   resolve(process.cwd(), '.env'),
@@ -56,6 +60,7 @@ const envFilePath = [
       { name: User.name, schema: UserSchema },
       { name: ExtensionInstallation.name, schema: ExtensionInstallationSchema },
       { name: FacebookConnection.name, schema: FacebookConnectionSchema },
+      { name: PlatformConnection.name, schema: PlatformConnectionSchema },
       { name: Group.name, schema: GroupSchema },
       { name: Post.name, schema: PostSchema },
       { name: PublishingJob.name, schema: PublishingJobSchema },

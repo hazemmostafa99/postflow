@@ -1,5 +1,16 @@
 // ── Constants ──
 
+interface FacebookResponseCandidateDetail {
+  requestUrl?: string;
+  requestStartedAt?: unknown;
+  isStoryCreateResponse?: unknown;
+  postUrls?: unknown[];
+  storyFbids?: unknown[];
+  videoIds?: unknown[];
+  uploadSessionIds?: unknown[];
+  pendingPostCandidates?: unknown[];
+}
+
 const EXCLUDED_SLUGS = new Set([
   "feed", "discover", "create", "joins",
   "requests", "questions", "members",
@@ -79,17 +90,6 @@ let isExecutingJob = false;
 let activeJobId: string | null = null;
 let activeJobUsesEnglishGroupFlow = false;
 let activeJobPublishedVideoIds: string[] = [];
-
-interface FacebookResponseCandidateDetail {
-  requestUrl?: string;
-  requestStartedAt?: unknown;
-  isStoryCreateResponse?: unknown;
-  postUrls?: unknown[];
-  storyFbids?: unknown[];
-  videoIds?: unknown[];
-  uploadSessionIds?: unknown[];
-  pendingPostCandidates?: unknown[];
-}
 
 interface PendingPostNetworkCandidate {
   postUrls: string[];
@@ -464,7 +464,14 @@ function getBestNetworkPendingPostUrl(session: PublishTrackingSession): string |
 
 function injectFacebookResponseSpy(): void {
   const script = document.createElement('script');
-  script.src = chrome.runtime.getURL('dist/graphql-spy.js');
+  const background = chrome.runtime.getManifest().background;
+  const serviceWorkerPath = background && 'service_worker' in background
+    ? background.service_worker
+    : '';
+  const directory = serviceWorkerPath.includes('/')
+    ? serviceWorkerPath.slice(0, serviceWorkerPath.lastIndexOf('/') + 1)
+    : '';
+  script.src = chrome.runtime.getURL(`${directory}graphql-spy.js`);
   script.onload = () => script.remove();
   (document.head || document.documentElement).appendChild(script);
 }
@@ -1052,6 +1059,46 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return;
   }
 
+  if (message.type === 'GET_PROFILE_VIDEO_POSTS') {
+    const expectedFacebookUserId = typeof message.expectedFacebookUserId === 'string'
+      ? message.expectedFacebookUserId
+      : '';
+    const submittedText = typeof message.submittedText === 'string'
+      ? message.submittedText
+      : '';
+    const includeNonVideo = message.includeNonVideo === true;
+    const candidates = /^\d+$/.test(expectedFacebookUserId)
+      ? getProfileVideoPostCandidates(document, expectedFacebookUserId, submittedText, includeNonVideo)
+      : [];
+    const currentProfileId = location.pathname.toLowerCase() === '/profile.php'
+      ? new URL(location.href).searchParams.get('id')
+      : null;
+    const pageText = (document.body.innerText ?? '').toLowerCase();
+    const hasProfileFeedCards = Boolean(
+      document.querySelector('[role="article"], [data-pagelet*="FeedUnit"]'),
+    );
+    const explicitlyEmptyProfile = [
+      'no posts yet',
+      "hasn't posted",
+      'has not posted',
+    ].some((cue) => pageText.includes(cue));
+    const surfaceReady = Boolean(
+      document.querySelector('[role="main"]') &&
+      currentProfileId === expectedFacebookUserId &&
+      (hasProfileFeedCards || explicitlyEmptyProfile),
+    );
+    console.log('[PostFlow] Profile video posts scanned', {
+      jobId: message.jobId,
+      expectedFacebookUserId,
+      submittedTextLength: submittedText.length,
+      includeNonVideo,
+      count: candidates.length,
+      surfaceReady,
+    });
+    sendResponse({ ok: true, surfaceReady, candidates });
+    return;
+  }
+
   if (message.type === 'CHECK_PENDING_POST') {
     void (async () => {
       try {
@@ -1267,11 +1314,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     const profileVideoNotificationBaselineKeys = Array.isArray(message.profileVideoNotificationBaselineKeys)
       ? message.profileVideoNotificationBaselineKeys.filter((value: unknown): value is string => typeof value === 'string')
       : null;
+    const profileVideoProfileBaselineUrls = Array.isArray(message.profileVideoProfileBaselineUrls)
+      ? message.profileVideoProfileBaselineUrls.filter((value: unknown): value is string => typeof value === 'string')
+      : null;
     executeFacebookPost(
       message.jobId,
       message.post,
       target,
       profileVideoNotificationBaselineKeys,
+      profileVideoProfileBaselineUrls,
     )
       .then((submissionResult) => {
         const publishedVideoIds = activeJobPublishedVideoIds;
@@ -1385,6 +1436,7 @@ async function executeFacebookPost(
   post: any,
   target: any,
   profileVideoNotificationBaselineKeys: readonly string[] | null = null,
+  profileVideoProfileBaselineUrls: readonly string[] | null = null,
 ): Promise<FacebookPostSubmissionResult> {
   return new Promise<FacebookPostSubmissionResult>(async (resolve, reject) => {
     isExecutingJob = true;
@@ -1932,6 +1984,20 @@ async function executeFacebookPost(
             .filter((url): url is string => Boolean(url))
             .map((url) => url.replace(/\/$/, '').toLowerCase()),
         );
+        const profileVideoBaselineUrls = hasVideo && profileVideoProfileBaselineUrls
+          ? new Set(
+            profileVideoProfileBaselineUrls.map((url) => url.replace(/\/$/, '').toLowerCase()),
+          )
+          : null;
+        if (profileVideoBaselineUrls) {
+          for (const url of profileVideoBaselineUrls) existingProfilePostUrls.add(url);
+        }
+        if (hasVideo) {
+          recordPostingStep(jobId, 'profile_video_baseline_ready', {
+            baselineAvailable: Boolean(profileVideoBaselineUrls),
+            baselineCount: profileVideoBaselineUrls?.size ?? 0,
+          });
+        }
         const existingProfileConfirmationSurfaceText = new Map(
           Array.from(document.querySelectorAll<HTMLElement>('[role="alert"], [role="status"], [aria-live]'))
             .map((element) => [element, `${element.innerText ?? element.textContent ?? ''} ${element.getAttribute('aria-label') ?? ''}`]),
@@ -1979,6 +2045,7 @@ async function executeFacebookPost(
           submittedAt: profileTrackingSession.submittedAt,
           existingPostElements: existingProfilePostElements,
           existingPostUrls: existingProfilePostUrls,
+          profileVideoBaselineUrls,
           submittedMediaCount: mediaUrls.length,
           trackingSession: profileTrackingSession,
           existingConfirmationSurfaceText: existingProfileConfirmationSurfaceText,
@@ -2255,6 +2322,7 @@ async function waitForProfileSubmissionResult(options: {
   submittedAt: number;
   existingPostElements: ReadonlySet<Element>;
   existingPostUrls: ReadonlySet<string>;
+  profileVideoBaselineUrls: ReadonlySet<string> | null;
   submittedMediaCount: number;
   trackingSession: ProfilePublishTrackingSession;
   existingConfirmationSurfaceText: ReadonlyMap<Element, string>;
@@ -2264,12 +2332,18 @@ async function waitForProfileSubmissionResult(options: {
 }): Promise<FacebookPostSubmissionResult> {
   const startedAt = Date.now();
   let acceptedVideoEvidence: string | null = null;
+  let acceptedVideoEvidenceAt: number | null = null;
   let acceptedVideoPersisted = false;
   let lastTrackingHeartbeatAt = 0;
   const successCues = [
     'your post is now published',
     'your post has been published',
     'post published',
+    'your post has been shared',
+    'your video has been shared',
+    'your reel has been shared',
+    'post shared',
+    'shared reel',
     '\u062a\u0645 \u0646\u0634\u0631',
     'ØªÙ… Ù†Ø´Ø±',
   ];
@@ -2323,6 +2397,9 @@ async function waitForProfileSubmissionResult(options: {
 
     acceptedVideoEvidence = acceptedVideoEvidence ??
       getAcceptedProfileVideoEvidence(options.dialog, options.hasVideo);
+    if (acceptedVideoEvidence && acceptedVideoEvidenceAt === null) {
+      acceptedVideoEvidenceAt = Date.now();
+    }
     if (acceptedVideoEvidence && !acceptedVideoPersisted) {
       const acceptance = await chrome.runtime.sendMessage({
         type: 'PROFILE_VIDEO_PUBLISH_ACCEPTED',
@@ -2334,16 +2411,18 @@ async function waitForProfileSubmissionResult(options: {
       }
     }
 
-    const publishedProfilePost = findPublishedProfilePost({
-      root: options.root,
-      expectedFacebookUserId: options.expectedFacebookUserId,
-      submittedText: options.submittedText,
-      submittedAt: options.submittedAt,
-      existingPostElements: options.existingPostElements,
-      existingPostUrls: options.existingPostUrls,
-      submittedMediaCount: options.submittedMediaCount,
-      allowUndatedMedia: Boolean(acceptedVideoEvidence),
-    });
+    const publishedProfilePost = options.hasVideo && !options.profileVideoBaselineUrls
+      ? null
+      : findPublishedProfilePost({
+        root: options.root,
+        expectedFacebookUserId: options.expectedFacebookUserId,
+        submittedText: options.submittedText,
+        submittedAt: options.submittedAt,
+        existingPostElements: options.existingPostElements,
+        existingPostUrls: options.existingPostUrls,
+        submittedMediaCount: options.submittedMediaCount,
+        allowUndatedMedia: Boolean(acceptedVideoEvidence),
+      });
     if (publishedProfilePost) {
       return { status: 'PUBLISHED', postUrl: publishedProfilePost.postUrl };
     }
@@ -2355,10 +2434,16 @@ async function waitForProfileSubmissionResult(options: {
       window.location.href,
       options.expectedFacebookUserId,
     );
-    if (currentPagePostUrl) return { status: 'PUBLISHED', postUrl: currentPagePostUrl };
+    if (
+      currentPagePostUrl &&
+      (!options.hasVideo || (
+        options.profileVideoBaselineUrls &&
+        !options.profileVideoBaselineUrls.has(currentPagePostUrl.replace(/\/$/, '').toLowerCase())
+      ))
+    ) return { status: 'PUBLISHED', postUrl: currentPagePostUrl };
 
     const visibleSurfaces = Array.from(document.querySelectorAll<HTMLElement>(
-      '[role="alert"], [role="status"], [aria-live]',
+      '[role="alert"], [role="status"], [aria-live], [role="dialog"], [aria-modal="true"]',
     )).filter((element) => {
       const style = window.getComputedStyle(element);
       return !element.hidden && element.getAttribute('aria-hidden') !== 'true' &&
@@ -2379,6 +2464,20 @@ async function waitForProfileSubmissionResult(options: {
       return {
         status: 'UNKNOWN',
         reason: 'Facebook rejected the profile post after clicking Post',
+      };
+    }
+
+    // A processed profile video may not expose a permalink in the composer
+    // tab at all. Once Facebook has closed the composer, return control to the
+    // background reconciler after a small grace period instead of blocking the
+    // publishing queue for the entire permalink timeout.
+    if (
+      acceptedVideoEvidence &&
+      acceptedVideoEvidenceAt !== null &&
+      Date.now() - acceptedVideoEvidenceAt >= POSTING_TIMING.profileVideoAcceptedEvidenceGraceMs
+    ) {
+      return {
+        status: 'PUBLISHED',
       };
     }
     await sleep(options.interval);

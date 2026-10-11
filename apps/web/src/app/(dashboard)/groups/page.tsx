@@ -108,8 +108,8 @@ function pageHref(page: number, search: string, connectionId: string): string {
 }
 
 export const metadata = {
-  title: "Groups - PostFlow",
-  description: "Browse and filter Facebook groups synced with PostFlow.",
+  title: "Groups - iPostFlow",
+  description: "Browse and filter Facebook groups synced with iPostFlow.",
 };
 
 export default async function GroupsPage({
@@ -209,7 +209,7 @@ export default async function GroupsPage({
           <p className="mt-1 max-w-md text-sm leading-6 text-muted-foreground">
             {hasFilters
               ? "Try a different group name or Facebook connection."
-              : "Open Facebook with the PostFlow extension to discover and sync your groups."}
+              : "Open Facebook with the iPostFlow extension to discover and sync your groups."}
           </p>
           {hasFilters && (
             <Link href="/groups" className="mt-4 text-sm font-medium text-primary hover:underline">

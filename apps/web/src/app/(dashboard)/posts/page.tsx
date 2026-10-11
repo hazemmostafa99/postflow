@@ -204,7 +204,7 @@ function getTargetSummary(jobs: Job[]): string {
 }
 
 export const metadata = {
-  title: "Posts - PostFlow",
+  title: "Posts - iPostFlow",
   description: "Manage and track your published Facebook posts.",
 };
 

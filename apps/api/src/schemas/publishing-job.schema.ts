@@ -6,12 +6,17 @@ import {
   PublishingTargetType,
   validatePublishingTarget,
 } from './publishing-target';
+import { PublishingPlatform } from './publishing-platform';
 
 export {
   PublishingTargetType,
   resolvePublishingTargetType,
   validatePublishingTarget,
 } from './publishing-target';
+export {
+  PublishingPlatform,
+  resolvePublishingPlatform,
+} from './publishing-platform';
 
 export type PublishingJobDocument = PublishingJob & Document;
 
@@ -19,6 +24,7 @@ export enum FacebookSubmissionStatus {
   PUBLISHED = 'PUBLISHED',
   PENDING_APPROVAL = 'PENDING_APPROVAL',
   UNKNOWN = 'UNKNOWN',
+  PROCESSING = 'PROCESSING',
 }
 
 export enum PublishingJobStatus {
@@ -42,6 +48,15 @@ export class PublishingJob {
   postId: Post;
 
   @Prop({
+    type: String,
+    required: true,
+    enum: Object.values(PublishingPlatform),
+    default: PublishingPlatform.FACEBOOK,
+    index: true,
+  })
+  platform: PublishingPlatform;
+
+  @Prop({
     required: true,
     enum: PublishingTargetType,
     default: PublishingTargetType.GROUP,
@@ -60,6 +75,14 @@ export class PublishingJob {
   })
   facebookConnectionId?: Types.ObjectId;
 
+  /** Generic owner for Instagram, TikTok, and migrated Facebook jobs. */
+  @Prop({
+    type: MongooseSchema.Types.ObjectId,
+    ref: 'PlatformConnection',
+    index: true,
+  })
+  platformConnectionId?: Types.ObjectId;
+
   @Prop({ required: true, default: PublishingJobStatus.PENDING })
   status: string;
 
@@ -69,6 +92,13 @@ export class PublishingJob {
 
   @Prop()
   claimExpiresAt?: Date;
+
+  /** Hash of the short-lived bearer token used to download this job's media. */
+  @Prop({ select: false })
+  mediaAccessTokenHash?: string;
+
+  @Prop()
+  mediaAccessExpiresAt?: Date;
 
   @Prop({ required: true, default: 0 })
   attempts: number;
@@ -85,6 +115,14 @@ export class PublishingJob {
 
   @Prop()
   postUrl?: string;
+
+  /** Platform correlation ID for an accepted upload/publish operation. */
+  @Prop()
+  externalPublishId?: string;
+
+  /** Stable platform post identity when it can be detected reliably. */
+  @Prop()
+  externalPostId?: string;
 
   @Prop()
   submissionReason?: string;
@@ -109,13 +147,21 @@ export class PublishingJob {
   @Prop()
   publishedDetectedAt?: Date;
 
-  /** Latest visible Facebook engagement counters. Kept separate from approval-sync metadata. */
+  /** Latest visible platform engagement counters. Kept separate from approval-sync metadata. */
   @Prop({
-    type: { reactionCount: Number, commentCount: Number, lastSyncedAt: Date },
+    type: {
+      reactionCount: Number,
+      commentCount: Number,
+      favoriteCount: Number,
+      shareCount: Number,
+      lastSyncedAt: Date,
+    },
   })
   engagement?: {
     reactionCount?: number;
     commentCount?: number;
+    favoriteCount?: number;
+    shareCount?: number;
     lastSyncedAt: Date;
   };
 
@@ -154,6 +200,10 @@ export class PublishingJob {
   @Prop()
   scheduledFor?: Date;
 
+  /** Set by an owner-initiated retry and consumed atomically by the worker. */
+  @Prop()
+  manualRetryRequestedAt?: Date;
+
   @Prop()
   startedAt?: Date;
 
@@ -167,9 +217,11 @@ PublishingJobSchema.index({ postId: 1 });
 
 PublishingJobSchema.pre('validate', function () {
   const validationError = validatePublishingTarget({
+    platform: this.platform,
     targetType: this.targetType,
     groupId: this.groupId,
     facebookConnectionId: this.facebookConnectionId,
+    platformConnectionId: this.platformConnectionId,
   });
   if (validationError) {
     this.invalidate(validationError.path, validationError.message);
@@ -184,6 +236,19 @@ PublishingJobSchema.index({
   flowOrder: 1,
   createdAt: 1,
 });
+
+PublishingJobSchema.index(
+  {
+    platformConnectionId: 1,
+    platform: 1,
+    targetType: 1,
+    status: 1,
+    scheduledFor: 1,
+    flowOrder: 1,
+    createdAt: 1,
+  },
+  { name: 'platform_connection_publish_queue' },
+);
 
 // Connection-scoped maintenance queues must be able to find due work without
 // scanning all jobs for a user or returning legacy jobs that have no owner.

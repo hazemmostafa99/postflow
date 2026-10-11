@@ -3,10 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev -p 3001",
     "build": "next build",
-    "start": "node --env-file=.env server.js",
-    "lint": "eslint"
+    "start": "next start -p 3001",
+    "lint": "eslint",
+    "test": "node --test tests/connection-lifecycle.test.cjs tests/connection-platforms.test.cjs tests/instagram-publishing.test.cjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",

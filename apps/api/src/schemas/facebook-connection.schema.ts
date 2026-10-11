@@ -1,5 +1,5 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-import { Document } from 'mongoose';
+import { Document, Schema as MongooseSchema, Types } from 'mongoose';
 
 export type FacebookConnectionDocument = FacebookConnection & Document;
 
@@ -34,9 +34,48 @@ export class FacebookConnection {
   @Prop({ index: true })
   extensionInstanceId?: string;
 
+  /** Current installation bound to this durable logical connection. */
+  @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'ExtensionInstallation', index: true })
+  activeExtensionInstallationId?: Types.ObjectId;
+
+  /** Soft-removal timestamp; Groups and jobs remain attached to this record. */
+  @Prop({ index: true })
+  archivedAt?: Date;
+
+  @Prop()
+  archivedByClerkUserId?: string;
+
+  @Prop()
+  archiveReason?: string;
+
+  /** Removed from Connections without entering the archive; jobs retain this ID. */
+  @Prop({ index: true })
+  removedAt?: Date;
+
+  /**
+   * One-time reconnect approval issued by an authenticated dashboard action.
+   * Only a hash of the approval token is stored; the plaintext is returned
+   * once and consumed by the reinstallation recovery flow.
+   */
+  @Prop()
+  reconnectApprovalTokenHash?: string;
+
+  @Prop()
+  reconnectApprovalRequestedAt?: Date;
+
+  @Prop()
+  reconnectApprovalExpiresAt?: Date;
+
+  @Prop()
+  reconnectApprovalUsedAt?: Date;
+
   /** User-provided label for recognizing this Chrome Profile. */
   @Prop({ trim: true, maxlength: 60 })
   displayName?: string;
+
+  /** Canonical form used to enforce per-user display-name uniqueness. */
+  @Prop()
+  displayNameKey?: string;
 
   /** Expected account identity, bound on the first verified session. */
   @Prop({ index: true })
@@ -68,4 +107,12 @@ export const FacebookConnectionSchema =
 FacebookConnectionSchema.index(
   { clerkUserId: 1, extensionInstanceId: 1 },
   { unique: true, sparse: true },
+);
+
+// Unnamed connections do not have a key and remain allowed. Named
+// connections must be unique for each PostFlow user, regardless of casing or
+// repeated whitespace in the label.
+FacebookConnectionSchema.index(
+  { clerkUserId: 1, displayNameKey: 1 },
+  { unique: true, partialFilterExpression: { displayNameKey: { $type: 'string' } } },
 );

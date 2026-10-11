@@ -4,16 +4,18 @@ import { auth } from "@clerk/nextjs/server";
 import { ArrowLeft, CheckCircle2, Send } from "lucide-react";
 import { redirect } from "next/navigation";
 
+const MARKETING_URL = process.env.NEXT_PUBLIC_MARKETING_URL ?? "http://localhost:3000";
+
 export default async function SignUpPage() {
   const { userId } = await auth();
-  if (userId) redirect("/");
+  if (userId) redirect("/dashboard");
 
   return (
     <main className="min-h-screen bg-background text-foreground">
       <div className="grid min-h-screen lg:grid-cols-[1.05fr_0.95fr]">
         <section className="relative hidden overflow-hidden border-r border-border bg-sidebar text-sidebar-foreground lg:flex lg:flex-col lg:justify-between">
           <div className="p-10">
-            <Link href="/" className="inline-flex items-center gap-2 text-sm text-sidebar-foreground/65 transition-colors hover:text-sidebar-foreground">
+            <Link href={MARKETING_URL} className="inline-flex items-center gap-2 text-sm text-sidebar-foreground/65 transition-colors hover:text-sidebar-foreground">
               <ArrowLeft className="h-4 w-4" />
               Back to home
             </Link>
@@ -24,7 +26,7 @@ export default async function SignUpPage() {
               <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground shadow-sm">
                 <Send className="h-5 w-5" />
               </span>
-              <span className="text-xl font-semibold">PostFlow</span>
+              <span className="text-xl font-semibold">iPostFlow</span>
             </div>
             <p className="text-sm font-semibold uppercase tracking-normal text-sidebar-primary">Start publishing</p>
             <h1 className="mt-4 text-4xl font-semibold leading-tight tracking-tight xl:text-5xl">
@@ -44,7 +46,7 @@ export default async function SignUpPage() {
           </div>
 
           <div className="p-10 text-sm text-sidebar-foreground/45">
-            Copyright {new Date().getFullYear()} PostFlow
+            Copyright {new Date().getFullYear()} iPostFlow
           </div>
         </section>
 
@@ -55,10 +57,10 @@ export default async function SignUpPage() {
                 <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary text-primary-foreground">
                   <Send className="h-5 w-5" />
                 </span>
-                <span className="text-xl font-semibold">PostFlow</span>
+                <span className="text-xl font-semibold">iPostFlow</span>
               </div>
               <h2 className="text-3xl font-semibold tracking-tight">Create your account</h2>
-              <p className="mt-2 text-muted-foreground">Start managing your posts and Facebook groups in PostFlow.</p>
+              <p className="mt-2 text-muted-foreground">Start managing your posts and Facebook groups in iPostFlow.</p>
             </div>
             <SignUp
               appearance={{
@@ -81,7 +83,7 @@ export default async function SignUpPage() {
                   formFieldAction: "text-primary hover:text-primary/80",
                 },
               }}
-              fallbackRedirectUrl="/"
+              fallbackRedirectUrl="/dashboard"
             />
           </div>
         </section>

@@ -8,6 +8,9 @@ import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { parseDigits, parsePhoneNumber } from 'libphonenumber-js/max';
 import {
+  LEAD_QUALIFICATION_STATUSES,
+  LeadQualificationStatus,
+  MAX_LEAD_NOTES_LENGTH,
   PhoneContact,
   PhoneContactDocument,
   PhoneContactSource,
@@ -18,8 +21,17 @@ const MAX_PHONE_SYNC_BATCH_SIZE = 500;
 interface ListPhoneContactsOptions {
   search?: string;
   category?: string;
+  group?: string;
+  qualificationStatus?: string;
   page?: number;
   limit?: number;
+  cursor?: string;
+  includeMetadata?: boolean;
+}
+
+interface PhoneContactCursor {
+  lastSeenAt: Date;
+  id: Types.ObjectId;
 }
 
 export interface PhoneSyncResult {
@@ -78,11 +90,146 @@ function normalizeCategory(value: unknown): string | undefined {
   return category;
 }
 
+// Groups are optional free-text labels independent from the contact category.
+// An explicit empty string clears an existing group.
+export function normalizeGroup(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string') {
+    throw new BadRequestException('Group must be text.');
+  }
+  const group = value.trim().replace(/\s+/g, ' ');
+  if (group.length > 80) {
+    throw new BadRequestException('Group may contain at most 80 characters.');
+  }
+  return group;
+}
+
+// Accepts only the three supported board states; undefined means "not supplied".
+export function normalizeQualificationStatus(
+  value: unknown,
+): LeadQualificationStatus | undefined {
+  if (value === undefined || value === null || value === '') {
+    return undefined;
+  }
+  if (
+    typeof value !== 'string' ||
+    !LEAD_QUALIFICATION_STATUSES.includes(value as LeadQualificationStatus)
+  ) {
+    throw new BadRequestException(
+      'Qualification status must be UNREVIEWED, QUALIFIED, or NOT_QUALIFIED.',
+    );
+  }
+  return value as LeadQualificationStatus;
+}
+
+// Normalizes plain-text notes and enforces the shared length limit.
+// An explicitly supplied empty string clears the stored notes.
+export function normalizeNotes(value: unknown): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== 'string') {
+    throw new BadRequestException('Notes must be text.');
+  }
+  const notes = value
+    .replace(/\r\n?/g, '\n')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
+    .trim();
+  if (notes.length > MAX_LEAD_NOTES_LENGTH) {
+    throw new BadRequestException(
+      `Notes may contain at most ${MAX_LEAD_NOTES_LENGTH} characters.`,
+    );
+  }
+  return notes;
+}
+
+// Contacts stored before qualification existed read as unreviewed, never rejected.
+export function resolveQualificationStatus(
+  value: unknown,
+): LeadQualificationStatus {
+  return LEAD_QUALIFICATION_STATUSES.includes(value as LeadQualificationStatus)
+    ? (value as LeadQualificationStatus)
+    : 'UNREVIEWED';
+}
+
+// Missing legacy notes read as an empty string instead of undefined.
+export function resolveNotes(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+// Missing legacy groups read as ungrouped without altering their category.
+export function resolveGroup(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+// Mongoose filter for one status; UNREVIEWED also matches legacy records that
+// predate the qualificationStatus field so they are never silently rejected.
+function buildStatusFilter(
+  status: LeadQualificationStatus,
+): Record<string, unknown> {
+  if (status === 'UNREVIEWED') {
+    return {
+      $or: [
+        { qualificationStatus: 'UNREVIEWED' },
+        { qualificationStatus: { $exists: false } },
+        { qualificationStatus: null },
+        { qualificationStatus: '' },
+      ],
+    };
+  }
+  return { qualificationStatus: status };
+}
+
 function normalizeContactId(id: string): Types.ObjectId {
   if (!Types.ObjectId.isValid(id)) {
     throw new NotFoundException('Phone contact was not found.');
   }
   return new Types.ObjectId(id);
+}
+
+function decodePhoneContactCursor(
+  value: string | undefined,
+): PhoneContactCursor | undefined {
+  if (!value) return undefined;
+  if (value.length > 512) {
+    throw new BadRequestException('Lead cursor is invalid.');
+  }
+  try {
+    const decoded: unknown = JSON.parse(
+      Buffer.from(value, 'base64url').toString('utf8'),
+    );
+    if (
+      !isRecord(decoded) ||
+      typeof decoded.lastSeenAt !== 'string' ||
+      typeof decoded.id !== 'string'
+    ) {
+      throw new Error('Invalid cursor shape');
+    }
+    const lastSeenAt = new Date(decoded.lastSeenAt);
+    if (
+      Number.isNaN(lastSeenAt.getTime()) ||
+      !Types.ObjectId.isValid(decoded.id)
+    ) {
+      throw new Error('Invalid cursor values');
+    }
+    return { lastSeenAt, id: new Types.ObjectId(decoded.id) };
+  } catch {
+    throw new BadRequestException('Lead cursor is invalid.');
+  }
+}
+
+function encodePhoneContactCursor(contact: {
+  _id: unknown;
+  lastSeenAt?: unknown;
+}): string {
+  const lastSeenAt = new Date(contact.lastSeenAt as string | number | Date);
+  return Buffer.from(
+    JSON.stringify({
+      lastSeenAt: lastSeenAt.toISOString(),
+      id: String(contact._id),
+    }),
+  ).toString('base64url');
 }
 
 function isDuplicateKeyError(error: unknown): boolean {
@@ -146,8 +293,11 @@ export class PhoneContactsService {
       : 20;
     const requestedPageNumber = Math.max(1, requestedPage);
     const limit = Math.min(100, Math.max(1, requestedLimit));
+    const cursor = decodePhoneContactCursor(options.cursor);
+    const includeMetadata = options.includeMetadata !== false;
     const search = options.search?.trim().slice(0, 128);
     const category = options.category?.trim().slice(0, 80);
+    const group = options.group?.trim().slice(0, 80);
     const escapedSearch = search?.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const categoryFilter =
       category === 'Uncategorized'
@@ -161,66 +311,193 @@ export class PhoneContactsService {
         : category
           ? { category }
           : undefined;
-    const filters = [
+    const groupFilter =
+      group === 'Ungrouped'
+        ? {
+            $or: [
+              { group: 'Ungrouped' },
+              { group: { $exists: false } },
+              { group: null },
+              { group: '' },
+            ],
+          }
+        : group
+          ? { group }
+          : undefined;
+    const qualificationStatus = normalizeQualificationStatus(
+      options.qualificationStatus,
+    );
+    const statusFilter = qualificationStatus
+      ? buildStatusFilter(qualificationStatus)
+      : undefined;
+    const baseFilters = [
       ...(escapedSearch
         ? [
             {
               $or: [
                 { normalizedNumber: { $regex: escapedSearch, $options: 'i' } },
                 { category: { $regex: escapedSearch, $options: 'i' } },
+                { group: { $regex: escapedSearch, $options: 'i' } },
               ],
             },
           ]
         : []),
       ...(categoryFilter ? [categoryFilter] : []),
+      ...(groupFilter ? [groupFilter] : []),
+    ];
+    const filterConditions = [
+      ...baseFilters,
+      ...(statusFilter ? [statusFilter] : []),
     ];
     const filter = {
       clerkUserId,
-      ...(filters.length ? { $and: filters } : {}),
+      ...(filterConditions.length ? { $and: filterConditions } : {}),
     };
+    // Counts for each status reflect the active search/group filters so a
+    // column can show its total even while a different column is paginated.
+    const countFilterForStatus = (status: LeadQualificationStatus) => ({
+      clerkUserId,
+      ...(baseFilters.length
+        ? { $and: [...baseFilters, buildStatusFilter(status)] }
+        : buildStatusFilter(status)),
+    });
 
-    const [total, storedCategories, uncategorizedCount] = await Promise.all([
-      this.phoneContactModel.countDocuments(filter),
-      this.phoneContactModel.distinct('category', { clerkUserId }).exec(),
-      this.phoneContactModel.countDocuments({
-        clerkUserId,
-        $or: [
-          { category: { $exists: false } },
-          { category: '' },
-          { category: 'Uncategorized' },
-        ],
-      }),
-    ]);
+    const metadata = includeMetadata
+      ? await Promise.all([
+          this.phoneContactModel.countDocuments(filter),
+          this.phoneContactModel.distinct('category', { clerkUserId }).exec(),
+          this.phoneContactModel.countDocuments({
+            clerkUserId,
+            $or: [
+              { category: { $exists: false } },
+              { category: '' },
+              { category: 'Uncategorized' },
+            ],
+          }),
+          this.phoneContactModel.distinct('group', { clerkUserId }).exec(),
+          this.phoneContactModel.countDocuments({
+            clerkUserId,
+            $or: [
+              { group: { $exists: false } },
+              { group: null },
+              { group: '' },
+              { group: 'Ungrouped' },
+            ],
+          }),
+          this.phoneContactModel.countDocuments(
+            countFilterForStatus('UNREVIEWED'),
+          ),
+          this.phoneContactModel.countDocuments(
+            countFilterForStatus('QUALIFIED'),
+          ),
+          this.phoneContactModel.countDocuments(
+            countFilterForStatus('NOT_QUALIFIED'),
+          ),
+        ] as const)
+      : undefined;
+    const [
+      total = 0,
+      storedCategories = [],
+      uncategorizedCount = 0,
+      storedGroups = [],
+      ungroupedCount = 0,
+      unreviewed = 0,
+      qualified = 0,
+      notQualified = 0,
+    ] = metadata ?? [];
     const totalPages = Math.max(1, Math.ceil(total / limit));
-    const page = Math.min(requestedPageNumber, totalPages);
-    const contacts = await this.phoneContactModel
-      .find(filter)
-      .select('_id normalizedNumber category source createdAt lastSeenAt')
+    const page = includeMetadata
+      ? Math.min(requestedPageNumber, totalPages)
+      : requestedPageNumber;
+    const cursorFilter = cursor
+      ? {
+          $or: [
+            { lastSeenAt: { $lt: cursor.lastSeenAt } },
+            { lastSeenAt: cursor.lastSeenAt, _id: { $lt: cursor.id } },
+          ],
+        }
+      : undefined;
+    const contactsAfterCursor = await this.phoneContactModel
+      .find({
+        clerkUserId,
+        ...([...filterConditions, ...(cursorFilter ? [cursorFilter] : [])]
+          .length
+          ? {
+              $and: [
+                ...filterConditions,
+                ...(cursorFilter ? [cursorFilter] : []),
+              ],
+            }
+          : {}),
+      })
+      .select(
+        '_id normalizedNumber category group qualificationStatus notes source createdAt lastSeenAt',
+      )
       .sort({ lastSeenAt: -1, _id: -1 })
-      .skip((page - 1) * limit)
-      .limit(limit)
+      .skip(cursor ? 0 : (page - 1) * limit)
+      .limit(limit + 1)
       .lean()
       .exec();
+    const hasMore =
+      contactsAfterCursor.length > limit ||
+      (!cursor && includeMetadata && page < totalPages);
+    const contacts = contactsAfterCursor.slice(0, limit);
+    const nextCursor =
+      hasMore && contacts.length
+        ? encodePhoneContactCursor(contacts[contacts.length - 1])
+        : null;
 
     return {
       contacts: contacts.map((contact) => ({
         ...contact,
         _id: contact._id.toString(),
+        qualificationStatus: resolveQualificationStatus(
+          contact.qualificationStatus,
+        ),
+        notes: resolveNotes(contact.notes),
+        group: resolveGroup(contact.group),
       })),
-      categories: Array.from(
-        new Set([
-          ...storedCategories.filter(
-            (value): value is string =>
-              typeof value === 'string' && Boolean(value.trim()),
-          ),
-          ...(uncategorizedCount > 0 ? ['Uncategorized'] : []),
-        ]),
-      ).sort((left, right) => left.localeCompare(right)),
+      ...(includeMetadata
+        ? {
+            categories: Array.from(
+              new Set([
+                ...storedCategories.filter(
+                  (value): value is string =>
+                    typeof value === 'string' && Boolean(value.trim()),
+                ),
+                ...(uncategorizedCount > 0 ? ['Uncategorized'] : []),
+              ]),
+            ).sort((left, right) => left.localeCompare(right)),
+          }
+        : {}),
+      ...(includeMetadata
+        ? {
+            groups: Array.from(
+              new Set([
+                ...storedGroups.filter(
+                  (value): value is string =>
+                    typeof value === 'string' && Boolean(value.trim()),
+                ),
+                ...(ungroupedCount > 0 ? ['Ungrouped'] : []),
+              ]),
+            ).sort((left, right) => left.localeCompare(right)),
+          }
+        : {}),
+      ...(includeMetadata
+        ? {
+            statusCounts: {
+              UNREVIEWED: unreviewed,
+              QUALIFIED: qualified,
+              NOT_QUALIFIED: notQualified,
+            },
+          }
+        : {}),
       pagination: {
         page,
         limit,
-        total,
-        totalPages,
+        ...(includeMetadata ? { total, totalPages } : {}),
+        hasMore,
+        nextCursor,
       },
     };
   }
@@ -235,19 +512,31 @@ export class PhoneContactsService {
       throw new BadRequestException('Enter a valid phone number.');
     }
     const category = normalizeCategory(payload.category) ?? 'Uncategorized';
+    const group = normalizeGroup(payload.group) ?? '';
+    const qualificationStatus =
+      normalizeQualificationStatus(payload.qualificationStatus) ?? 'UNREVIEWED';
+    const notes = normalizeNotes(payload.notes) ?? '';
 
     try {
       const contact = await this.phoneContactModel.create({
         clerkUserId,
         normalizedNumber,
         category,
+        group,
         source: { type: 'manual' },
         lastSeenAt: new Date(),
+        qualificationStatus,
+        notes,
       });
       return {
         _id: contact._id.toString(),
         normalizedNumber: contact.normalizedNumber,
         category: contact.category,
+        group: resolveGroup(contact.group),
+        qualificationStatus: resolveQualificationStatus(
+          contact.qualificationStatus,
+        ),
+        notes: resolveNotes(contact.notes),
         source: contact.source,
         lastSeenAt: contact.lastSeenAt,
       };
@@ -259,29 +548,73 @@ export class PhoneContactsService {
     }
   }
 
-  /** Updates the number and category for one user-owned contact. */
+  /** Partially updates one user-owned contact. */
   async updatePhoneContact(clerkUserId: string, id: string, payload: unknown) {
     if (!isRecord(payload)) {
       throw new BadRequestException('Phone contact changes are required.');
     }
-    const normalizedNumber = normalizePhoneNumber(payload.number);
-    if (!normalizedNumber) {
-      throw new BadRequestException('Enter a valid phone number.');
+
+    // Only fields present with a non-null value are treated as supplied, so a
+    // status-only quick action cannot wipe unrelated lead fields.
+    const supplied = (field: string) =>
+      Object.prototype.hasOwnProperty.call(payload, field) &&
+      payload[field] !== undefined &&
+      payload[field] !== null;
+
+    const updates: Record<string, unknown> = {};
+    if (supplied('number')) {
+      const normalizedNumber = normalizePhoneNumber(payload.number);
+      if (!normalizedNumber) {
+        throw new BadRequestException('Enter a valid phone number.');
+      }
+      updates.normalizedNumber = normalizedNumber;
     }
-    const category = normalizeCategory(payload.category) ?? 'Uncategorized';
+    if (supplied('category')) {
+      updates.category = normalizeCategory(payload.category) ?? 'Uncategorized';
+    }
+    if (supplied('group')) {
+      updates.group = normalizeGroup(payload.group) ?? '';
+    }
+    if (supplied('qualificationStatus')) {
+      updates.qualificationStatus = normalizeQualificationStatus(
+        payload.qualificationStatus,
+      );
+      if (!updates.qualificationStatus) {
+        throw new BadRequestException(
+          'Qualification status must be UNREVIEWED, QUALIFIED, or NOT_QUALIFIED.',
+        );
+      }
+    }
+    if (supplied('notes')) {
+      updates.notes = normalizeNotes(payload.notes) ?? '';
+    }
+
+    if (Object.keys(updates).length === 0) {
+      throw new BadRequestException('Phone contact changes are required.');
+    }
 
     try {
       const contact = await this.phoneContactModel
         .findOneAndUpdate(
           { _id: normalizeContactId(id), clerkUserId },
-          { $set: { normalizedNumber, category } },
+          { $set: updates },
           { new: true, runValidators: true },
         )
-        .select('_id normalizedNumber category source createdAt lastSeenAt')
+        .select(
+          '_id normalizedNumber category group qualificationStatus notes source createdAt lastSeenAt',
+        )
         .lean()
         .exec();
       if (!contact) throw new NotFoundException('Phone contact was not found.');
-      return { ...contact, _id: contact._id.toString() };
+      return {
+        ...contact,
+        _id: contact._id.toString(),
+        qualificationStatus: resolveQualificationStatus(
+          contact.qualificationStatus,
+        ),
+        notes: resolveNotes(contact.notes),
+        group: resolveGroup(contact.group),
+      };
     } catch (error) {
       if (isDuplicateKeyError(error)) {
         throw new ConflictException('This phone number already exists.');
@@ -345,6 +678,12 @@ export class PhoneContactsService {
               clerkUserId,
               normalizedNumber,
               ...(!category ? { category: 'Uncategorized' } : {}),
+              group: '',
+              // New sync leads start unreviewed and ungrouped; existing leads
+              // keep their group, status, and notes because they are never
+              // $set here.
+              qualificationStatus: 'UNREVIEWED' as const,
+              notes: '',
             },
           },
           upsert: true,

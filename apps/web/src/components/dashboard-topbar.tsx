@@ -7,7 +7,7 @@ import { DeleteButton } from "@/components/delete-button";
 import { NewPostDialog } from "@/components/new-post-dialog";
 
 const PAGE_TITLES: Array<{ match: (path: string) => boolean; title: string }> = [
-  { match: (path) => path === "/", title: "Overview" },
+  { match: (path) => path === "/dashboard", title: "Overview" },
   { match: (path) => path === "/posts", title: "Posts" },
   { match: (path) => path.startsWith("/posts/"), title: "Post Details" },
   { match: (path) => path === "/reports", title: "Reports" },
@@ -20,12 +20,12 @@ const PAGE_TITLES: Array<{ match: (path: string) => boolean; title: string }> = 
 
 export function DashboardTopbar({ role }: { role?: string }) {
   const pathname = usePathname();
-  const title = PAGE_TITLES.find((page) => page.match(pathname))?.title ?? "PostFlow";
+  const title = PAGE_TITLES.find((page) => page.match(pathname))?.title ?? "iPostFlow";
   const searchable = pathname === "/users" || pathname === "/teams";
   const searchPlaceholder = pathname === "/users" ? "Search users" : "Search teams";
 
   function search(value: string) {
-    window.dispatchEvent(new CustomEvent("postflow:topbar-search", { detail: { pathname, value } }));
+    window.dispatchEvent(new CustomEvent("iPostFlow:topbar-search", { detail: { pathname, value } }));
   }
 
   return (
@@ -39,16 +39,16 @@ export function DashboardTopbar({ role }: { role?: string }) {
           </div>
         )}
         {pathname === "/teams" && role === "ADMIN" && (
-          <button onClick={() => window.dispatchEvent(new Event("postflow:add-team"))} className="inline-flex h-9 items-center justify-center rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90">
+          <button onClick={() => window.dispatchEvent(new Event("iPostFlow:add-team"))} className="inline-flex h-9 items-center justify-center rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90">
             Add Team
           </button>
         )}
         {pathname === "/users" && (role === "ADMIN" || role === "MANAGER") && (
-          <button onClick={() => window.dispatchEvent(new Event("postflow:invite-user"))} className="inline-flex h-9 items-center justify-center rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90">
+          <button onClick={() => window.dispatchEvent(new Event("iPostFlow:invite-user"))} className="inline-flex h-9 items-center justify-center rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90">
             Invite user
           </button>
         )}
-        {pathname === "/" && (
+        {pathname === "/dashboard" && (
           <Link href="/posts" prefetch={false} className="inline-flex h-9 items-center justify-center rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90">
             View posts
           </Link>
@@ -66,3 +66,4 @@ export function DashboardTopbar({ role }: { role?: string }) {
     </div>
   );
 }
+

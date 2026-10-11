@@ -9,8 +9,9 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "PostFlow",
-  description: "Create, publish, and monitor Facebook group posts.",
+  title:  "iPostFlow",
+  description: "iPostFlow sales publishing dashboard.",
+  robots: { index: false, follow: false },
 };
 
 export default function RootLayout({

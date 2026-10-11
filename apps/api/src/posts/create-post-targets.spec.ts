@@ -1,5 +1,7 @@
 import { PublishingTargetType } from '../schemas/publishing-target';
 import {
+  isVerifiedInstagramConnection,
+  isVerifiedPlatformConnection,
   isVerifiedProfileConnection,
   normalizeCreatePostTargets,
 } from './create-post-targets';
@@ -26,10 +28,41 @@ describe('normalizeCreatePostTargets', () => {
     ]);
   });
 
+  it('normalizes Instagram Feed and Reel targets', () => {
+    expect(
+      normalizeCreatePostTargets(
+        [
+          { type: 'INSTAGRAM_FEED', platformConnectionId: connectionId },
+          { type: 'INSTAGRAM_REEL', platformConnectionId: '64b000000000000000000003' },
+        ],
+        undefined,
+      ),
+    ).toEqual([
+      { type: PublishingTargetType.INSTAGRAM_FEED, platformConnectionId: connectionId },
+      { type: PublishingTargetType.INSTAGRAM_REEL, platformConnectionId: '64b000000000000000000003' },
+    ]);
+  });
+
   it('converts legacy targetGroupIds to Group targets', () => {
     expect(normalizeCreatePostTargets(undefined, [groupId])).toEqual([
       { type: PublishingTargetType.GROUP, groupId },
     ]);
+  });
+
+  it('normalizes a TikTok target and rejects mixed Facebook fields', () => {
+    expect(normalizeCreatePostTargets([{ type: 'TIKTOK_VIDEO', platformConnectionId: connectionId }], undefined))
+      .toEqual([{ type: PublishingTargetType.TIKTOK_VIDEO, platformConnectionId: connectionId }]);
+    expect(normalizeCreatePostTargets([{ type: 'TIKTOK_PHOTO', platformConnectionId: connectionId }], undefined))
+      .toEqual([{ type: PublishingTargetType.TIKTOK_PHOTO, platformConnectionId: connectionId }]);
+    expect(() => normalizeCreatePostTargets([{ type: 'TIKTOK_VIDEO', platformConnectionId: connectionId, groupId }], undefined))
+      .toThrow('Platform targets must not include Facebook destinations');
+  });
+
+  it('verifies TikTok identity and rejects cross-platform or mismatched connections', () => {
+    const connection = { platform: 'TIKTOK', status: 'CONNECTED', sessionDetected: true, externalUsername: 'Creator', detectedExternalUsername: 'creator' };
+    expect(isVerifiedPlatformConnection(connection, 'TIKTOK')).toBe(true);
+    expect(isVerifiedPlatformConnection(connection, 'INSTAGRAM')).toBe(false);
+    expect(isVerifiedPlatformConnection({ ...connection, detectedExternalUsername: 'someone.else' }, 'TIKTOK')).toBe(false);
   });
 
   it('canonicalizes object IDs for stable ownership lookup', () => {
@@ -111,6 +144,18 @@ describe('normalizeCreatePostTargets', () => {
         facebookSessionDetected: true,
         facebookUserId: 'facebook-user-1',
         detectedFacebookUserId: 'facebook-user-1',
+      }),
+    ).toBe(true);
+  });
+
+  it('accepts an identity-matched connected Instagram session by username', () => {
+    expect(
+      isVerifiedInstagramConnection({
+        platform: 'INSTAGRAM',
+        status: 'CONNECTED',
+        sessionDetected: true,
+        externalUsername: 'brand.account',
+        detectedExternalUsername: 'Brand.Account',
       }),
     ).toBe(true);
   });

@@ -17,7 +17,16 @@ Create `apps/api/.env`:
 DATABASE_URL=mongodb://localhost:27017/postflow
 CLERK_SECRET_KEY=your_secret_key
 PORT=8000
+TIKTOK_EXTENSION_PUBLISHING_ENABLED=true
 ```
+
+Set `TIKTOK_EXTENSION_PUBLISHING_ENABLED=true` only when the TikTok browser
+publishing build and web flag are being rolled out together. The API gate is
+authoritative: leaving it unset or false rejects new TikTok jobs and claims,
+while already-running jobs can still report terminal outcomes safely.
+Restart the API after changing the value; startup logs now emit
+`[PostFlow] TikTok extension publishing { enabled: true|false }` so a stale
+process or deployment environment is immediately visible.
 
 ## Development
 

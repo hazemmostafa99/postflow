@@ -77,6 +77,58 @@ test('derives an owner-scoped profile video URL from a publish response', () => 
   );
 });
 
+test('collects profile video candidates for a before/after permalink snapshot', () => {
+  const app = setup(`
+    <div role="article" id="photo">
+      <a href="https://www.facebook.com/profile.php?id=12345&story_fbid=100">photo</a>
+      <img src="photo.jpg">
+    </div>
+    <div role="article" id="old-video">
+      <a href="https://www.facebook.com/reel/200/">old video</a>
+      <video src="old.mp4"></video>
+    </div>
+    <div role="article" id="new-video">
+      <a href="https://www.facebook.com/profile-name/videos/300/">new caption</a>
+      <video src="new.mp4"></video>
+    </div>
+  `);
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(app.context.getProfileVideoPostCandidates(app.document, '12345'))),
+    [
+      {
+        postUrl: 'https://www.facebook.com/reel/200/',
+        text: 'old video',
+      },
+      {
+        postUrl: 'https://www.facebook.com/profile-name/videos/300/',
+        text: 'new caption',
+      },
+    ],
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(app.context.getProfileVideoPostCandidates(app.document, '12345', 'new caption'))),
+    [{ postUrl: 'https://www.facebook.com/profile-name/videos/300/', text: 'new caption' }],
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(app.context.getProfileVideoPostCandidates(app.document, '12345', '', true))),
+    [
+      {
+        postUrl: 'https://www.facebook.com/profile.php?id=12345&story_fbid=100',
+        text: 'photo',
+      },
+      {
+        postUrl: 'https://www.facebook.com/reel/200/',
+        text: 'old video',
+      },
+      {
+        postUrl: 'https://www.facebook.com/profile-name/videos/300/',
+        text: 'new caption',
+      },
+    ],
+  );
+});
+
 test('finds a new matching profile post and rejects old or unrelated posts', () => {
   const app = setup(`
     <div role="article" id="old">

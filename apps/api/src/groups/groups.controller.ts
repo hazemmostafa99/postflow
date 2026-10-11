@@ -31,6 +31,7 @@ export class GroupsController {
     @Headers('x-clerk-user-id') clerkUserId: string,
     @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
     @Body() body: SyncGroupsDto,
+    @Headers('x-extension-credential') credential?: string,
   ) {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
@@ -38,6 +39,7 @@ export class GroupsController {
       clerkUserId,
       body.groups ?? [],
       extensionInstanceId,
+      credential,
     );
   }
 

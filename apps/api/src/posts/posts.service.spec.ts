@@ -15,15 +15,19 @@ import { Types } from 'mongoose';
 import { PublishingTargetType } from '../schemas/publishing-target';
 import { UserRole } from '../schemas/user.schema';
 import { PostsService } from './posts.service';
+import * as tikTokPolicy from './tiktok-publishing-policy';
 
 type InsertedJob = {
+  platform?: string;
   targetType: PublishingTargetType;
   groupId?: unknown;
   facebookConnectionId?: unknown;
+  platformConnectionId?: unknown;
   scheduledFor?: Date;
 };
 
 describe('PostsService.createPost', () => {
+  afterEach(() => jest.restoreAllMocks());
   const userId = 'clerk-user-1';
   const postId = '64b000000000000000000010';
   const groupId = '64b000000000000000000001';
@@ -32,9 +36,11 @@ describe('PostsService.createPost', () => {
   function createHarness(options?: {
     groups?: Record<string, unknown>[];
     connections?: Record<string, unknown>[];
+    platformConnections?: Record<string, unknown>[];
   }) {
     const groups = options?.groups ?? [];
     const connections = options?.connections ?? [];
+    const platformConnections = options?.platformConnections ?? [];
     const postDocument = {
       _id: { toString: () => postId },
       toObject: () => ({ clerkUserId: userId, content: 'Hello' }),
@@ -58,6 +64,11 @@ describe('PostsService.createPost', () => {
         exec: jest.fn().mockResolvedValue(connections),
       }),
     };
+    const platformConnectionModel = {
+      find: jest.fn().mockReturnValue({
+        exec: jest.fn().mockResolvedValue(platformConnections),
+      }),
+    };
     const service = new PostsService(
       postModel as never,
       jobModel as never,
@@ -65,9 +76,10 @@ describe('PostsService.createPost', () => {
       connectionModel as never,
       {} as never,
       {} as never,
+      platformConnectionModel as never,
     );
 
-    return { service, postModel, jobModel, insertedJobs };
+    return { service, postModel, jobModel, insertedJobs, platformConnectionModel };
   }
 
   function verifiedConnection() {
@@ -129,6 +141,98 @@ describe('PostsService.createPost', () => {
     ]);
   });
 
+  it('creates a verified Instagram Feed job with one image', async () => {
+    const platformConnection = {
+      _id: { toString: () => connectionId },
+      clerkUserId: userId,
+      platform: 'INSTAGRAM',
+      status: 'CONNECTED',
+      sessionDetected: true,
+      externalUsername: 'brand.account',
+      detectedExternalUsername: 'brand.account',
+    };
+    const { service, insertedJobs } = createHarness({
+      platformConnections: [platformConnection],
+    });
+
+    await service.createPost(userId, {
+      content: 'Instagram launch',
+      mediaUrls: ['data:image/png;base64,AAAA'],
+      targets: [
+        {
+          type: PublishingTargetType.INSTAGRAM_FEED,
+          platformConnectionId: connectionId,
+        },
+      ],
+    });
+
+    expect(insertedJobs[0]).toEqual([
+      expect.objectContaining({
+        platform: 'INSTAGRAM',
+        targetType: PublishingTargetType.INSTAGRAM_FEED,
+        platformConnectionId: platformConnection._id,
+      }),
+    ]);
+  });
+
+  it('creates one verified Instagram Feed job for an image carousel', async () => {
+    const platformConnection = {
+      _id: { toString: () => connectionId },
+      clerkUserId: userId,
+      platform: 'INSTAGRAM',
+      status: 'CONNECTED',
+      sessionDetected: true,
+      externalUsername: 'brand.account',
+      detectedExternalUsername: 'brand.account',
+    };
+    const { service, insertedJobs } = createHarness({
+      platformConnections: [platformConnection],
+    });
+
+    await service.createPost(userId, {
+      content: 'Carousel launch',
+      mediaUrls: [
+        'data:image/png;base64,AAAA',
+        'data:image/jpeg;base64,BBBB',
+        'data:image/png;base64,CCCC',
+      ],
+      targets: [{
+        type: PublishingTargetType.INSTAGRAM_FEED,
+        platformConnectionId: connectionId,
+      }],
+    });
+
+    expect(insertedJobs[0]?.[0]).toEqual(expect.objectContaining({
+      platform: 'INSTAGRAM',
+      targetType: PublishingTargetType.INSTAGRAM_FEED,
+    }));
+  });
+
+  it('rejects mixed Instagram Feed media before creating a job', async () => {
+    const platformConnection = {
+      _id: { toString: () => connectionId },
+      clerkUserId: userId,
+      platform: 'INSTAGRAM',
+      status: 'CONNECTED',
+      sessionDetected: true,
+      externalUsername: 'brand.account',
+      detectedExternalUsername: 'brand.account',
+    };
+    const { service, insertedJobs } = createHarness({
+      platformConnections: [platformConnection],
+    });
+
+    await expect(service.createPost(userId, {
+      content: 'Mixed media',
+      mediaUrls: ['data:image/png;base64,AAAA', 'data:video/mp4;base64,BBBB'],
+      targets: [{
+        type: PublishingTargetType.INSTAGRAM_FEED,
+        platformConnectionId: connectionId,
+      }],
+    })).rejects.toThrow('Instagram Feed supports images only');
+    expect(insertedJobs).toHaveLength(0);
+  });
+
   it('preserves mixed target order and applies random spacing', async () => {
     const random = jest.spyOn(Math, 'random').mockReturnValue(0);
     const { service, insertedJobs } = createHarness({
@@ -163,6 +267,71 @@ describe('PostsService.createPost', () => {
       groupId,
     ]);
   });
+
+  function tikTokConnection(overrides: Record<string, unknown> = {}) {
+    return { _id: { toString: () => connectionId }, platform: 'TIKTOK', status: 'CONNECTED', sessionDetected: true,
+      externalUsername: 'creator', detectedExternalUsername: 'creator', ...overrides };
+  }
+
+  it('blocks disabled TikTok creation before writes', async () => {
+    jest.spyOn(tikTokPolicy, 'isTikTokPublishingEnabled').mockReturnValue(false);
+    const { service, postModel, jobModel } = createHarness();
+    await expect(service.createPost(userId, { content: '', mediaUrls: ['data:video/mp4;base64,AAAA'],
+      targets: [{ type: PublishingTargetType.TIKTOK_VIDEO, platformConnectionId: connectionId }] }))
+      .rejects.toThrow('TikTok publishing is not available yet');
+    expect(postModel.create).not.toHaveBeenCalled();
+    expect(jobModel.insertMany).not.toHaveBeenCalled();
+  });
+
+  it('creates and schedules a TikTok video job when enabled', async () => {
+    jest.spyOn(tikTokPolicy, 'isTikTokPublishingEnabled').mockReturnValue(true);
+    const connection = tikTokConnection();
+    const { service, insertedJobs } = createHarness({ platformConnections: [connection] });
+    const result = await service.createPost(userId, { content: '', mediaUrls: ['data:video/mp4;base64,AAAA'],
+      targets: [{ type: PublishingTargetType.TIKTOK_VIDEO, platformConnectionId: connectionId }], startTime: '2026-10-15T10:00:00Z' });
+    expect(insertedJobs[0][0]).toMatchObject({ platform: 'TIKTOK', targetType: 'TIKTOK_VIDEO', platformConnectionId: connection._id,
+      scheduledFor: new Date('2026-10-15T10:00:00Z') });
+    expect(result.schedule[0].targetType).toBe('TIKTOK_VIDEO');
+  });
+
+  it('creates one TikTok photo job for multiple images when enabled', async () => {
+    jest.spyOn(tikTokPolicy, 'isTikTokPublishingEnabled').mockReturnValue(true);
+    const connection = tikTokConnection();
+    const { service, insertedJobs } = createHarness({ platformConnections: [connection] });
+    await service.createPost(userId, { content: 'photos', mediaUrls: [
+      'data:image/png;base64,AAAA', 'data:image/jpeg;base64,AAAA',
+    ], targets: [{ type: PublishingTargetType.TIKTOK_PHOTO, platformConnectionId: connectionId }] });
+    expect(insertedJobs[0][0]).toMatchObject({ platform: 'TIKTOK', targetType: 'TIKTOK_PHOTO',
+      platformConnectionId: connection._id });
+  });
+
+  it('rejects mixed TikTok photo media before writes', async () => {
+    jest.spyOn(tikTokPolicy, 'isTikTokPublishingEnabled').mockReturnValue(true);
+    const { service, postModel } = createHarness({ platformConnections: [tikTokConnection()] });
+    await expect(service.createPost(userId, { content: 'caption', mediaUrls: [
+      'data:image/png;base64,AAAA', 'data:video/mp4;base64,AAAA',
+    ], targets: [{ type: PublishingTargetType.TIKTOK_PHOTO, platformConnectionId: connectionId }] }))
+      .rejects.toThrow('TikTok Photo requires');
+    expect(postModel.create).not.toHaveBeenCalled();
+  });
+
+  it.each([[], ['data:image/png;base64,AAAA'], ['data:video/mp4;base64,AAAA', 'data:image/png;base64,AAAA']].map((media) => [media]))
+    ('rejects incompatible TikTok media before writes: %j', async (mediaUrls) => {
+      jest.spyOn(tikTokPolicy, 'isTikTokPublishingEnabled').mockReturnValue(true);
+      const { service, postModel } = createHarness({ platformConnections: [tikTokConnection()] });
+      await expect(service.createPost(userId, { content: 'caption', mediaUrls,
+        targets: [{ type: PublishingTargetType.TIKTOK_VIDEO, platformConnectionId: connectionId }] })).rejects.toThrow('TikTok Video requires');
+      expect(postModel.create).not.toHaveBeenCalled();
+    });
+
+  it.each([{ platform: 'INSTAGRAM' }, { detectedExternalUsername: 'wrong.account' }, { status: 'PAUSED' }])
+    ('rejects an unverified TikTok destination: %j', async (overrides) => {
+      jest.spyOn(tikTokPolicy, 'isTikTokPublishingEnabled').mockReturnValue(true);
+      const { service, postModel } = createHarness({ platformConnections: [tikTokConnection(overrides)] });
+      await expect(service.createPost(userId, { content: '', mediaUrls: ['data:video/mp4;base64,AAAA'],
+        targets: [{ type: PublishingTargetType.TIKTOK_VIDEO, platformConnectionId: connectionId }] })).rejects.toThrow('verified session');
+      expect(postModel.create).not.toHaveBeenCalled();
+    });
 
   it('keeps legacy targetGroupIds compatible', async () => {
     const targetGroup = group();

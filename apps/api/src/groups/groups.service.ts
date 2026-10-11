@@ -17,6 +17,7 @@ import {
   FacebookConnectionDocument,
   FacebookConnectionStatus,
 } from '../schemas/facebook-connection.schema';
+import { ExtensionsService } from '../extensions/extensions.service';
 
 export interface SyncGroupDto {
   externalId: string;
@@ -86,21 +87,38 @@ export class GroupsService {
     private readonly jobModel: Model<PublishingJobDocument>,
     @InjectModel(FacebookConnection.name)
     private readonly connectionModel: Model<FacebookConnectionDocument>,
+    private readonly extensionsService: ExtensionsService,
   ) {}
 
   private async assertVerifiedConnection(
     clerkUserId: string,
     extensionInstanceId?: string,
+    credential?: string,
   ): Promise<FacebookConnectionDocument | null> {
     const normalizedInstanceId = extensionInstanceId?.trim();
     if (!normalizedInstanceId) return null;
 
-    const connection = await this.connectionModel
-      .findOne({ clerkUserId, extensionInstanceId: normalizedInstanceId })
-      .lean()
-      .exec();
+    // Worker identity + lifecycle gate: the installation must exist, present a
+    // valid credential, be non-revoked, and be ACTIVE to claim group sync work
+    // on a live, unarchived connection it is the active binding for.
+    const installation = await this.extensionsService.verifyWorkerIdentity(
+      clerkUserId,
+      normalizedInstanceId,
+      credential,
+    );
+    this.extensionsService.assertInstallationActive(installation);
+    const connection = await this.extensionsService.resolveActiveWorkerConnection(
+      clerkUserId,
+      installation,
+    );
+    if (!connection) {
+      throw new ForbiddenException(
+        'Facebook identity must be verified before syncing groups.',
+      );
+    }
+
     const verified = Boolean(
-      connection?.status === FacebookConnectionStatus.CONNECTED &&
+      connection.status === FacebookConnectionStatus.CONNECTED &&
       connection.facebookSessionDetected &&
       connection.facebookUserId &&
       connection.detectedFacebookUserId &&
@@ -111,7 +129,7 @@ export class GroupsService {
         'Facebook identity must be verified before syncing groups.',
       );
     }
-    return connection as FacebookConnectionDocument;
+    return connection;
   }
 
   /**
@@ -122,10 +140,12 @@ export class GroupsService {
     clerkUserId: string,
     groups: SyncGroupDto[],
     extensionInstanceId?: string,
+    credential?: string,
   ): Promise<{ synced: number; total?: number }> {
     const connection = await this.assertVerifiedConnection(
       clerkUserId,
       extensionInstanceId,
+      credential,
     );
     const connectionId = connection?._id;
     if (!groups.length) return { synced: 0 };

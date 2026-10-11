@@ -5,7 +5,7 @@ import { redirect } from "next/navigation";
 
 export default async function SignInPage() {
   const { userId } = await auth();
-  if (userId) redirect("/");
+  if (userId) redirect("/dashboard");
 
   return (
     <main className="min-h-screen bg-background text-foreground">
@@ -16,12 +16,12 @@ export default async function SignInPage() {
               <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground shadow-sm">
                 <Send className="h-5 w-5" />
               </span>
-              <span className="text-xl font-semibold">PostFlow</span>
+              <span className="text-xl font-semibold">iPostFlow</span>
             </div>
           </div>
 
           <div className="max-w-xl p-10">
-            <p className="text-sm font-semibold uppercase tracking-normal text-sidebar-primary">PostFlow</p>
+            <p className="text-sm font-semibold uppercase tracking-normal text-sidebar-primary">iPostFlow</p>
             <h1 className="mt-4 text-4xl font-semibold leading-tight tracking-tight xl:text-5xl">
               Publish to your Facebook Groups from one focused dashboard.
             </h1>
@@ -45,7 +45,7 @@ export default async function SignInPage() {
           </div>
 
           <div className="p-10 text-sm text-sidebar-foreground/45">
-            Copyright {new Date().getFullYear()} PostFlow
+            Copyright {new Date().getFullYear()} iPostFlow
           </div>
         </section>
 
@@ -56,7 +56,7 @@ export default async function SignInPage() {
                 <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary text-primary-foreground">
                   <Send className="h-5 w-5" />
                 </span>
-                <span className="text-xl font-semibold">PostFlow</span>
+                <span className="text-xl font-semibold">iPostFlow</span>
               </div>
               <h2 className="text-3xl font-semibold tracking-tight">Welcome back</h2>
               <p className="mt-2 text-muted-foreground">Sign in to manage your posts and Facebook groups.</p>
@@ -83,7 +83,7 @@ export default async function SignInPage() {
                   formFieldAction: "text-primary hover:text-primary/80",
                 },
               }}
-              fallbackRedirectUrl="/"
+              fallbackRedirectUrl="/dashboard"
             />
           </div>
         </section>

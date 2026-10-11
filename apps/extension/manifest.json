@@ -2,24 +2,26 @@
   "manifest_version": 3,
   "name": "PostFlow",
   "version": "0.1.0",
-  "description": "PostFlow Facebook Groups POC",
+  "description": "PostFlow publishing and sync for Facebook, Instagram, and TikTok",
   "permissions": [
     "storage",
     "tabs",
     "alarms",
     "activeTab",
     "scripting",
-    "cookies"
+    "cookies",
+    "debugger"
   ],
   "host_permissions": [
     "https://www.facebook.com/*",
-    "https://api.fitcure.online/*",
-    "https://fitcure.online/*",
+    "https://instagram.com/*",
+    "https://www.instagram.com/*",
+    "https://www.tiktok.com/*",
     "http://localhost:8000/*",
     "http://127.0.0.1:8000/*",
     "https://api.fitcure.online/*",
     "https://fitcure.online/*",
-    "http://localhost:3000/*"
+    "http://localhost:3001/*"
   ],
   "background": {
     "service_worker": "dist/background.js",
@@ -32,7 +34,7 @@
     {
       "matches": ["https://www.facebook.com/*"],
       "js": [
-        "dist/posting-config.js",
+        "dist/posting-timing.js",
         "dist/post-tracking/types.js",
         "dist/post-tracking/detect-pending-approval.js",
         "dist/post-tracking/facebook-interruption-detector.js",
@@ -55,12 +57,40 @@
       "run_at": "document_idle"
     },
     {
+<<<<<<< HEAD
       "matches": [
         "https://fitcure.online/*",
         "https://www.fitcure.online/*",
         "http://localhost:3000/*",
         "http://127.0.0.1:3000/*"
       ],
+=======
+      "matches": ["https://instagram.com/*", "https://www.instagram.com/*"],
+      "js": [
+        "dist/platforms/instagram/identity.js",
+        "dist/platforms/instagram/selectors.js",
+        "dist/platforms/instagram/caption.js",
+        "dist/platforms/instagram/composer.js",
+        "dist/platforms/instagram/engagement.js",
+        "dist/platforms/instagram/content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.tiktok.com/*"],
+      "js": [
+        "dist/platforms/tiktok/identity.js",
+        "dist/shared/media/media-runtime.js",
+        "dist/platforms/tiktok/selectors.js",
+        "dist/platforms/tiktok/composer.js",
+        "dist/platforms/tiktok/engagement.js",
+        "dist/platforms/tiktok/content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["http://localhost:3001/*", "http://127.0.0.1:3001/*", "https://fitcure.online/*"],
+>>>>>>> main
       "js": ["dist/postflow-content.js"],
       "run_at": "document_idle"
     }

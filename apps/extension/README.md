@@ -16,10 +16,19 @@ Build-time public API configuration is committed in:
 - `.env.development`: `API_BASE_URL=http://localhost:8000`
 - `.env.production`: `API_BASE_URL=https://api.fitcure.online`
 
-Both files also define the public rollout switch
-`AUTOMATIC_ANALYTICS_ENABLED`. It is `true` for local development and defaults
-to `false` for production until the analytics scheduler is deliberately
-enabled.
+Both files define `AUTOMATIC_ANALYTICS_ENABLED` for the shared analytics
+scheduler. TikTok automatic analytics has its own
+`TIKTOK_AUTOMATIC_ANALYTICS_ENABLED` switch, independent of TikTok publishing.
+The production extension build enables both switches; the development build
+keeps scheduled analytics disabled. Manual refresh remains available when the
+TikTok automatic switch is off.
+
+TikTok Video publishing is enabled in the local development and production
+extension builds with `TIKTOK_EXTENSION_PUBLISHING_ENABLED=true`. The API must
+also have `TIKTOK_EXTENSION_PUBLISHING_ENABLED=true`, and the web deployment
+must set `NEXT_PUBLIC_TIKTOK_PUBLISHING_ENABLED=true`, before a TikTok target
+can be created. Keep the API and web gates aligned with the extension build;
+the server gate remains authoritative.
 
 The build reads the selected file using Node's `parseEnv` and generates
 `dist/env.js`. `src/background.ts` reads it with:
@@ -28,15 +37,16 @@ The build reads the selected file using Node's `parseEnv` and generates
 import {
   API_BASE_URL,
   AUTOMATIC_ANALYTICS_ENABLED,
+  TIKTOK_AUTOMATIC_ANALYTICS_ENABLED,
   BUILD_ENV,
 } from './env.js';
 ```
 
 API requests use `${API_BASE_URL}${path}`. The build also emits `BUILD_ENV` and
-the validated boolean analytics flag from the selected build mode. Only these
-two public values are read from the env file; shell environment variables and
-other `.env` files are not loaded. Never put secrets in extension environment
-files or bundled code.
+the validated analytics flags from the selected build mode. Only public
+configuration values are read from the selected env file; shell environment
+variables and other `.env` files are not loaded. Never put secrets in extension
+environment files or bundled code.
 
 The manifest permits both API hosts and the production frontend. The dashboard
 content script runs on localhost and `https://fitcure.online/*` to read the
@@ -45,7 +55,7 @@ signed-in user ID and handle dashboard sync actions.
 ```text
 Web: https://fitcure.online
 API: https://api.fitcure.online
-Web: http://localhost:3000
+Web: http://localhost:3001
 Facebook: https://www.facebook.com/*
 ```
 
@@ -115,6 +125,11 @@ manual analytics:
 No database rollback is required. Existing metrics and scheduling timestamps
 are preserved, dashboard/manual refresh remains available, and any abandoned
 maintenance lease expires after five minutes.
+
+To pause only TikTok scheduled analytics, set
+`TIKTOK_AUTOMATIC_ANALYTICS_ENABLED=false`, rebuild, and reload the extension.
+Facebook and Instagram analytics and TikTok publishing remain available; a
+manual TikTok refresh can still be requested.
 
 Per-profile maintenance counters can be inspected from the extension service
 worker console without exposing claim tokens:

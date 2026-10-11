@@ -1,10 +1,12 @@
 // ── Configuration ──
 
 import './posting-config.js';
+import { connectionIdentityUpdate } from './shared/connections/index.js';
 
 import {
   API_BASE_URL,
   AUTOMATIC_ANALYTICS_ENABLED,
+  TIKTOK_AUTOMATIC_ANALYTICS_ENABLED,
   BUILD_ENV,
 } from './env.js';
 import {
@@ -13,6 +15,16 @@ import {
   type ProfileFeedPublishTarget,
   type PublishJob,
 } from './publishing-target.js';
+import { refreshInstagramSession, registerInstagramSessionWorker } from './platforms/instagram/worker.js';
+import { refreshTikTokSession, registerTikTokSessionWorker, registerTikTokPublishingBridge } from './platforms/tiktok/index.js';
+import { normalizeTikTokAnalyticsPermalink } from './platforms/tiktok/engagement-url.js';
+import {
+  checkPendingJobs as checkPlatformJobs,
+  handlePlatformQueueResume,
+  pausePlatformQueue,
+  resumePlatformQueue,
+  isPlatformQueuePaused,
+} from './job-orchestrator.js';
 import {
   ENGAGEMENT_MAINTENANCE_WAKE_INTERVAL_MINUTES,
   PENDING_MAINTENANCE_WAKE_INTERVAL_MINUTES,
@@ -33,6 +45,10 @@ import {
   type MaintenanceMetricName,
   type MaintenanceWorkType,
 } from './maintenance-diagnostics.js';
+import {
+  normalizeRecoveryCandidates,
+  type RecoveryCandidate,
+} from './extension-recovery.js';
 
 console.info(
   `[PostFlow] ${BUILD_ENV === 'production' ? 'PROD' : 'DEV'} environment | API: ${API_BASE_URL} | Automatic analytics: ${AUTOMATIC_ANALYTICS_ENABLED ? 'ON' : 'OFF'}`,
@@ -41,7 +57,10 @@ console.info(
 const HEARTBEAT_ALARM = 'postflow-heartbeat';
 const HEARTBEAT_INTERVAL_MINUTES = 1;
 const REGISTER_RETRY_ALARM = 'postflow-register-retry';
-const REGISTER_RETRY_DELAY_MINUTES = 1;
+// Chrome clamps alarm delays to its minimum interval, but keeping this below a
+// minute makes a missing dashboard handshake recover quickly instead of
+// leaving the popup on “Checking…” for a full minute.
+const REGISTER_RETRY_DELAY_MINUTES = 0.5;
 const PENDING_POST_SYNC_ALARM = 'postflow-pending-post-sync';
 const PENDING_POST_SYNC_INTERVAL_MINUTES =
   PENDING_MAINTENANCE_WAKE_INTERVAL_MINUTES;
@@ -57,6 +76,10 @@ const ENGAGEMENT_SYNC_ALARM_INITIALIZED_KEY = 'engagementSyncAlarmInitialized';
 const MAINTENANCE_DIAGNOSTICS_KEY = 'maintenanceDiagnosticsV1';
 const EXTENSION_INSTANCE_ID_KEY = 'extensionInstanceId';
 const EXTENSION_NAME_KEY = 'extensionName';
+const EXTENSION_CREDENTIAL_KEY = 'extensionCredential';
+const EXTENSION_CREDENTIAL_ISSUED_AT_KEY = 'credentialIssuedAt';
+const EXTENSION_LIFECYCLE_STATUS_KEY = 'extensionLifecycleStatus';
+const RECOVERY_CANDIDATES_KEY = 'extensionRecoveryCandidates';
 const TAB_ACTION_RETRY_COUNT = 6;
 const TAB_ACTION_RETRY_DELAY_MS = 500;
 const FACEBOOK_NOTIFICATIONS_URL = 'https://www.facebook.com/notifications/';
@@ -81,6 +104,17 @@ function logPhoneSync(
 interface ApiFetchFailure {
   apiFetchError: true;
   status: number;
+  message?: string;
+}
+
+async function persistRecoveryCandidates(value: unknown): Promise<RecoveryCandidate[]> {
+  const candidates = normalizeRecoveryCandidates(value);
+  if (candidates.length) {
+    await chrome.storage.local.set({ [RECOVERY_CANDIDATES_KEY]: candidates });
+  } else {
+    await chrome.storage.local.remove(RECOVERY_CANDIDATES_KEY);
+  }
+  return candidates;
 }
 
 // Identifies structured API failures returned only to callers that request details.
@@ -121,7 +155,21 @@ function createExtensionInstanceId(): string {
   return `pfi_${randomId}`;
 }
 
-async function getExtensionInstanceId(): Promise<string> {
+function isPostFlowDashboardUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (
+      (url.protocol === 'https:' && url.hostname === 'fitcure.online') ||
+      (url.protocol === 'http:' &&
+        (url.hostname === 'localhost' || url.hostname === '127.0.0.1') &&
+        url.port === '3001')
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function getExtensionInstanceId(): Promise<string> {
   if (!extensionInstanceIdPromise) {
     extensionInstanceIdPromise = (async () => {
       const result = await chrome.storage.local.get(EXTENSION_INSTANCE_ID_KEY);
@@ -239,22 +287,80 @@ async function getExtensionName(): Promise<string> {
     : '';
 }
 
+async function getExtensionCredential(): Promise<string | null> {
+  const result = await chrome.storage.local.get(EXTENSION_CREDENTIAL_KEY);
+  const credential = result[EXTENSION_CREDENTIAL_KEY];
+  return typeof credential === 'string' && credential.trim()
+    ? credential.trim()
+    : null;
+}
+
+// Persists the single-use installation credential issued by the backend. The
+// credential is a random revocable bearer token; only its SHA-256 hash lives on
+// the server, so the extension must keep the raw value to authenticate.
+async function persistExtensionCredential(credential?: string): Promise<void> {
+  if (typeof credential !== 'string' || !credential.trim()) return;
+  await chrome.storage.local.set({
+    [EXTENSION_CREDENTIAL_KEY]: credential.trim(),
+    [EXTENSION_CREDENTIAL_ISSUED_AT_KEY]: Date.now(),
+  });
+  console.log('[PostFlow] Installation credential stored');
+}
+
+async function getExtensionLifecycleStatus(): Promise<string | null> {
+  const result = await chrome.storage.local.get(EXTENSION_LIFECYCLE_STATUS_KEY);
+  const status = result[EXTENSION_LIFECYCLE_STATUS_KEY];
+  return typeof status === 'string' && status.trim() ? status.trim() : null;
+}
+
+async function persistExtensionLifecycleStatus(status?: string): Promise<void> {
+  if (typeof status !== 'string' || !status.trim()) return;
+  await chrome.storage.local.set({ [EXTENSION_LIFECYCLE_STATUS_KEY]: status.trim() });
+  console.log('[PostFlow] Installation lifecycle status stored:', status);
+}
+
+async function clearExtensionLifecycleStatus(): Promise<void> {
+  await chrome.storage.local.remove(EXTENSION_LIFECYCLE_STATUS_KEY);
+  console.log('[PostFlow] Installation lifecycle status cleared');
+}
+
+/**
+ * The credential is intentionally not recoverable from the API. If local
+ * extension storage lost it while the server installation is still active,
+ * treat this as a fresh reinstall instead of retrying the same ID forever.
+ */
+async function resetInstallationIdentityAfterCredentialLoss(): Promise<void> {
+  await chrome.storage.local.remove([
+    EXTENSION_INSTANCE_ID_KEY,
+    EXTENSION_CREDENTIAL_KEY,
+    EXTENSION_CREDENTIAL_ISSUED_AT_KEY,
+    EXTENSION_LIFECYCLE_STATUS_KEY,
+    RECOVERY_CANDIDATES_KEY,
+    'extensionConnectionStage',
+  ]);
+  extensionInstanceIdPromise = null;
+  console.warn('[PostFlow] Installation credential is unavailable; starting a fresh installation registration');
+}
+
 // Uses shared authentication and URL fallback; detailed failures are opt-in for UI workflows.
-async function apiFetch(
+export async function apiFetch(
   path: string,
   body?: Record<string, unknown>,
   method?: string,
   includeFailureDetails = false,
+  allowCredentialReset = true,
 ) {
   if (!path || !path.startsWith('/')) {
     console.warn('[PostFlow] Refusing API call with invalid path:', path);
     return includeFailureDetails ? { apiFetchError: true, status: 400 } : null;
   }
 
-  const [clerkUserId, extensionInstanceId] = await Promise.all([
-    getClerkUserId(),
-    getExtensionInstanceId(),
-  ]);
+  const [clerkUserId, extensionInstanceId, extensionCredential] =
+    await Promise.all([
+      getClerkUserId(),
+      getExtensionInstanceId(),
+      getExtensionCredential(),
+    ]);
   if (!clerkUserId) {
     console.warn('[PostFlow] No user ID found — skipping API call:', path);
     return includeFailureDetails ? { apiFetchError: true, status: 401 } : null;
@@ -278,10 +384,14 @@ async function apiFetch(
     try {
       const response = await fetch(url, {
         method: httpMethod,
+        signal: AbortSignal.timeout(10_000),
         headers: {
           'Content-Type': 'application/json',
           'x-clerk-user-id': clerkUserId,
           'x-extension-instance-id': extensionInstanceId,
+          ...(extensionCredential
+            ? { 'x-extension-credential': extensionCredential }
+            : {}),
         },
         body: body ? JSON.stringify(body) : undefined,
       });
@@ -302,6 +412,23 @@ async function apiFetch(
           message = typeof parsed.message === 'string' ? parsed.message : undefined;
         } catch {
           // Keep the compact status-only error for non-JSON responses.
+        }
+        if (
+          response.status === 403 &&
+          allowCredentialReset &&
+          (path === '/api/extensions/register' || path === '/api/extensions/heartbeat') &&
+          message &&
+          /x-extension-credential header is required|installation credential is invalid/i.test(message)
+        ) {
+          await resetInstallationIdentityAfterCredentialLoss();
+          return apiFetch(path, body, httpMethod, includeFailureDetails, false);
+        }
+        if (
+          response.status === 403 &&
+          message &&
+          /revoked|credential has been revoked|installation has been revoked/i.test(message)
+        ) {
+          await handleRevokedInstallation();
         }
         const maintenanceWorkType = getMaintenanceWorkTypeForRequest(
           path,
@@ -356,6 +483,12 @@ async function apiFetch(
   );
   return includeFailureDetails ? { apiFetchError: true, status: 0 } : null;
 }
+
+registerInstagramSessionWorker(apiFetch);
+console.info('[PostFlow][Instagram] Background bridge ready');
+registerTikTokSessionWorker(apiFetch);
+registerTikTokPublishingBridge(apiFetch);
+console.info('[PostFlow][TikTok] Background bridge ready');
 
 // Reads persisted review state and submits only selected, valid normalized numbers.
 async function syncPhoneNumbersToBackend(): Promise<PhoneSyncResponse> {
@@ -516,13 +649,13 @@ async function collectPhoneNumbersFromActiveTab(): Promise<PhoneCollectionRespon
   }
 }
 
-async function updateJobStatus(
+export async function updateJobStatus(
   jobId: string,
   body: {
     status: string;
     error?: string;
     submissionResult?: {
-      status: 'PUBLISHED' | 'PENDING_APPROVAL' | 'UNKNOWN';
+      status: 'PUBLISHED' | 'PENDING_APPROVAL' | 'PROCESSING' | 'UNKNOWN';
       postUrl?: string;
       reason?: string;
     };
@@ -538,48 +671,181 @@ async function updateJobStatus(
 
 // ── Registration ──
 
-async function registerExtension() {
-  const extensionName = await getExtensionName();
-  const result = await apiFetch(
-    '/api/extensions/register',
-    extensionName ? { extensionName } : undefined,
-    'POST',
-  );
-  if (result) {
-    await chrome.alarms.clear(REGISTER_RETRY_ALARM);
-    console.log('[PostFlow] Registered with backend:', result._id);
-    void refreshFacebookSession();
-    return true;
-  }
-  chrome.alarms.create(REGISTER_RETRY_ALARM, {
-    delayInMinutes: REGISTER_RETRY_DELAY_MINUTES,
+let registrationPromise: Promise<boolean> | null = null;
+
+/**
+ * Publishing checks use this barrier so a service-worker wake-up cannot claim
+ * a job before registration has finished binding the current platform session.
+ */
+export async function waitForExtensionRegistration(): Promise<boolean> {
+  const pending = registrationPromise;
+  return pending ? pending : true;
+}
+
+function registerExtension(): Promise<boolean> {
+  if (registrationPromise) return registrationPromise;
+
+  registrationPromise = (async () => {
+    const clerkUserId = await getClerkUserId();
+    if (!clerkUserId) {
+      await chrome.storage.local.set({ extensionConnectionStage: 'waiting-for-dashboard' });
+      chrome.alarms.create(REGISTER_RETRY_ALARM, {
+        delayInMinutes: REGISTER_RETRY_DELAY_MINUTES,
+      });
+      return false;
+    }
+
+    await chrome.storage.local.set({ extensionConnectionStage: 'connecting' });
+    const result = await apiFetch(
+      '/api/extensions/register',
+      undefined,
+      'POST',
+    );
+    if (result) {
+      await chrome.alarms.clear(REGISTER_RETRY_ALARM);
+      const connectionIdentity = connectionIdentityUpdate(result);
+      if (connectionIdentity) await chrome.storage.local.set(connectionIdentity);
+      const registrationStatus = typeof result.status === 'string'
+        ? result.status
+        : 'ACTIVE';
+      // A revoked or disconnecting installation must never be reactivated by
+      // register; stop the connection handshake and surface the outcome.
+      if (registrationStatus === 'REVOKED' || registrationStatus === 'REVOKE_PENDING') {
+        console.warn(
+          `[PostFlow] Registration halted (${registrationStatus})`,
+          typeof result.reason === 'string' ? result.reason : '',
+        );
+        await chrome.storage.local.set({
+          extensionConnectionStage: registrationStatus === 'REVOKED'
+            ? 'revoked'
+            : 'revoke-pending',
+        });
+        await persistExtensionLifecycleStatus(registrationStatus);
+        if (registrationStatus === 'REVOKED') {
+          await handleRevokedInstallation();
+        }
+        return false;
+      }
+      // The backend issues a fresh credential on first registration and when a
+      // legacy installation is upgraded; persist it for future requests.
+      if (typeof result.credentialIssued === 'string' && result.credentialIssued) {
+        await persistExtensionCredential(result.credentialIssued);
+      }
+      const recoveryCandidates = await persistRecoveryCandidates(
+        result.candidates,
+      );
+      await persistExtensionLifecycleStatus(
+        registrationStatus === 'RECOVERY_AVAILABLE' ||
+          registrationStatus === 'NEW_INSTALLATION'
+          ? 'ACTIVE'
+          : registrationStatus,
+      );
+      if (registrationStatus === 'RECOVERY_AVAILABLE' || recoveryCandidates.length) {
+        await chrome.storage.local.set({ extensionConnectionStage: 'recovery-required' });
+        console.log('[PostFlow] Recovery choice required before binding this installation');
+        return true;
+      }
+      await chrome.storage.local.set({ extensionConnectionStage: 'verifying-facebook' });
+      console.log('[PostFlow] Registered with backend:', registrationStatus);
+      const facebookReady = await refreshFacebookSession();
+      // Instagram uses top-level document evidence instead of Facebook's
+      // c_user cookie, but it follows the same installation-bound startup
+      // refresh when an Instagram tab is already open in this profile.
+      void refreshInstagramSession().then((instagramReady) => {
+        console.info('[PostFlow][Instagram] Startup session refresh completed', { connected: instagramReady });
+      }).catch((error) => {
+        console.warn('[PostFlow][Instagram] Startup session refresh failed', error);
+      });
+      const tiktokReady = await refreshTikTokSession();
+      console.info('[PostFlow][TikTok] Startup session refresh completed', { connected: tiktokReady });
+      await chrome.storage.local.set({
+        extensionConnectionStage: facebookReady ? 'connected' : 'facebook-required',
+      });
+      return true;
+    }
+
+    await chrome.storage.local.set({ extensionConnectionStage: 'backend-unavailable' });
+    chrome.alarms.create(REGISTER_RETRY_ALARM, {
+      delayInMinutes: REGISTER_RETRY_DELAY_MINUTES,
+    });
+    return false;
+  })().finally(() => {
+    registrationPromise = null;
   });
-  return false;
+
+  return registrationPromise;
 }
 
 // ── Heartbeat ──
 
 async function sendHeartbeat() {
-  const extensionName = await getExtensionName();
   const result = await apiFetch(
     '/api/extensions/heartbeat',
-    extensionName ? { extensionName } : undefined,
+    undefined,
     'POST',
   );
-  if (result) {
-    console.log('[PostFlow] Heartbeat sent at', new Date().toISOString());
+  if (result && typeof result.status === 'string') {
+    const connectionIdentity = connectionIdentityUpdate(result);
+    if (connectionIdentity) await chrome.storage.local.set(connectionIdentity);
+    console.log(
+      `[PostFlow] Heartbeat sent at ${new Date().toISOString()} | lifecycle: ${result.status}`,
+    );
+    if (result.status === 'REVOKE_PENDING') {
+      console.warn('[PostFlow] Extension is disconnecting; finishing in-flight work');
+    }
+    await persistExtensionLifecycleStatus(result.status);
+    // If the backend says REVOKED, we must stop all worker activity immediately.
+    if (result.status === 'REVOKED') {
+      await handleRevokedInstallation();
+    }
   }
+}
+
+async function handleRevokedInstallation(): Promise<void> {
+  console.warn('[PostFlow] Installation revoked — stopping all worker activity');
+  // Clear the credential so no further authenticated requests can be made.
+  await chrome.storage.local.remove(EXTENSION_CREDENTIAL_KEY);
+  await chrome.storage.local.remove(EXTENSION_CREDENTIAL_ISSUED_AT_KEY);
+  // Clear all maintenance alarms so no new work is attempted.
+  await chrome.alarms.clear(PENDING_POST_SYNC_ALARM);
+  await chrome.alarms.clear(ENGAGEMENT_SYNC_ALARM);
+  await chrome.alarms.clear(MANUAL_MAINTENANCE_ALARM);
+  // Clear the heartbeat alarm so no more heartbeats are sent.
+  await chrome.alarms.clear(HEARTBEAT_ALARM);
+  // Clear the register retry alarm.
+  await chrome.alarms.clear(REGISTER_RETRY_ALARM);
+  // Update local state.
+  await chrome.storage.local.set({
+    extensionConnectionStage: 'revoked',
+    [EXTENSION_LIFECYCLE_STATUS_KEY]: 'REVOKED',
+    extensionWorkerStatus: 'OFFLINE',
+  });
+  // Notify any open popups.
+  chrome.runtime.sendMessage({ type: 'LIFECYCLE_REVOKED' }).catch(() => undefined);
+}
+
+// Returns true if the local lifecycle status allows claiming new work.
+export async function canClaimNewWork(): Promise<boolean> {
+  const lifecycle = await getExtensionLifecycleStatus();
+  if (!lifecycle) return true; // No status yet (first register), allow.
+  if (lifecycle === 'PAUSED' || lifecycle === 'REVOKE_PENDING' || lifecycle === 'REVOKED') {
+    console.log('[PostFlow] Skipping new work claim — lifecycle:', lifecycle);
+    return false;
+  }
+  return true;
 }
 
 // ── Session reporting ──
 
 type FacebookConnectionSessionResponse = {
   connection?: {
+    displayName?: string | null;
     status?: string;
     workerStatus?: string;
     facebookUserId?: string;
     detectedFacebookUserId?: string;
   };
+  recoveryCandidates?: RecoveryCandidate[];
 };
 
 let facebookIdentityVerified = false;
@@ -596,6 +862,26 @@ async function reportSession(sessionDetected: boolean, facebookUserId?: string |
       ...(normalizedFacebookUserId ? { facebookUserId: normalizedFacebookUserId } : {}),
     }) as FacebookConnectionSessionResponse | null;
     const connection = result?.connection;
+    if (connection) {
+      const connectionDisplayName = typeof connection.displayName === 'string'
+        ? connection.displayName.trim()
+        : '';
+      if (connectionDisplayName) {
+        await chrome.storage.local.set({ [EXTENSION_NAME_KEY]: connectionDisplayName });
+      } else {
+        await chrome.storage.local.remove(EXTENSION_NAME_KEY);
+      }
+    }
+    const recoveryCandidates = await persistRecoveryCandidates(
+      result?.recoveryCandidates,
+    );
+    if (recoveryCandidates.length > 0 && !connection) {
+      await chrome.storage.local.set({
+        extensionConnectionStage: 'recovery-required',
+      });
+    } else if (connection) {
+      await chrome.storage.local.set({ extensionConnectionStage: 'connected' });
+    }
     facebookConnectionStatus = connection?.status ?? 'UNKNOWN';
     facebookIdentityVerified = Boolean(
       sessionDetected &&
@@ -630,7 +916,7 @@ async function reportSession(sessionDetected: boolean, facebookUserId?: string |
   return verificationPromise;
 }
 
-async function refreshFacebookSession() {
+export async function refreshFacebookSession() {
   try {
     const cookie = await chrome.cookies.get({
       url: 'https://www.facebook.com/',
@@ -651,11 +937,87 @@ async function refreshFacebookSession() {
   }
 }
 
+async function completeExtensionRecovery(options: {
+  connectionId?: string;
+  createNewConnection?: boolean;
+  confirmReplacement?: boolean;
+  approvalToken?: string;
+}): Promise<{ ok: boolean; error?: string; confirmationRequired?: boolean }> {
+  const result = await apiFetch(
+    '/api/extensions/reconnect',
+    options,
+    'POST',
+    true,
+  );
+  if (isApiFetchFailure(result)) {
+    const confirmationRequired = Boolean(
+      result.status === 409 &&
+      result.message?.includes('REPLACEMENT_CONFIRMATION_REQUIRED'),
+    );
+    return {
+      ok: false,
+      confirmationRequired,
+      error: confirmationRequired
+        ? 'The previous extension is still online. Confirm that you want this installation to replace it.'
+        : result.message ?? 'Could not reconnect this installation.',
+    };
+  }
+
+  // Reconnect keeps the selected connection record and its display name. Make
+  // the local popup identity follow that recovered connection instead of
+  // continuing to show the temporary name from this fresh installation.
+  const recoveredDisplayName = typeof result?.displayName === 'string'
+    ? result.displayName.trim()
+    : '';
+  if (recoveredDisplayName) {
+    await chrome.storage.local.set({ [EXTENSION_NAME_KEY]: recoveredDisplayName });
+  } else {
+    await chrome.storage.local.remove(EXTENSION_NAME_KEY);
+  }
+  await persistRecoveryCandidates([]);
+  await persistExtensionLifecycleStatus('ACTIVE');
+  await chrome.storage.local.set({ extensionConnectionStage: 'connected' });
+  await refreshFacebookSession();
+  // Bind any already-open Instagram document to the newly created
+  // installation immediately; do not wait for the 15-second content heartbeat.
+  void refreshInstagramSession().then((connected) => {
+    console.info('[PostFlow][Instagram] New-connection session refresh completed', { connected });
+  });
+  return { ok: true };
+}
+
+async function restoreDisconnectedExtension(installationId: string, approvalToken: string): Promise<{ ok: boolean; error?: string }> {
+  const storedInstallationId = (await chrome.storage.local.get('extensionInstallationId')).extensionInstallationId;
+  if (!installationId || !approvalToken || (storedInstallationId && installationId !== storedInstallationId)) {
+    return { ok: false, error: 'Open the dashboard in the Chrome Profile of this disconnected extension.' };
+  }
+  const result = await apiFetch('/api/extensions/restore-disconnected', { approvalToken }, 'POST', true, false);
+  if (isApiFetchFailure(result) || result?.status !== 'ACTIVE' || typeof result?.credentialIssued !== 'string') {
+    return { ok: false, error: isApiFetchFailure(result) ? result.message ?? 'Could not restore this extension.' : 'The backend did not issue a restored credential.' };
+  }
+  await persistExtensionCredential(result.credentialIssued);
+  await persistExtensionLifecycleStatus('ACTIVE');
+  await chrome.storage.local.set({ extensionConnectionStage: 'connecting' });
+  await registerExtension();
+  await initializeWorkerAlarms();
+  void checkPendingJobs();
+  return { ok: true };
+}
+
 chrome.cookies.onChanged.addListener((changeInfo) => {
   const domain = changeInfo.cookie.domain.replace(/^\./, '').toLowerCase();
   const isFacebookDomain = domain === 'facebook.com' || domain.endsWith('.facebook.com');
-  if (changeInfo.cookie.name !== 'c_user' || !isFacebookDomain) return;
-  void refreshFacebookSession();
+  const isInstagramDomain = domain === 'instagram.com' || domain.endsWith('.instagram.com');
+  if (changeInfo.cookie.name === 'c_user' && isFacebookDomain) {
+    void refreshFacebookSession();
+    return;
+  }
+  if ((changeInfo.cookie.name === 'ds_user_id' || changeInfo.cookie.name === 'sessionid') && isInstagramDomain) {
+    // Re-evaluate the same open top-level document immediately when Instagram
+    // finishes login or switches accounts. The content heartbeat remains the
+    // fallback for pages that do not emit a cookie-change event.
+    void refreshInstagramSession();
+  }
 });
 
 type ExtensionWorkerStatus =
@@ -670,7 +1032,7 @@ type ExtensionWorkerStatus =
   | 'CAPTCHA_OR_CHALLENGE'
   | 'MANUAL_INTERVENTION_REQUIRED';
 
-async function reportWorkerStatus(workerStatus: ExtensionWorkerStatus, reason?: string) {
+export async function reportWorkerStatus(workerStatus: ExtensionWorkerStatus, reason?: string) {
   await chrome.storage.local.set({
     extensionWorkerStatus: workerStatus,
     extensionWorkerReason: reason ? reason.slice(0, 500) : null,
@@ -832,6 +1194,121 @@ chrome.runtime.onConnect.addListener((port) => {
 // ── Session + sync messages ──
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'RETRY_PLATFORM_CONNECTION') {
+    if (sender.tab || sender.id !== chrome.runtime.id) {
+      sendResponse({ ok: false, error: 'Platform retries can only be started from the extension popup.' });
+      return;
+    }
+    const platform = message.platform;
+    if (platform !== 'FACEBOOK' && platform !== 'INSTAGRAM' && platform !== 'TIKTOK') {
+      sendResponse({ ok: false, error: 'Unknown platform.' });
+      return;
+    }
+    void (async () => {
+      const lifecycle = await getExtensionLifecycleStatus();
+      if (lifecycle === 'REVOKED' || lifecycle === 'REVOKE_PENDING') {
+        return { ok: false, error: 'Restore this connection from the PostFlow dashboard before retrying.' };
+      }
+      if (!await getClerkUserId() || !await getExtensionCredential()) {
+        return { ok: false, error: 'Open the signed-in PostFlow dashboard to finish connecting this extension.' };
+      }
+      const connected = platform === 'FACEBOOK'
+        ? await refreshFacebookSession()
+        : platform === 'INSTAGRAM'
+          ? await refreshInstagramSession()
+          : await refreshTikTokSession();
+      if (connected) return { ok: true };
+      const state = await chrome.storage.local.get(['instagramConnectionError', 'tiktokConnectionError']);
+      const detail = platform === 'INSTAGRAM' ? state.instagramConnectionError
+        : platform === 'TIKTOK' ? state.tiktokConnectionError : null;
+      const name = platform === 'FACEBOOK' ? 'Facebook' : platform === 'INSTAGRAM' ? 'Instagram' : 'TikTok';
+      return { ok: false, error: typeof detail === 'string' && detail
+        ? detail : `${name} is still not connected. Check that you are signed in, then retry.` };
+    })()
+      .then(sendResponse)
+      .catch((error) => sendResponse({ ok: false, error: error instanceof Error ? error.message : 'Could not retry this platform.' }));
+    return true;
+  }
+
+  if (message.type === 'COMPLETE_EXTENSION_RECOVERY') {
+    void completeExtensionRecovery({
+      ...(typeof message.connectionId === 'string'
+        ? { connectionId: message.connectionId }
+        : {}),
+      createNewConnection: message.createNewConnection === true,
+      confirmReplacement: message.confirmReplacement === true,
+    })
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Could not reconnect this installation.',
+      }));
+    return true;
+  }
+
+  if (message.type === 'RECONNECT_WITH_APPROVAL') {
+    // Approval codes originate from the authenticated dashboard content
+    // script, never from a Facebook page.
+    if (!sender.tab?.url || !isPostFlowDashboardUrl(sender.tab.url)) {
+      sendResponse({ ok: false, error: 'Reconnect approval must come from the PostFlow dashboard.' });
+      return;
+    }
+    void completeExtensionRecovery({
+      ...(typeof message.connectionId === 'string'
+        ? { connectionId: message.connectionId }
+        : {}),
+      ...(typeof message.approvalToken === 'string'
+        ? { approvalToken: message.approvalToken }
+        : {}),
+      confirmReplacement: message.confirmReplacement === true,
+    })
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Could not restore this connection.',
+      }));
+    return true;
+  }
+
+  if (message.type === 'RESTORE_DISCONNECTED_INSTALLATION') {
+    if (!sender.tab?.url || !isPostFlowDashboardUrl(sender.tab.url)) {
+      sendResponse({ ok: false, error: 'Restore approval must come from the PostFlow dashboard.' });
+      return;
+    }
+    void restoreDisconnectedExtension(message.installationId, message.approvalToken)
+      .then(sendResponse)
+      .catch((error) => sendResponse({ ok: false, error: error instanceof Error ? error.message : 'Could not restore this extension.' }));
+    return true;
+  }
+
+  if (message.type === 'AUTH_CONTEXT_READY') {
+    void (async () => {
+      let registered = await registerExtension();
+      // An install-time attempt may have been finishing just as the dashboard
+      // supplied the user ID. Retry immediately instead of waiting one minute.
+      if (!registered && await getClerkUserId()) {
+        registered = await registerExtension();
+      }
+      return registered;
+    })()
+      .then((registered) => sendResponse({ ok: registered }))
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Could not connect extension',
+      }));
+    return true;
+  }
+
+  if (message.type === 'REFRESH_AUTH_CONTEXT') {
+    void requestDashboardAuthContext()
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Could not request dashboard identity',
+      }));
+    return true;
+  }
+
   if (message.type === 'SYNC_PHONE_NUMBERS') {
     if (sender.tab) {
       sendResponse({
@@ -936,6 +1413,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     );
   }
 
+  if (message.type === 'TRIGGER_ANALYTICS_SYNC') {
+    // The web dashboard has already created the authenticated maintenance
+    // request. Start only the engagement worker here; the periodic alarm stays
+    // as a recovery path if the dashboard bridge is unavailable.
+    void runMaintenanceCoordinator({
+      manualOnly: true,
+      pending: false,
+      analytics: true,
+      analyticsMode: 'MANUAL',
+    })
+      .then((results) => sendResponse({ ok: true, processed: results.length }))
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Analytics sync failed',
+      }));
+    return true;
+  }
+
   if (message.type === 'TRIGGER_GROUP_SYNC') {
     (async () => {
       try {
@@ -989,9 +1484,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const extensionName = typeof message.extensionName === 'string'
         ? message.extensionName.trim()
         : '';
-      await chrome.storage.local.set({ [EXTENSION_NAME_KEY]: extensionName });
-      const registered = await registerExtension();
-      sendResponse({ ok: registered });
+      const response = await apiFetch(
+        '/api/extensions/name',
+        { extensionName },
+        'PATCH',
+        true,
+      );
+      if (isApiFetchFailure(response)) {
+        sendResponse({
+          ok: false,
+          error: response.status === 409
+            ? 'This name is already used by another extension.'
+            : response.message ?? 'Could not save extension name',
+        });
+        return;
+      }
+      const savedName = typeof response?.displayName === 'string'
+        ? response.displayName
+        : '';
+      await chrome.storage.local.set({ [EXTENSION_NAME_KEY]: savedName });
+      sendResponse({ ok: true, extensionName: savedName });
     })().catch((error) => {
       console.error('[PostFlow] Could not save extension name:', error);
       sendResponse({ ok: false, error: 'Could not save extension name' });
@@ -999,7 +1511,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message.type === 'TRIGGER_JOB_CHECK') {
-    checkPendingJobs();
+    // A post can be created immediately after recovery while the worker's
+    // in-memory Facebook identity flag is still warming up. Refresh first so
+    // the one-shot dashboard signal is not lost behind the identity gate.
+    void (async () => {
+      if (!facebookIdentityVerified) {
+        await refreshFacebookSession();
+      }
+      await checkPendingJobs();
+    })();
   }
   if (message.type === 'GET_JOB_STATUS' && typeof message.jobId === 'string') {
     void apiFetch(`/api/jobs/${message.jobId}`)
@@ -1008,9 +1528,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message.type === 'RESUME_PUBLISH_QUEUE') {
-    publishQueuePaused = null;
-    void chrome.storage.local.remove('publishQueuePaused');
-    void reportWorkerStatus('IDLE');
+    // Support platform-specific resume
+    const platform = typeof message.platform === 'string' ? message.platform.toUpperCase() : null;
+    if (platform) {
+      resumePlatformQueue(platform);
+      void reportWorkerStatus('IDLE');
+    } else {
+      // Legacy: resume all platforms
+      publishQueuePaused = null;
+      void chrome.storage.local.remove('publishQueuePaused');
+      void reportWorkerStatus('IDLE');
+    }
     checkPendingJobs();
   }
 });
@@ -1027,19 +1555,111 @@ let publishQueuePaused: {
   pausedAt: number;
 } | null = null;
 let pendingCheckSequence = 0;
-let finishExecutionHandshake: (() => void) | null = null;
+let finishExecutionHandshake: (() => void) | null = () => {};
+interface FacebookExecutionCompletionGate {
+  promise: Promise<void>;
+  resolve: () => void;
+  timeoutId: ReturnType<typeof setTimeout>;
+}
+
+const facebookExecutionCompletionGates = new Map<string, FacebookExecutionCompletionGate>();
+
+function createFacebookExecutionCompletionGate(jobId: string): void {
+  if (facebookExecutionCompletionGates.has(jobId)) return;
+  let resolveGate!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    resolveGate = resolve;
+  });
+  const timeoutId = setTimeout(() => {
+    console.warn('[PostFlow] Profile-video reconciliation safety timeout reached', { jobId });
+    resolveFacebookExecutionCompletion(jobId);
+  }, 5 * 60_000);
+  facebookExecutionCompletionGates.set(jobId, {
+    promise,
+    resolve: resolveGate,
+    timeoutId,
+  });
+}
+
+function resolveFacebookExecutionCompletion(jobId: string): void {
+  const gate = facebookExecutionCompletionGates.get(jobId);
+  if (!gate) return;
+  clearTimeout(gate.timeoutId);
+  facebookExecutionCompletionGates.delete(jobId);
+  gate.resolve();
+}
+
+export function waitForFacebookExecutionSettled(jobId: string): Promise<void> {
+  return facebookExecutionCompletionGates.get(jobId)?.promise ?? Promise.resolve();
+}
+
 let activeExecution: {
   jobId: string;
   tabId: number;
   target: PublishJob['target'];
   post: PublishJob['post'];
+  profileVideoProfileBaselineUrls?: string[] | null;
   profileVideoNotificationBaselineKeys?: string[] | null;
 } | null = null;
+
+/**
+ * Bridges the adapter-based worker to Facebook's existing result/identity
+ * handlers. The Facebook content script still owns all DOM automation, but
+ * these handlers need the active execution context to reject stale messages
+ * and to reconcile accepted profile videos.
+ */
+export async function prepareFacebookExecution(
+  job: PublishJob,
+  tabId: number,
+): Promise<string[] | null> {
+  const profileTarget = job.target.type === 'PROFILE_FEED' ? job.target : null;
+  const isProfileVideo = Boolean(profileTarget && publishJobHasVideo(job.post));
+  if (isProfileVideo) createFacebookExecutionCompletionGate(job.id);
+  const [profileBaseline, notificationBaseline] = isProfileVideo
+    ? await Promise.all([
+      snapshotProfileVideoPostUrls(tabId, job.id, profileTarget!.facebookUserId),
+      snapshotProcessedProfileVideoNotificationKeys(job.id),
+    ])
+    : [null, null] as const;
+  activeExecution = {
+    jobId: job.id,
+    tabId,
+    target: job.target,
+    post: job.post,
+    profileVideoProfileBaselineUrls: profileBaseline,
+    profileVideoNotificationBaselineKeys: notificationBaseline,
+  };
+  if (isProfileVideo) {
+    console.log('[PostFlow][Facebook] Profile-video baselines captured', {
+      jobId: job.id,
+      profilePostCount: profileBaseline?.length ?? null,
+      notificationIdentityCount: notificationBaseline?.length ?? null,
+    });
+  }
+  return notificationBaseline;
+}
+
+export function clearFacebookExecution(jobId: string, settleCompletion = false): void {
+  if (activeExecution?.jobId === jobId) activeExecution = null;
+  if (settleCompletion) resolveFacebookExecutionCompletion(jobId);
+}
+
+export function getFacebookProfileVideoBaselineUrls(jobId: string): string[] | null {
+  if (activeExecution?.jobId !== jobId) return null;
+  return Array.isArray(activeExecution.profileVideoProfileBaselineUrls)
+    ? [...activeExecution.profileVideoProfileBaselineUrls]
+    : null;
+}
 
 interface ProcessedProfileVideoNotificationScanResult {
   key: string;
   notificationId?: string;
   postUrl: string;
+}
+
+interface ProfileVideoPostScanCandidate {
+  postUrl: string;
+  text?: string;
 }
 
 function publishJobHasVideo(post: PublishJob['post'] | undefined): boolean {
@@ -1060,225 +1680,14 @@ void chrome.storage.local.get('publishQueuePaused').then((result) => {
   }
 }).catch(() => undefined);
 
+// Platform-aware job checking using the new orchestrator.
+// Legacy Facebook-only checkPendingJobs is kept for maintenance tasks.
 async function checkPendingJobs() {
-  if (!facebookIdentityVerified) {
-    console.log('[PostFlow] Publishing blocked until Facebook identity is verified', {
-      status: facebookConnectionStatus,
-    });
-    return;
-  }
-  if (publishQueuePaused) {
-    console.warn('[PostFlow] Publishing queue is paused; skipping job check', publishQueuePaused);
-    return;
-  }
-  if (isProcessingJob || isFacebookSyncBusy) {
-    console.log('[PostFlow] Skipping job check while Facebook navigation is busy', {
-      isProcessingJob,
-      isFacebookSyncBusy,
-    });
-    return;
-  }
-  isProcessingJob = true;
-
-  const job = normalizePublishJob(await apiFetch('/api/jobs/next'));
-  if (!job) {
-    console.log('[PostFlow] No pending jobs');
-    isProcessingJob = false;
-    return;
-  }
-  const executionJob = job;
-
-  console.log('[PostFlow] Found pending job', { jobId: executionJob.id, targetType: executionJob.target.type });
-
-  try {
-    // 1. Mark as running
-    await updateJobStatus(executionJob.id, { status: 'RUNNING' });
-
-    const targetUrl = executionJob.target.type === 'GROUP'
-      ? getSafeFacebookGroupUrl(executionJob.target, executionJob.target.url)
-      : getSafeFacebookProfileUrl(executionJob.target);
-    if (!targetUrl) {
-      console.error('[PostFlow] Refusing to navigate to invalid Facebook target URL', {
-        jobId: executionJob.id,
-        targetType: executionJob.target.type,
-      });
-      await updateJobStatus(executionJob.id, { status: 'FAILED', error: 'Invalid Facebook target URL' });
-      isProcessingJob = false;
-      return;
-    }
-
-    if (executionJob.target.type === 'PROFILE_FEED' && !(await verifyProfileTargetIdentity(executionJob.target))) {
-      await failProfileIdentityMismatch(executionJob);
-      return;
-    }
-
-    const profileVideoNotificationBaselineKeys =
-      executionJob.target.type === 'PROFILE_FEED' && publishJobHasVideo(executionJob.post)
-        ? await snapshotProcessedProfileVideoNotificationKeys(executionJob.id)
-        : undefined;
-    
-    const fbTab = await openFacebookTargetTab(targetUrl);
-
-    const tabId = fbTab.id;
-    if (!tabId) {
-      await updateJobStatus(executionJob.id, { status: 'FAILED', error: 'Could not get tab ID' });
-      isProcessingJob = false;
-      activeExecution = null;
-      return;
-    }
-    const readyTabId = tabId;
-    activeExecution = {
-      jobId: executionJob.id,
-      tabId: readyTabId,
-      target: executionJob.target,
-      post: executionJob.post,
-      profileVideoNotificationBaselineKeys,
-    };
-
-    // tabs.update/tabs.create resolves before the old Facebook document has
-    // necessarily been replaced. Sending EXECUTE_JOB immediately can make
-    // the previous page open its composer. Wait for the target group document.
-    const targetReady = await waitForFacebookTabDocument(readyTabId, targetUrl, POSTING_TIMING.facebookTabReadyTimeoutMs);
-    if (!targetReady) {
-      console.error('[PostFlow] Target Facebook page did not finish loading', { targetType: executionJob.target.type });
-      await updateJobStatus(executionJob.id, {
-        status: 'FAILED',
-        error: 'Target Facebook page did not finish loading',
-      });
-      isProcessingJob = false;
-      activeExecution = null;
-      return;
-    }
-    console.log('[PostFlow] Target Facebook page is loaded; waiting for content script', { targetType: executionJob.target.type });
-
-    const latestJob = await apiFetch(`/api/jobs/${executionJob.id}`) as { status?: string } | null;
-    if (latestJob?.status === 'CANCEL_REQUESTED') {
-      console.warn('[PostFlow] Job was canceled before Facebook execution started:', executionJob.id);
-      await updateJobStatus(executionJob.id, { status: 'CANCELED' });
-      isProcessingJob = false;
-      activeExecution = null;
-      checkPendingJobs();
-      return;
-    }
-
-      let sent = false;
-      let sendInFlight = false;
-      let identityFailureHandled = false;
-      let timeoutHandle: ReturnType<typeof setTimeout>;
-      let retryHandle: ReturnType<typeof setInterval> | null = null;
-
-    async function sendExecuteJob() {
-        if (activeExecution?.jobId !== executionJob.id || activeExecution?.tabId !== readyTabId) {
-          console.warn('[PostFlow] Skipping stale EXECUTE_JOB send', {
-            jobId: executionJob.id,
-            tabId: readyTabId,
-            activeExecution,
-          });
-          return;
-        }
-        if (sent) return;
-        if (sendInFlight) {
-          console.log('[PostFlow] Skipping overlapping EXECUTE_JOB send', executionJob.id);
-          return;
-        }
-        sendInFlight = true;
-        if (executionJob.target.type === 'PROFILE_FEED' && !(await verifyProfileTargetIdentity(executionJob.target))) {
-          sendInFlight = false;
-          if (!identityFailureHandled) {
-            identityFailureHandled = true;
-            cleanup();
-            await failProfileIdentityMismatch(executionJob);
-          }
-          return;
-        }
-        console.log('[PostFlow] Sending EXECUTE_JOB to Facebook tab', {
-          tabId: readyTabId,
-          jobId: executionJob.id,
-          targetType: executionJob.target.type,
-        });
-        chrome.tabs.sendMessage(readyTabId, {
-          type: 'EXECUTE_JOB',
-          jobId: executionJob.id,
-          post: executionJob.post,
-          target: executionJob.target,
-          profileVideoNotificationBaselineKeys,
-        }).then((response) => {
-          sendInFlight = false;
-          if (response?.accepted !== true) {
-            sent = false;
-            console.warn('[PostFlow] Facebook content script did not accept EXECUTE_JOB', {
-              jobId: executionJob.id,
-              error: response?.error,
-            });
-            return;
-          }
-          sent = true;
-          console.log('[PostFlow] Facebook content script accepted EXECUTE_JOB');
-        }).catch(() => {
-          sendInFlight = false;
-          sent = false;
-          console.log('[PostFlow] Facebook content script is not ready; retrying');
-        });
-      }
-
-      function onMessage(message: any, sender: chrome.runtime.MessageSender) {
-        if (message.type === 'CONTENT_SCRIPT_READY' && sender.tab?.id === readyTabId) {
-          if (activeExecution?.jobId !== executionJob.id || activeExecution?.tabId !== readyTabId) {
-            console.warn('[PostFlow] Ignoring stale content-script ready handler', {
-              jobId: executionJob.id,
-              tabId: readyTabId,
-              activeExecution,
-            });
-            cleanup();
-            return;
-          }
-          // A successful send means a content script already accepted this
-          // job. Never redeliver it to a replacement document: that can click
-          // Facebook's Post button twice.
-          console.log('[PostFlow] Facebook content script ready', {
-            jobId: executionJob.id,
-            deliveryAlreadyAccepted: sent,
-          });
-          void sendExecuteJob();
-        }
-      }
-
-    function cleanup() {
-        chrome.runtime.onMessage.removeListener(onMessage);
-        if (retryHandle) clearInterval(retryHandle);
-        if (finishExecutionHandshake === cleanup) finishExecutionHandshake = null;
-      }
-
-    finishExecutionHandshake = cleanup;
-
-    chrome.runtime.onMessage.addListener(onMessage);
-    void sendExecuteJob();
-    retryHandle = setInterval(() => void sendExecuteJob(), POSTING_TIMING.facebookMessageRetryIntervalMs);
-
-    timeoutHandle = setTimeout(async () => {
-        if (sent) return;
-        cleanup();
-        console.error('[PostFlow] Timed out waiting for Facebook tab to be ready');
-        await updateJobStatus(executionJob.id, {
-          status: 'FAILED',
-          error: 'Timed out waiting for Facebook page to load',
-        });
-        isProcessingJob = false;
-        activeExecution = null;
-    }, POSTING_TIMING.facebookTabReadyTimeoutMs);
-
-  } catch (err) {
-    console.error('[PostFlow] Error processing job:', err);
-    await updateJobStatus(executionJob.id, {
-      status: 'FAILED', 
-      error: 'Extension error while processing job' 
-    });
-    isProcessingJob = false;
-    activeExecution = null;
-  }
+  // Use the new platform-aware orchestrator for publishing jobs
+  await checkPlatformJobs();
 }
 
-async function verifyProfileTargetIdentity(target: ProfileFeedPublishTarget): Promise<boolean> {
+export async function verifyProfileTargetIdentity(target: ProfileFeedPublishTarget): Promise<boolean> {
   if (!/^\d+$/.test(target.facebookUserId)) return false;
   const verified = await refreshFacebookSession();
   const identity = await chrome.storage.local.get(['expectedFacebookUserId', 'detectedFacebookUserId']);
@@ -1466,6 +1875,197 @@ async function saveBackgroundPostingStep(
   await chrome.storage.local.set({ postingLogs: logs.slice(-500) });
 }
 
+function normalizeProfileVideoPostUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== 'https:' ||
+      !['facebook.com', 'www.facebook.com'].includes(url.hostname.toLowerCase())
+    ) return null;
+
+    const path = url.pathname.replace(/\/+$/, '');
+    if (/^\/reel\/[A-Za-z0-9_-]+$/i.test(path)) {
+      return `https://www.facebook.com${path}/`;
+    }
+    if (/^\/share\/v\/[A-Za-z0-9_-]+$/i.test(path)) {
+      return `https://www.facebook.com${path}/`;
+    }
+    if (/^\/[^/]+\/(?:posts|videos)\/[A-Za-z0-9_-]+$/i.test(path)) {
+      return `https://www.facebook.com${path}/`;
+    }
+    if (path.toLowerCase() === '/profile.php' || path.toLowerCase() === '/permalink.php') {
+      const id = url.searchParams.get('id');
+      const storyFbid = url.searchParams.get('story_fbid');
+      if (id && storyFbid) {
+        return `https://www.facebook.com${path}?id=${encodeURIComponent(id)}&story_fbid=${encodeURIComponent(storyFbid)}`;
+      }
+    }
+    if (path.toLowerCase() === '/watch') {
+      const videoId = url.searchParams.get('v');
+      if (videoId && /^[A-Za-z0-9_-]+$/.test(videoId)) {
+        return `https://www.facebook.com/watch/?v=${encodeURIComponent(videoId)}`;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function parseProfileVideoPostScan(
+  response: unknown,
+): { surfaceReady: boolean; candidates: ProfileVideoPostScanCandidate[] } | null {
+  if (typeof response !== 'object' || response === null) return null;
+  const value = response as Record<string, unknown>;
+  if (value.ok !== true || !Array.isArray(value.candidates)) return null;
+
+  const candidates: ProfileVideoPostScanCandidate[] = [];
+  const seen = new Set<string>();
+  for (const rawCandidate of value.candidates) {
+    if (typeof rawCandidate !== 'object' || rawCandidate === null) continue;
+    const candidate = rawCandidate as Record<string, unknown>;
+    if (typeof candidate.postUrl !== 'string') continue;
+    const postUrl = normalizeProfileVideoPostUrl(candidate.postUrl);
+    if (!postUrl) continue;
+    const key = postUrl.replace(/\/$/, '').toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    candidates.push({
+      postUrl,
+      ...(typeof candidate.text === 'string' ? { text: candidate.text } : {}),
+    });
+  }
+  return {
+    surfaceReady: value.surfaceReady === true,
+    candidates,
+  };
+}
+
+async function scanProfileVideoPosts(
+  tabId: number,
+  jobId: string,
+  expectedFacebookUserId: string,
+  submittedText = '',
+  includeNonVideo = false,
+): Promise<{ surfaceReady: boolean; candidates: ProfileVideoPostScanCandidate[] } | null> {
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, {
+      type: 'GET_PROFILE_VIDEO_POSTS',
+      jobId,
+      expectedFacebookUserId,
+      submittedText,
+      includeNonVideo,
+    });
+    return parseProfileVideoPostScan(response);
+  } catch {
+    return null;
+  }
+}
+
+async function snapshotProfileVideoPostUrls(
+  tabId: number,
+  jobId: string,
+  expectedFacebookUserId: string,
+): Promise<string[] | null> {
+  const startedAt = Date.now();
+  let surfaceReadyAt: number | null = null;
+  while (Date.now() - startedAt < POSTING_TIMING.facebookTabReadyTimeoutMs) {
+    const scan = await scanProfileVideoPosts(tabId, jobId, expectedFacebookUserId, '', true);
+    if (scan?.surfaceReady) {
+      surfaceReadyAt ??= Date.now();
+      // Allow the virtualized profile feed a short hydration window before
+      // freezing the baseline. This captures the visible top cards only; a
+      // newly published card will still be compared after a refresh.
+      if (Date.now() - surfaceReadyAt >= 3000) {
+        const urls = scan.candidates.map((candidate) => candidate.postUrl);
+        await saveBackgroundPostingStep(jobId, 'profile_video_profile_baseline_captured', {
+          profilePostCount: urls.length,
+        }).catch(() => undefined);
+        return urls;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, POSTING_TIMING.profileVideoProfilePollIntervalMs));
+  }
+
+  await saveBackgroundPostingStep(jobId, 'profile_video_profile_baseline_failed', {
+    reason: 'Facebook profile feed did not expose a ready DOM surface',
+  }).catch(() => undefined);
+  return null;
+}
+
+async function waitForNewProfileVideoPost(
+  jobId: string,
+  target: ProfileFeedPublishTarget,
+  baselineUrls: readonly string[],
+  submittedText: string,
+): Promise<ProfileVideoPostScanCandidate | null> {
+  let tabId: number | undefined;
+  try {
+    const profileUrl = getSafeFacebookProfileUrl(target) ?? target.url;
+    const tab = await chrome.tabs.create({ url: profileUrl, active: false });
+    tabId = tab.id;
+    if (
+      tabId === undefined ||
+      !(await waitForFacebookTabAfterNavigation(
+        tabId,
+        profileUrl,
+        POSTING_TIMING.facebookTabReadyTimeoutMs,
+      ))
+    ) return null;
+
+    const baseline = new Set(
+      baselineUrls.map((url) => url.replace(/\/$/, '').toLowerCase()),
+    );
+    const startedAt = Date.now();
+    let lastRefreshAt = startedAt;
+    while (Date.now() - startedAt < POSTING_TIMING.profileVideoProfileTimeoutMs) {
+      const scan = await scanProfileVideoPosts(
+        tabId,
+        jobId,
+        target.facebookUserId,
+        submittedText,
+      );
+      const found = scan?.candidates.find((candidate) =>
+        !baseline.has(candidate.postUrl.replace(/\/$/, '').toLowerCase()),
+      );
+      if (found) {
+        await saveBackgroundPostingStep(jobId, 'profile_video_profile_post_matched', {
+          postUrl: found.postUrl,
+        }).catch(() => undefined);
+        return found;
+      }
+
+      if (Date.now() - lastRefreshAt >= POSTING_TIMING.profileVideoProfileRefreshIntervalMs) {
+        await chrome.tabs.reload(tabId).catch(() => undefined);
+        await waitForFacebookTabAfterNavigation(
+          tabId,
+          profileUrl,
+          POSTING_TIMING.facebookTabReadyTimeoutMs,
+        );
+        lastRefreshAt = Date.now();
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, POSTING_TIMING.profileVideoProfilePollIntervalMs));
+      }
+    }
+
+    await saveBackgroundPostingStep(jobId, 'profile_video_profile_post_not_found', {
+      baselineProfilePostCount: baseline.size,
+    }).catch(() => undefined);
+    return null;
+  } catch (error) {
+    console.warn('[PostFlow] Profile-video profile-page reconciliation failed', {
+      jobId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    await saveBackgroundPostingStep(jobId, 'profile_video_profile_check_failed', {
+      reason: error instanceof Error ? error.message : String(error),
+    }).catch(() => undefined);
+    return null;
+  } finally {
+    if (tabId !== undefined) await chrome.tabs.remove(tabId).catch(() => undefined);
+  }
+}
+
 async function snapshotProcessedProfileVideoNotificationKeys(jobId: string): Promise<string[] | null> {
   let tabId: number | undefined;
   try {
@@ -1521,6 +2121,7 @@ async function snapshotProcessedProfileVideoNotificationKeys(jobId: string): Pro
 async function waitForNewProcessedProfileVideoNotification(
   jobId: string,
   baselineKeys: readonly string[],
+  timeoutMs = POSTING_TIMING.profileVideoNotificationTimeoutMs,
 ): Promise<ProcessedProfileVideoNotificationScanResult | null> {
   let tabId: number | undefined;
   try {
@@ -1538,7 +2139,7 @@ async function waitForNewProcessedProfileVideoNotification(
     const baseline = new Set(baselineKeys);
     const startedAt = Date.now();
     let lastRefreshAt = startedAt;
-    while (Date.now() - startedAt < POSTING_TIMING.profileVideoNotificationTimeoutMs) {
+    while (Date.now() - startedAt < timeoutMs) {
       const scan = await scanProcessedProfileVideoNotifications(tabId, jobId);
       const found = scan?.notifications.find((notification) =>
         !baseline.has(notification.key) && !baseline.has(`post:${notification.postUrl}`),
@@ -1621,58 +2222,92 @@ chrome.runtime.onMessage.addListener((message, sender) => {
       });
 
       const completedPostHasVideo = publishJobHasVideo(completedExecution?.post);
-      const shouldReconcileProfileVideoNotification = Boolean(
+      const shouldReconcileProfileVideoPost = Boolean(
         completedExecution?.target.type === 'PROFILE_FEED' &&
         completedPostHasVideo &&
-        message.submissionResult?.status === 'PUBLISHED' &&
+        (
+          message.submissionResult?.status === 'PUBLISHED' ||
+          message.submissionResult?.status === 'UNKNOWN'
+        ) &&
         !message.submissionResult.postUrl &&
-        Array.isArray(completedExecution.profileVideoNotificationBaselineKeys),
+        (
+          Array.isArray(completedExecution.profileVideoProfileBaselineUrls) ||
+          Array.isArray(completedExecution.profileVideoNotificationBaselineKeys)
+        ),
       );
 
       if (
-        shouldReconcileProfileVideoNotification &&
+        shouldReconcileProfileVideoPost &&
         completedExecution?.target.type === 'PROFILE_FEED' &&
-        Array.isArray(completedExecution.profileVideoNotificationBaselineKeys)
+        (
+          Array.isArray(completedExecution.profileVideoProfileBaselineUrls) ||
+          Array.isArray(completedExecution.profileVideoNotificationBaselineKeys)
+        )
       ) {
-        console.log('[PostFlow] Waiting for a new processed profile-video notification', {
+        console.log('[PostFlow] Reconciling the new Facebook profile video', {
           jobId: message.jobId,
-          baselineIdentityCount: completedExecution.profileVideoNotificationBaselineKeys.length,
+          profileBaselineCount: completedExecution.profileVideoProfileBaselineUrls?.length ?? null,
+          notificationBaselineCount: completedExecution.profileVideoNotificationBaselineKeys?.length ?? null,
         });
         const identityStillMatches = await verifyProfileTargetIdentity(completedExecution.target);
-        const notification = identityStillMatches
+        const reconciliationStartedAt = Date.now();
+        const submittedText = typeof completedExecution.post?.content === 'string'
+          ? completedExecution.post.content
+          : '';
+        const profilePost = identityStillMatches &&
+          Array.isArray(completedExecution.profileVideoProfileBaselineUrls)
+          ? await waitForNewProfileVideoPost(
+              message.jobId,
+              completedExecution.target,
+              completedExecution.profileVideoProfileBaselineUrls,
+              submittedText,
+            )
+          : null;
+        const remainingNotificationTimeoutMs = Math.max(
+          0,
+          POSTING_TIMING.profileVideoNotificationTimeoutMs -
+            (Date.now() - reconciliationStartedAt),
+        );
+        const notification = !profilePost && identityStillMatches &&
+          Array.isArray(completedExecution.profileVideoNotificationBaselineKeys)
           ? await waitForNewProcessedProfileVideoNotification(
               message.jobId,
               completedExecution.profileVideoNotificationBaselineKeys,
+              remainingNotificationTimeoutMs,
             )
           : null;
-        if (notification) {
+        const resolvedPostUrl = profilePost?.postUrl ?? notification?.postUrl ?? null;
+        if (resolvedPostUrl) {
           const updatedJob = await updateJobStatus(message.jobId, {
             status: 'SUCCESS',
             submissionResult: {
               status: 'PUBLISHED',
-              postUrl: notification.postUrl,
+              postUrl: resolvedPostUrl,
             },
           });
           if (updatedJob) {
             await saveBackgroundPostingStep(message.jobId, 'profile_video_post_url_saved', {
-              postUrl: notification.postUrl,
+              postUrl: resolvedPostUrl,
+              source: profilePost ? 'profile_feed' : 'processed_notification',
             }).catch(() => undefined);
             console.log('[PostFlow] Profile-video job enriched with its canonical reel URL', {
               jobId: message.jobId,
-              postUrl: notification.postUrl,
+              postUrl: resolvedPostUrl,
+              source: profilePost ? 'profile_feed' : 'processed_notification',
             });
           } else {
             await saveBackgroundPostingStep(message.jobId, 'profile_video_post_url_update_failed', {
-              postUrl: notification.postUrl,
+              postUrl: resolvedPostUrl,
             }).catch(() => undefined);
           }
         } else if (!identityStillMatches) {
-          await saveBackgroundPostingStep(message.jobId, 'profile_video_notification_check_skipped', {
+          await saveBackgroundPostingStep(message.jobId, 'profile_video_reconciliation_skipped', {
             reason: 'Facebook identity no longer matches the profile target',
           }).catch(() => undefined);
         }
       }
 
+      resolveFacebookExecutionCompletion(message.jobId);
       isProcessingJob = false;
       activeExecution = null;
 
@@ -1735,7 +2370,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
             Boolean(syncResult.postUrl)
           );
         const updated = shouldPersistAutomaticPostLinkCheck
-          ? await persistPendingSyncResult(syncPost, syncResult)
+          ? await persistAutomaticPostLinkResult(message.jobId, syncResult)
           : false;
         console.log('[PostFlow] Automatic post-link check finished', {
           jobId: message.jobId,
@@ -1756,7 +2391,16 @@ chrome.runtime.onMessage.addListener((message, sender) => {
       }
 
       checkPendingJobs();
-    })();
+    })().catch((error) => {
+      console.error('[PostFlow] Facebook job completion reconciliation failed', {
+        jobId: message.jobId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      resolveFacebookExecutionCompletion(message.jobId);
+      isProcessingJob = false;
+      activeExecution = null;
+      checkPendingJobs();
+    });
   }
   if (message.type === 'JOB_FAILED') {
     if (!isCurrentExecutionResult(message, sender)) return;
@@ -1780,6 +2424,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
         console.warn('[PostFlow] Publishing queue paused for manual attention', publishQueuePaused);
       }
       await updateJobStatus(message.jobId, { status: 'FAILED', error: message.error });
+      resolveFacebookExecutionCompletion(message.jobId);
       isProcessingJob = false;
       activeExecution = null;
       if (!publishQueuePaused) checkPendingJobs();
@@ -1791,6 +2436,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
       console.warn('[PostFlow] Job canceled before Facebook submit:', message.jobId);
       finishExecutionHandshake?.();
       await updateJobStatus(message.jobId, { status: 'CANCELED' });
+      resolveFacebookExecutionCompletion(message.jobId);
       isProcessingJob = false;
       activeExecution = null;
       checkPendingJobs();
@@ -2329,6 +2975,7 @@ async function syncPendingPostsBatch(
   manualOnly = false,
   maxItems = MAINTENANCE_BATCH_LIMIT,
 ): Promise<Array<{ postId: string; result: PendingPostSyncResult; updated: boolean }>> {
+  if (!(await canClaimNewWork())) return [];
   if (isPendingBatchRunning || isFacebookSyncBusy || isProcessingJob) return [];
   isPendingBatchRunning = true;
   isFacebookSyncBusy = true;
@@ -2402,6 +3049,35 @@ async function persistPendingSyncResult(post: PendingFacebookPost, result: Pendi
   const response = await apiFetch(`/api/jobs/${post.id}/pending-sync`, {
     ...result,
     ...(post.claimToken ? { claimToken: post.claimToken } : {}),
+  });
+  return Boolean(response);
+}
+
+/**
+ * Persist a post URL discovered immediately after publishing.
+ *
+ * This path is owned by the publishing job execution, not by the scheduled
+ * pending-approval maintenance worker, so it must use the normal job status
+ * endpoint instead of /pending-sync (which intentionally requires a
+ * maintenance claim token).
+ */
+async function persistAutomaticPostLinkResult(
+  jobId: string,
+  result: PendingPostSyncResult,
+): Promise<boolean> {
+  const submissionStatus = result.status === 'PUBLISHED'
+    ? 'PUBLISHED'
+    : result.status === 'STILL_PENDING'
+      ? 'PENDING_APPROVAL'
+      : null;
+  if (!submissionStatus) return false;
+
+  const response = await updateJobStatus(jobId, {
+    status: 'SUCCESS',
+    submissionResult: {
+      status: submissionStatus,
+      ...('postUrl' in result && result.postUrl ? { postUrl: result.postUrl } : {}),
+    },
   });
   return Boolean(response);
 }
@@ -2545,11 +3221,211 @@ async function checkSinglePostEngagement(
   }
 }
 
+function normalizeInstagramEngagementPermalink(value: string): string | null {
+  const markdownMatch = value.trim().match(/^\[[^\]]+\]\((https?:\/\/[^)]+)\)$/i);
+  const candidate = markdownMatch?.[1] ?? value.trim();
+  try {
+    const url = new URL(candidate);
+    const hostname = url.hostname.toLowerCase();
+    if (hostname !== 'instagram.com' && !hostname.endsWith('.instagram.com')) return null;
+    const match = url.pathname.match(/^(?:\/[^/]+)?\/(p|reels?)\/([A-Za-z0-9_-]+)\/?$/i);
+    if (!match) return null;
+    const kind = match[1].toLowerCase() === 'p' ? 'p' : 'reel';
+    return `https://www.instagram.com/${kind}/${match[2]}/`;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForInstagramTabAfterNavigation(tabId: number, targetUrl: string, timeoutMs: number): Promise<boolean> {
+  const startedAt = Date.now();
+  let targetPath = '';
+  let targetIdentity = '';
+  try {
+    targetPath = new URL(targetUrl).pathname.replace(/\/+$/, '').toLowerCase();
+    targetIdentity = targetPath.match(/\/(?:p|reels?)\/([a-z0-9_-]+)/i)?.[1] ?? '';
+  } catch {
+    return false;
+  }
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      const currentPath = tab.url ? new URL(tab.url).pathname.replace(/\/+$/, '').toLowerCase() : '';
+      const currentIdentity = currentPath.match(/\/(?:p|reels?)\/([a-z0-9_-]+)/i)?.[1] ?? '';
+      const landedOnTarget = currentPath === targetPath ||
+        Boolean(targetIdentity && currentIdentity && targetIdentity === currentIdentity);
+      if (tab.status === 'complete' && landedOnTarget && Date.now() - startedAt >= 1200) return true;
+    } catch {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return false;
+}
+
+// Instagram post-detail pages can stream the dialog and counters long after
+// the initial document reports complete. Keep these independent from the
+// shorter Facebook readiness window.
+const INSTAGRAM_ANALYTICS_TAB_READY_TIMEOUT_MS = 60_000;
+const INSTAGRAM_ANALYTICS_MESSAGE_TIMEOUT_MS = 60_000;
+const TIKTOK_ANALYTICS_TAB_READY_TIMEOUT_MS = 60_000;
+const TIKTOK_ANALYTICS_MESSAGE_TIMEOUT_MS = 30_000;
+
+async function checkSingleInstagramPostEngagement(
+  post: PublishedPlatformPost,
+): Promise<PostEngagementSyncResult> {
+  const postUrl = normalizeInstagramEngagementPermalink(post.postUrl);
+  if (!postUrl) return { status: 'CHECK_FAILED', reason: 'Stored Instagram post URL is invalid' };
+  let tabId: number | undefined;
+  try {
+    console.log('[PostAnalytics][Instagram] Opening published post', { postId: post.id, postUrl });
+    const tab = await chrome.tabs.create({ url: postUrl, active: false });
+    tabId = tab.id;
+    console.log('[PostAnalytics][Instagram] Waiting for post details tab', {
+      postId: post.id,
+      tabId,
+      tabReadyTimeoutMs: INSTAGRAM_ANALYTICS_TAB_READY_TIMEOUT_MS,
+      engagementTimeoutMs: INSTAGRAM_ANALYTICS_MESSAGE_TIMEOUT_MS,
+    });
+    const ready = Boolean(tabId && await waitForInstagramTabAfterNavigation(
+      tabId,
+      postUrl,
+      INSTAGRAM_ANALYTICS_TAB_READY_TIMEOUT_MS,
+    ));
+    if (!tabId || !ready) {
+      console.warn('[PostAnalytics][Instagram] Post details tab readiness timeout', {
+        postId: post.id,
+        tabId,
+        postUrl,
+      });
+      return { status: 'CHECK_FAILED', reason: 'Target Instagram post did not finish loading' };
+    }
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < INSTAGRAM_ANALYTICS_MESSAGE_TIMEOUT_MS) {
+      try {
+        const response = await chrome.tabs.sendMessage(tabId, {
+          type: 'CHECK_INSTAGRAM_POST_ENGAGEMENT',
+          postUrl,
+        });
+        if (response?.ok && response.result) {
+          console.log('[PostAnalytics][Instagram] Engagement result received', {
+            postId: post.id,
+            result: response.result,
+          });
+          return response.result as PostEngagementSyncResult;
+        }
+      } catch (error) {
+        console.debug('[PostAnalytics][Instagram] Content script not ready; retrying', {
+          postId: post.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      await new Promise((resolve) => setTimeout(resolve, POSTING_TIMING.facebookMessageRetryIntervalMs));
+    }
+    return { status: 'CHECK_FAILED', reason: 'Timed out waiting for Instagram engagement counters' };
+  } catch (error) {
+    return { status: 'CHECK_FAILED', reason: error instanceof Error ? error.message : 'Instagram engagement check failed' };
+  } finally {
+    if (tabId !== undefined) await chrome.tabs.remove(tabId).catch(() => undefined);
+  }
+}
+
+async function waitForTikTokTabAfterNavigation(tabId: number, targetUrl: string, timeoutMs: number): Promise<boolean> {
+  const target = normalizeTikTokAnalyticsPermalink(targetUrl);
+  if (!target) return false;
+  const targetPath = new URL(target).pathname.toLowerCase();
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.url) {
+        const currentUrl = new URL(tab.url);
+        if (!['www.tiktok.com', 'tiktok.com'].includes(currentUrl.hostname.toLowerCase())) return false;
+        if (/^\/(?:login|signup)(?:\/|$)/i.test(currentUrl.pathname)) return false;
+        const currentPath = currentUrl.pathname.replace(/\/+$/, '').toLowerCase();
+        if (tab.status === 'complete' && currentPath === targetPath && Date.now() - startedAt >= 1_200) return true;
+      }
+    } catch {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return false;
+}
+
+async function checkSingleTikTokPostEngagement(
+  post: PublishedPlatformPost,
+): Promise<PostEngagementSyncResult> {
+  const postUrl = normalizeTikTokAnalyticsPermalink(
+    post.postUrl,
+    post.targetType === 'TIKTOK_PHOTO' || post.targetType === 'TIKTOK_VIDEO'
+      ? post.targetType
+      : undefined,
+  );
+  if (!postUrl) return { status: 'CHECK_FAILED', reason: 'Stored TikTok post URL is invalid' };
+  let tabId: number | undefined;
+  try {
+    console.info('[PostAnalytics][TikTok] Opening published post', {
+      postId: post.id,
+      targetType: post.targetType ?? null,
+      storedPostUrl: post.postUrl,
+      postUrl,
+    });
+    const tab = await chrome.tabs.create({ url: postUrl, active: false });
+    tabId = tab.id;
+    const ready = Boolean(tabId && await waitForTikTokTabAfterNavigation(
+      tabId,
+      postUrl,
+      TIKTOK_ANALYTICS_TAB_READY_TIMEOUT_MS,
+    ));
+    const landedTab = tabId === undefined ? null : await chrome.tabs.get(tabId).catch(() => null);
+    console.info('[PostAnalytics][TikTok] Published post page readiness', {
+      postId: post.id,
+      targetType: post.targetType ?? null,
+      ready,
+      landedUrl: landedTab?.url ?? null,
+      tabStatus: landedTab?.status ?? null,
+    });
+    if (!tabId || !ready) {
+      return { status: 'CHECK_FAILED', reason: 'Target TikTok post did not finish loading' };
+    }
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < TIKTOK_ANALYTICS_MESSAGE_TIMEOUT_MS) {
+      try {
+        const response = await chrome.tabs.sendMessage(tabId, {
+          type: 'CHECK_TIKTOK_POST_ENGAGEMENT',
+          postUrl,
+        });
+        if (response?.ok && response.result) {
+          console.info('[PostAnalytics][TikTok] Engagement result received', {
+            postId: post.id,
+            postUrl,
+            ...response.result,
+          });
+          return response.result as PostEngagementSyncResult;
+        }
+      } catch {
+        // The content script can start after the navigation completes.
+      }
+      await new Promise((resolve) => setTimeout(resolve, POSTING_TIMING.facebookMessageRetryIntervalMs));
+    }
+    return { status: 'CHECK_FAILED', reason: 'Timed out waiting for TikTok engagement counters' };
+  } catch (error) {
+    return {
+      status: 'CHECK_FAILED',
+      reason: error instanceof Error ? error.message : 'TikTok engagement check failed',
+    };
+  } finally {
+    if (tabId !== undefined) await chrome.tabs.remove(tabId).catch(() => undefined);
+  }
+}
+
 async function syncPublishedEngagementBatch(
   manualOnly = false,
   maxItems = MAINTENANCE_BATCH_LIMIT,
   mode: EngagementSyncMode = 'AUTOMATIC',
 ) {
+  if (!(await canClaimNewWork())) return [];
   if (isEngagementBatchRunning || isFacebookSyncBusy || isProcessingJob) return [];
   isEngagementBatchRunning = true;
   isFacebookSyncBusy = true;
@@ -2563,6 +3439,9 @@ async function syncPublishedEngagementBatch(
     const queryParams = new URLSearchParams({
       limit: String(Math.min(MAINTENANCE_BATCH_LIMIT, Math.max(1, maxItems))),
       ...(manualOnly ? { manualOnly: 'true' } : {}),
+      ...(mode === 'AUTOMATIC' && !TIKTOK_AUTOMATIC_ANALYTICS_ENABLED
+        ? { excludeTikTok: 'true' }
+        : {}),
     });
     const query = `/api/jobs/engagement-pending?${queryParams.toString()}`;
     const posts = await apiFetch(query);
@@ -2576,14 +3455,18 @@ async function syncPublishedEngagementBatch(
       );
     }
     const results = [];
-    for (const post of posts as PublishedFacebookPost[]) {
+    for (const post of posts as PublishedPlatformPost[]) {
       await recordMaintenanceDiagnostic(
         'claim.created',
         'ENGAGEMENT',
         'claimsCreated',
         { jobId: post.id, manualOnly },
       );
-      const result = await checkSinglePostEngagement(post, true, mode);
+      const result = post.platform === 'INSTAGRAM' || post.targetType === 'INSTAGRAM_FEED' || post.targetType === 'INSTAGRAM_REEL'
+        ? await checkSingleInstagramPostEngagement(post)
+        : post.platform === 'TIKTOK' || post.targetType === 'TIKTOK_VIDEO' || post.targetType === 'TIKTOK_PHOTO'
+          ? await checkSingleTikTokPostEngagement(post)
+          : await checkSinglePostEngagement(post, true, mode);
       const updated = Boolean(await apiFetch(`/api/jobs/${post.id}/engagement`, {
         ...result,
         ...(post.claimToken ? { claimToken: post.claimToken } : {}),
@@ -2632,15 +3515,33 @@ async function yieldMaintenanceToPublishing(deadline: number): Promise<boolean> 
   }
 }
 
+async function hasVerifiedMaintenanceSession(): Promise<boolean> {
+  if (facebookIdentityVerified) return true;
+  const stored = await chrome.storage.local.get([
+    'instagramSessionDetected',
+    'instagramConnectionStatus',
+    'tiktokSessionDetected',
+    'tiktokConnectionStatus',
+  ]);
+  return (
+    stored.instagramSessionDetected === true &&
+    stored.instagramConnectionStatus === 'CONNECTED'
+  ) || (
+    stored.tiktokSessionDetected === true &&
+    stored.tiktokConnectionStatus === 'CONNECTED'
+  );
+}
+
 /** Run maintenance in priority order with one navigation at a time. */
 async function runMaintenanceCoordinator(
   options: MaintenanceCoordinatorOptions = {},
 ) {
+  if (!(await canClaimNewWork())) return [];
   if (
     isMaintenanceCoordinatorRunning ||
     isProcessingJob ||
     isFacebookSyncBusy ||
-    !facebookIdentityVerified
+    !(await hasVerifiedMaintenanceSession())
   ) {
     return [];
   }
@@ -2782,10 +3683,18 @@ async function ensureMaintenanceAlarms(): Promise<void> {
   }
 }
 
-chrome.alarms.create(HEARTBEAT_ALARM, {
-  periodInMinutes: HEARTBEAT_INTERVAL_MINUTES,
-});
-void ensureMaintenanceAlarms();
+async function initializeWorkerAlarms(): Promise<void> {
+  if ((await getExtensionLifecycleStatus()) === 'REVOKED') {
+    await handleRevokedInstallation();
+    return;
+  }
+  chrome.alarms.create(HEARTBEAT_ALARM, {
+    periodInMinutes: HEARTBEAT_INTERVAL_MINUTES,
+  });
+  await ensureMaintenanceAlarms();
+}
+
+void initializeWorkerAlarms();
 // Remove state left by the retired English-video retry experiment. The
 // finalized flow performs one fresh-tab reconciliation immediately.
 void chrome.alarms.clear('postflow-english-video-link-sync');
@@ -2798,6 +3707,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === HEARTBEAT_ALARM) {
     sendHeartbeat();
     void refreshFacebookSession();
+    void refreshInstagramSession().catch((error) => {
+      console.warn('[PostFlow][Instagram] Heartbeat session refresh failed', error);
+    });
     checkPendingJobs(); // Also check jobs on heartbeat
   }
   if (alarm.name === PENDING_POST_SYNC_ALARM) {
@@ -2821,6 +3733,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 // ── Startup ──
 
+// A service-worker restart does not reinject content scripts into dashboard
+// tabs that were already open. Do this on every worker startup so the Clerk
+// user ID handshake is immediate instead of waiting for a dashboard refresh.
+void injectPostflowBridgeIntoOpenDashboardTabs();
 void registerExtension();
 
 chrome.runtime.onStartup.addListener(() => {
@@ -2829,8 +3745,93 @@ chrome.runtime.onStartup.addListener(() => {
   checkPendingJobs();
 });
 
-chrome.runtime.onInstalled.addListener(() => {
-  registerExtension();
-  sendHeartbeat();
-  checkPendingJobs();
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason === 'install') {
+    void chrome.storage.local.set({ extensionConnectionStage: 'waiting-for-dashboard' });
+  }
+  void injectPostflowBridgeIntoOpenDashboardTabs();
+  void registerExtension();
+  void sendHeartbeat();
+  void checkPendingJobs();
 });
+
+async function injectPostflowBridgeIntoOpenDashboardTabs(): Promise<void> {
+  // A stored user ID does not mean the open tab still has a live bridge after
+  // an extension reload. The content script guards against duplicate installs.
+  const tabs = await chrome.tabs.query({
+    url: [
+      'http://localhost:3001/*',
+      'http://127.0.0.1:3001/*',
+      'https://fitcure.online/*',
+    ],
+  });
+  const scriptFile = getBackgroundSiblingScriptFile('postflow-content.js');
+  await Promise.all(tabs.map(async (tab) => {
+    if (tab.id === undefined) return;
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: [scriptFile],
+      });
+    } catch (error) {
+      console.warn('[PostFlow] Could not connect an already-open dashboard tab', {
+        tabId: tab.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }));
+}
+
+async function requestDashboardAuthContext(): Promise<{ ok: boolean; error?: string }> {
+  const dashboardTabs = await chrome.tabs.query({
+    url: [
+      'http://localhost:3001/*',
+      'http://127.0.0.1:3001/*',
+      'https://fitcure.online/*',
+    ],
+  });
+  if (!dashboardTabs.length) {
+    return {
+      ok: false,
+      error: 'Open the signed-in PostFlow dashboard in this browser, then try again.',
+    };
+  }
+
+  // Ensure an already-open dashboard has the bridge after an extension reload,
+  // then explicitly ask it to publish its current Clerk user ID.
+  await injectPostflowBridgeIntoOpenDashboardTabs();
+  let dashboardUserId: string | null = null;
+  for (const tab of dashboardTabs) {
+    if (tab.id === undefined) continue;
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, {
+        type: 'REFRESH_AUTH_CONTEXT',
+      });
+      if (response?.ok === true && typeof response.userId === 'string') {
+        dashboardUserId = response.userId;
+      }
+    } catch {
+      // A tab may have navigated between query and send; try the remaining tabs.
+    }
+  }
+  if (!dashboardUserId) {
+    return {
+      ok: false,
+      error: 'Could not read a signed-in dashboard. Open PostFlow and sign in, then retry.',
+    };
+  }
+
+  // The content bridge writes storage asynchronously. Give it a short window
+  // to complete before retrying registration immediately.
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    if (await getClerkUserId() === dashboardUserId) {
+      await registerExtension();
+      return { ok: true };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return {
+    ok: false,
+    error: 'The dashboard did not provide a user ID. Confirm that you are signed in and refresh the dashboard.',
+  };
+}

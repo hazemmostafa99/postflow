@@ -17,10 +17,12 @@ export default async function TeamsPage() {
   const { userId } = await auth();
   if (!userId) redirect("/sign-in");
 
-  const [teams, users, currentUser] = await Promise.all([
+  const currentUser = await api("/api/auth/me", userId);
+  if (currentUser?.role === "SALES") redirect("/dashboard");
+
+  const [teams, users] = await Promise.all([
     api("/api/teams", userId),
     api("/api/users", userId),
-    api("/api/auth/me", userId),
   ]);
   const managers = users.filter((user: { role: string; status: string }) => user.role === "MANAGER" && user.status === "ACTIVE");
 
@@ -31,7 +33,7 @@ export default async function TeamsPage() {
         users={users}
         managers={managers}
       />
-      {currentUser.role === "ADMIN" && <CreateTeamForm managers={managers} />}
+      {currentUser?.role === "ADMIN" && <CreateTeamForm managers={managers} />}
     </div>
   );
 }

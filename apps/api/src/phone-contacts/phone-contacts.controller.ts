@@ -25,8 +25,12 @@ export class PhoneContactsController {
     @Headers('x-clerk-user-id') clerkUserId: string,
     @Query('search') search?: string,
     @Query('category') category?: string,
+    @Query('group') group?: string,
+    @Query('qualificationStatus') qualificationStatus?: string,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
+    @Query('cursor') cursor?: string,
+    @Query('includeMetadata') includeMetadata?: string,
   ) {
     const normalizedUserId = clerkUserId?.trim();
     if (!normalizedUserId) {
@@ -35,8 +39,12 @@ export class PhoneContactsController {
     return this.phoneContactsService.listPhoneContacts(normalizedUserId, {
       search,
       category,
+      group,
+      qualificationStatus,
       page: page ? Number(page) : undefined,
       limit: limit ? Number(limit) : undefined,
+      cursor,
+      includeMetadata: includeMetadata !== 'false',
     });
   }
 

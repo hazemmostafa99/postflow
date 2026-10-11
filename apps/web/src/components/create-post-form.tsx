@@ -4,6 +4,13 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { CalendarClock, CheckSquare, ChevronDown, Clock3, ImagePlus, Loader2, Search, Send, Square, Trash2, UserRound, Users, X } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import {
+  InstagramDestinationMenu,
+  type InstagramConnection,
+} from "@/components/instagram-destination-menu";
+import { buildInstagramTarget, resolveInstagramMedia } from "@/lib/instagram-publishing";
+import { TikTokDestinationMenu } from "@/components/tiktok-destination-menu";
+import { buildTikTokTarget, getTikTokMediaError, getTikTokMediaLabel, isTikTokConnectionReady, type TikTokConnection } from "@/lib/tiktok-publishing";
 
 interface Group {
   _id: string;
@@ -23,7 +30,9 @@ interface FacebookConnection {
 
 type SelectedDestination =
   | { key: string; type: "GROUP"; group: Group }
-  | { key: string; type: "PROFILE_FEED"; connection: FacebookConnection };
+  | { key: string; type: "PROFILE_FEED"; connection: FacebookConnection }
+  | { key: string; type: "INSTAGRAM"; connection: InstagramConnection }
+  | { key: string; type: "TIKTOK"; connection: TikTokConnection };
 
 interface CreatePostFormProps {
   groups?: Group[];
@@ -46,6 +55,8 @@ const MAX_MEDIA_FILES = 4;
 const MAX_MEDIA_FILE_SIZE = 2 * 1024 * 1024;
 const MAX_VIDEO_FILES = 1;
 const MAX_VIDEO_FILE_SIZE = 25 * 1024 * 1024;
+const INSTAGRAM_PUBLISHING_ENABLED = process.env.NEXT_PUBLIC_INSTAGRAM_PUBLISHING_ENABLED === "true";
+const TIKTOK_PUBLISHING_ENABLED = process.env.NEXT_PUBLIC_TIKTOK_PUBLISHING_ENABLED === "true";
 
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -56,11 +67,23 @@ function readFileAsDataUrl(file: File): Promise<string> {
   });
 }
 
+function platformConnectionName(connection: {
+  extensionName?: string | null;
+  extensionInstanceIdMasked?: string | null;
+}): string {
+  return connection.extensionName?.trim()
+    || connection.extensionInstanceIdMasked?.trim()
+    || "Chrome profile";
+}
+
 export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostFormProps) {
   const router = useRouter();
   const [availableGroups, setAvailableGroups] = useState<Group[]>(groups);
   const [selectedGroupsById, setSelectedGroupsById] = useState<Map<string, Group>>(new Map());
   const [selectedProfilesById, setSelectedProfilesById] = useState<Map<string, FacebookConnection>>(new Map());
+  const [selectedInstagramByKey, setSelectedInstagramByKey] = useState<Map<string, InstagramConnection>>(new Map());
+  const [selectedTikTokById, setSelectedTikTokById] = useState<Map<string, TikTokConnection>>(new Map());
+  const [tiktokConnections, setTikTokConnections] = useState<TikTokConnection[]>([]);
   const [selectedTargetKeys, setSelectedTargetKeys] = useState<string[]>([]);
   const [content, setContent] = useState("");
   const [mediaUrls, setMediaUrls] = useState<string[]>([]);
@@ -74,11 +97,15 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
   const [groupTotal, setGroupTotal] = useState(groups.length);
   const [groupTotalPages, setGroupTotalPages] = useState(Math.max(1, Math.ceil(groups.length / GROUPS_PER_PAGE)));
   const [connections, setConnections] = useState<FacebookConnection[]>([]);
+  const [instagramConnections, setInstagramConnections] = useState<InstagramConnection[]>([]);
   const [selectedConnectionIds, setSelectedConnectionIds] = useState<string[]>([]);
   const [isProfileMenuOpen, setIsProfileMenuOpen] = useState(false);
   const [isGroupAccountMenuOpen, setIsGroupAccountMenuOpen] = useState(false);
   const [isGroupMenuOpen, setIsGroupMenuOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const instagramMedia = resolveInstagramMedia(mediaUrls);
+  const instagramMediaError = selectedInstagramByKey.size > 0 ? instagramMedia.error : null;
+  const tiktokMediaError = selectedTikTokById.size > 0 ? getTikTokMediaError(mediaUrls) : null;
 
   const selectedDestinations = useMemo<SelectedDestination[]>(
     () => selectedTargetKeys.flatMap((key): SelectedDestination[] => {
@@ -90,9 +117,17 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
         const connection = selectedProfilesById.get(key.slice("PROFILE_FEED:".length));
         return connection ? [{ key, type: "PROFILE_FEED", connection }] : [];
       }
+      if (key.startsWith("INSTAGRAM:")) {
+        const connection = selectedInstagramByKey.get(key);
+        return connection ? [{ key, type: "INSTAGRAM", connection }] : [];
+      }
+      if (key.startsWith("TIKTOK:")) {
+        const connection = selectedTikTokById.get(key.slice("TIKTOK:".length));
+        return connection ? [{ key, type: "TIKTOK", connection }] : [];
+      }
       return [];
     }),
-    [selectedGroupsById, selectedProfilesById, selectedTargetKeys],
+    [selectedGroupsById, selectedInstagramByKey, selectedTikTokById, selectedProfilesById, selectedTargetKeys],
   );
 
   const fetchGroupsPage = useCallback(async (page: number, search: string) => {
@@ -122,14 +157,21 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
 
   useEffect(() => {
     let cancelled = false;
-    void fetch("/api/extensions/connections")
-      .then(async (res) => {
-        if (!res.ok) return [] as FacebookConnection[];
-        return (await res.json()) as FacebookConnection[];
-      })
-      .then((data) => {
+    void Promise.all([
+      fetch("/api/extensions/connections"),
+      fetch("/api/extensions/platform-connections?platform=INSTAGRAM"),
+      fetch("/api/extensions/platform-connections?platform=TIKTOK"),
+    ])
+      .then(async ([facebookResponse, instagramResponse, tiktokResponse]) => [
+        facebookResponse.ok ? (await facebookResponse.json()) as FacebookConnection[] : [],
+        instagramResponse.ok ? (await instagramResponse.json()) as InstagramConnection[] : [],
+        tiktokResponse.ok ? (await tiktokResponse.json()) as TikTokConnection[] : [],
+      ] as const)
+      .then(([facebookData, instagramData, tiktokData]) => {
         if (cancelled) return;
-        setConnections(data);
+        setConnections(facebookData);
+        setInstagramConnections(instagramData);
+        setTikTokConnections(tiktokData);
       })
       .catch(() => undefined);
 
@@ -253,15 +295,58 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
     );
   }, [selectedConnectionIds, updateGroupConnectionFilter]);
 
+  const toggleInstagram = useCallback((connection: InstagramConnection) => {
+    const key = `INSTAGRAM:${connection._id}`;
+    setSelectedInstagramByKey((previous) => {
+      const next = new Map(previous);
+      if (next.has(key)) next.delete(key);
+      else next.set(key, connection);
+      return next;
+    });
+    setSelectedTargetKeys((keys) => keys.includes(key)
+      ? keys.filter((item) => item !== key)
+      : [...keys, key]);
+  }, []);
+
+  const clearInstagram = useCallback(() => {
+    setSelectedInstagramByKey(new Map());
+    setSelectedTargetKeys((keys) => keys.filter((key) => !key.startsWith("INSTAGRAM:")));
+  }, []);
+
+  const toggleTikTok = useCallback((connection: TikTokConnection) => {
+    if (!TIKTOK_PUBLISHING_ENABLED || !isTikTokConnectionReady(connection)) return;
+    const key = `TIKTOK:${connection._id}`;
+    setSelectedTikTokById((previous) => {
+      const next = new Map(previous);
+      if (next.has(connection._id)) next.delete(connection._id);
+      else next.set(connection._id, connection);
+      return next;
+    });
+    setSelectedTargetKeys((keys) => keys.includes(key) ? keys.filter((item) => item !== key) : [...keys, key]);
+  }, []);
+
+  const clearTikTok = useCallback(() => {
+    setSelectedTikTokById(new Map());
+    setSelectedTargetKeys((keys) => keys.filter((key) => !key.startsWith("TIKTOK:")));
+  }, []);
+
   const clearAll = useCallback(() => {
     setSelectedGroupsById(new Map());
     setSelectedProfilesById(new Map());
+    setSelectedInstagramByKey(new Map());
+    setSelectedTikTokById(new Map());
     setSelectedTargetKeys([]);
   }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+
+    if (isSubmitting || isReadingMedia) return;
+    if (instagramMediaError || tiktokMediaError) {
+      setError(instagramMediaError || tiktokMediaError);
+      return;
+    }
 
     if (!content.trim() && mediaUrls.length === 0) {
       setError("Please write content or attach at least one image or video.");
@@ -285,7 +370,11 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
           mediaUrls,
           targets: selectedDestinations.map((destination) => destination.type === "GROUP"
             ? { type: "GROUP", groupId: destination.group._id }
-            : { type: "PROFILE_FEED", facebookConnectionId: destination.connection._id }),
+            : destination.type === "PROFILE_FEED"
+              ? { type: "PROFILE_FEED", facebookConnectionId: destination.connection._id }
+              : destination.type === "TIKTOK"
+                ? buildTikTokTarget(destination.connection._id, mediaUrls)
+                : buildInstagramTarget(destination.connection._id, mediaUrls)),
           ...(publishMode === "SCHEDULED" && startTime ? { startTime: new Date(startTime).toISOString() } : {}),
         }),
       });
@@ -370,6 +459,8 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
     !isSubmitting &&
     !isReadingMedia &&
     !isOverLimit &&
+    !instagramMediaError &&
+    !tiktokMediaError &&
     (content.trim().length > 0 || mediaUrls.length > 0) &&
     selectedTargetKeys.length > 0 &&
     (publishMode === "NOW" || Boolean(startTime));
@@ -466,19 +557,27 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
                 {selectedDestinations.map((destination) => {
                   const label = destination.type === "GROUP"
                     ? destination.group.name
-                    : connectionName(destination.connection);
+                    : destination.type === "PROFILE_FEED"
+                      ? connectionName(destination.connection)
+                      : destination.type === "TIKTOK"
+                        ? `TikTok · ${getTikTokMediaLabel(mediaUrls)} ${platformConnectionName(destination.connection)}`
+                        : `Instagram · ${instagramMedia.label} ${platformConnectionName(destination.connection)}`;
                   return (
                     <span
                       key={destination.key}
                       className="inline-flex h-8 max-w-full items-center gap-1.5 rounded-md border border-primary/20 bg-primary/10 pl-2.5 pr-1.5 text-xs font-medium text-foreground"
                     >
-                      {destination.type === "PROFILE_FEED"
+                      {destination.type !== "GROUP"
                         ? <UserRound className="h-3.5 w-3.5 shrink-0 text-primary" />
                         : <Users className="h-3.5 w-3.5 shrink-0 text-primary" />}
                       <span className="max-w-48 truncate">{label}</span>
                       <button
                         type="button"
-                        onClick={() => destination.type === "GROUP" ? toggleGroup(destination.group) : toggleProfile(destination.connection)}
+                        onClick={() => destination.type === "GROUP"
+                          ? toggleGroup(destination.group)
+                          : destination.type === "PROFILE_FEED"
+                            ? toggleProfile(destination.connection)
+                            : destination.type === "TIKTOK" ? toggleTikTok(destination.connection) : toggleInstagram(destination.connection)}
                         className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-background hover:text-foreground"
                         aria-label={"Remove " + label}
                       >
@@ -503,7 +602,7 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
 
             <div className="space-y-2">
               <div className="flex items-center justify-between gap-3">
-                <p className="text-xs font-medium text-muted-foreground">Profile feeds</p>
+                {/* <p className="text-xs font-medium text-muted-foreground">Profile feeds</p> */}
                 {selectedProfilesById.size > 0 && <span className="text-[11px] font-medium text-primary">{selectedProfilesById.size} selected</span>}
               </div>
               {connections.length === 0 ? (
@@ -588,12 +687,25 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
                   </PopoverContent>
                 </Popover>
               )}
-              <p className="text-[11px] leading-4 text-muted-foreground">Profile posts keep the audience currently set on Facebook.</p>
             </div>
+
+            <InstagramDestinationMenu
+              mediaSelection={instagramMedia}
+              connections={instagramConnections}
+              selectedIds={Array.from(selectedInstagramByKey.keys())
+                .map((key) => key.slice("INSTAGRAM:".length))}
+              publishingEnabled={INSTAGRAM_PUBLISHING_ENABLED}
+              onToggle={toggleInstagram}
+              onClear={clearInstagram}
+            />
+
+            <TikTokDestinationMenu connections={tiktokConnections} selectedIds={Array.from(selectedTikTokById.keys())}
+              publishingEnabled={TIKTOK_PUBLISHING_ENABLED} mediaError={getTikTokMediaError(mediaUrls)}
+              onToggle={toggleTikTok} onClear={clearTikTok} />
 
             <div className="space-y-2 border-t border-border pt-3">
               <div className="flex items-center justify-between gap-3">
-                <p className="text-xs font-medium text-muted-foreground">Facebook groups</p>
+                {/* <p className="text-xs font-medium text-muted-foreground">Facebook groups</p> */}
                 {selectedGroupsById.size > 0 && <span className="text-[11px] font-medium text-primary">{selectedGroupsById.size} selected</span>}
               </div>
 
@@ -812,7 +924,13 @@ export function CreatePostForm({ groups = [], onCancel, onSuccess }: CreatePostF
                     {selectedDestinations.map((destination, index) => (
                       <div key={destination.key} className="flex justify-between gap-3">
                         <span className="truncate">
-                          {destination.type === "GROUP" ? destination.group.name : connectionName(destination.connection) + " - Profile"}
+                          {destination.type === "GROUP"
+                            ? destination.group.name
+                            : destination.type === "PROFILE_FEED"
+                              ? connectionName(destination.connection) + " - Profile"
+                              : destination.type === "TIKTOK"
+                                ? `TikTok · ${getTikTokMediaLabel(mediaUrls)} ${platformConnectionName(destination.connection)}`
+                                : `Instagram · ${instagramMedia.label} ${platformConnectionName(destination.connection)}`}
                         </span>
                         <span className="shrink-0 tabular-nums">
                           {index === 0

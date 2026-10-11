@@ -1,14 +1,20 @@
 import {
   Controller,
   Post,
+  Patch,
+  Delete,
   Body,
   Get,
   HttpCode,
   HttpStatus,
   Headers,
+  Param,
+  Query,
+  BadRequestException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { FacebookConnectionWorkerStatus } from '../schemas/facebook-connection.schema';
+import { PlatformConnectionWorkerStatus } from '../schemas/platform-connection.schema';
 import { ExtensionsService } from './extensions.service';
 
 class SessionDto {
@@ -21,35 +27,246 @@ class WorkerStatusDto {
   reason?: string;
 }
 
+class PlatformWorkerStatusDto {
+  platform: 'FACEBOOK' | 'INSTAGRAM' | 'TIKTOK';
+  workerStatus: PlatformConnectionWorkerStatus;
+  reason?: string;
+}
+
+class PlatformSessionDto {
+  platform: 'FACEBOOK' | 'INSTAGRAM' | 'TIKTOK';
+  sessionDetected: boolean;
+  externalAccountId?: string;
+  externalUsername?: string;
+  evidenceState?: 'VERIFIED' | 'CHECKING' | 'LOGIN_REQUIRED' | 'STALE';
+  evidenceSource?: string;
+}
+
+class PlatformConnectionCreateDto {
+  platform: 'INSTAGRAM' | 'TIKTOK';
+  installationId: string;
+  displayName: string;
+  externalUsername?: string;
+  externalAccountId?: string;
+}
+
 class ExtensionIdentityDto {
   extensionName?: unknown;
 }
 
+class ReconnectDto {
+  connectionId?: string;
+  createNewConnection?: boolean;
+  confirmReplacement?: boolean;
+  approvalToken?: string;
+}
+
+class RestoreDisconnectedDto {
+  approvalToken?: string;
+}
+
+/**
+ * Extension-facing surface.
+ *
+ * Worker routes (register/heartbeat/session/status/name) authenticate with the
+ * `x-extension-instance-id` header plus the revocable `x-extension-credential`
+ * header issued at registration time.
+ *
+ * Dashboard routes key off the `x-clerk-user-id` header and operate only on
+ * connections owned by that user.
+ */
 @Controller('api/extensions')
 export class ExtensionsController {
   constructor(private readonly extensionsService: ExtensionsService) {}
 
-  @Get('connections')
-  async connections(@Headers('x-clerk-user-id') clerkUserId: string) {
+  private requireClerkUserId(clerkUserId?: string): string {
     if (!clerkUserId)
       throw new UnauthorizedException('x-clerk-user-id header is required');
-    return this.extensionsService.listConnections(clerkUserId);
+    return clerkUserId;
   }
 
+  // ── Dashboard surfaces ────────────────────────────────────────────────────
+
+  @Get('connections')
+  async connections(@Headers('x-clerk-user-id') clerkUserId?: string) {
+    return this.extensionsService.listConnections(
+      this.requireClerkUserId(clerkUserId),
+    );
+  }
+
+  @Get('installations')
+  async installations(@Headers('x-clerk-user-id') clerkUserId?: string) {
+    return this.extensionsService.listInstallations(
+      this.requireClerkUserId(clerkUserId),
+    );
+  }
+
+  @Get('browser-connections')
+  async browserConnections(@Headers('x-clerk-user-id') clerkUserId?: string) {
+    return this.extensionsService.listBrowserConnections(this.requireClerkUserId(clerkUserId));
+  }
+
+  @Patch('browser-connections/:installationId')
+  async renameBrowserConnection(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('installationId') installationId: string,
+    @Body() body: { name?: unknown },
+  ) {
+    return this.extensionsService.updateBrowserConnection(this.requireClerkUserId(clerkUserId), installationId, body.name);
+  }
+
+  @Post('browser-connections/:installationId/:action')
+  async browserConnectionAction(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('installationId') installationId: string,
+    @Param('action') action: string,
+  ) {
+    return this.extensionsService.browserConnectionAction(this.requireClerkUserId(clerkUserId), installationId, action);
+  }
+
+  @Get('platform-connections')
+  async platformConnections(
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+    @Query('platform') platform?: string,
+  ) {
+    const selectedPlatform = platform?.toUpperCase();
+    if (selectedPlatform && !['INSTAGRAM', 'TIKTOK'].includes(selectedPlatform)) {
+      throw new BadRequestException('Unsupported platform connection query');
+    }
+    return this.extensionsService.listPlatformConnections(
+      this.requireClerkUserId(clerkUserId),
+      (selectedPlatform as 'INSTAGRAM' | 'TIKTOK' | undefined) ?? 'INSTAGRAM',
+    );
+  }
+
+  @Post('platform-connections')
+  @HttpCode(HttpStatus.OK)
+  async createPlatformConnection(
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+    @Body() body: PlatformConnectionCreateDto = new PlatformConnectionCreateDto(),
+  ) {
+    return this.extensionsService.createPlatformConnection(
+      this.requireClerkUserId(clerkUserId),
+      body,
+    );
+  }
+
+  @Get('connections/archived')
+  async archivedConnections(@Headers('x-clerk-user-id') clerkUserId?: string) {
+    return this.extensionsService.listArchivedConnections(
+      this.requireClerkUserId(clerkUserId),
+    );
+  }
+
+  @Patch('connections/:connectionId/name')
+  @HttpCode(HttpStatus.OK)
+  async renameConnection(
+    @Param('connectionId') connectionId: string,
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+    @Body() body?: ExtensionIdentityDto,
+  ) {
+    return this.extensionsService.renameConnection(
+      this.requireClerkUserId(clerkUserId),
+      connectionId,
+      body?.extensionName,
+    );
+  }
+
+  @Post('connections/:connectionId/pause')
+  @HttpCode(HttpStatus.OK)
+  async pauseConnection(
+    @Param('connectionId') connectionId: string,
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+  ) {
+    return this.extensionsService.pauseConnection(
+      this.requireClerkUserId(clerkUserId),
+      connectionId,
+    );
+  }
+
+  @Post('connections/:connectionId/resume')
+  @HttpCode(HttpStatus.OK)
+  async resumeConnection(
+    @Param('connectionId') connectionId: string,
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+  ) {
+    return this.extensionsService.resumeConnection(
+      this.requireClerkUserId(clerkUserId),
+      connectionId,
+    );
+  }
+
+  @Post('connections/:connectionId/disconnect')
+  @HttpCode(HttpStatus.OK)
+  async disconnectConnection(
+    @Param('connectionId') connectionId: string,
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+  ) {
+    return this.extensionsService.disconnectConnection(
+      this.requireClerkUserId(clerkUserId),
+      connectionId,
+      false,
+    );
+  }
+
+  @Post('connections/:connectionId/force-disconnect')
+  @HttpCode(HttpStatus.OK)
+  async forceDisconnectConnection(
+    @Param('connectionId') connectionId: string,
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+  ) {
+    return this.extensionsService.disconnectConnection(
+      this.requireClerkUserId(clerkUserId),
+      connectionId,
+      true,
+    );
+  }
+
+  @Delete('connections/:connectionId')
+  @HttpCode(HttpStatus.OK)
+  async removeConnection(
+    @Param('connectionId') connectionId: string,
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+  ) {
+    return this.extensionsService.removeConnection(
+      this.requireClerkUserId(clerkUserId),
+      connectionId,
+    );
+  }
+
+  @Post('connections/:connectionId/reconnect-approval')
+  @HttpCode(HttpStatus.OK)
+  async issueReconnectApproval(
+    @Param('connectionId') connectionId: string,
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+  ) {
+    return this.extensionsService.issueReconnectApproval(
+      this.requireClerkUserId(clerkUserId),
+      connectionId,
+    );
+  }
+
+  // ── Worker surfaces (credential-authenticated) ───────────────────────────
+
   /**
-   * Called when the extension starts up.
-   * Registers or reactivates the installation for the user.
+   * Called when the extension starts up. Registers the installation and
+   * returns an explicit registration outcome. A revoked installation is never
+   * reactivated here.
    */
   @Post('register')
   @HttpCode(HttpStatus.OK)
   async register(
-    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Headers('x-clerk-user-id') clerkUserId?: string,
     @Headers('x-extension-instance-id') extensionInstanceId?: string,
+    @Headers('x-extension-credential') credential?: string,
     @Body() body?: ExtensionIdentityDto,
   ) {
-    if (!clerkUserId)
-      throw new UnauthorizedException('x-clerk-user-id header is required');
-    return this.extensionsService.register(clerkUserId, extensionInstanceId, body?.extensionName);
+    return this.extensionsService.register(
+      this.requireClerkUserId(clerkUserId),
+      extensionInstanceId,
+      body?.extensionName,
+      credential,
+    );
   }
 
   /**
@@ -58,13 +275,33 @@ export class ExtensionsController {
   @Post('heartbeat')
   @HttpCode(HttpStatus.OK)
   async heartbeat(
-    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Headers('x-clerk-user-id') clerkUserId?: string,
     @Headers('x-extension-instance-id') extensionInstanceId?: string,
+    @Headers('x-extension-credential') credential?: string,
     @Body() body?: ExtensionIdentityDto,
   ) {
-    if (!clerkUserId)
-      throw new UnauthorizedException('x-clerk-user-id header is required');
-    return this.extensionsService.heartbeat(clerkUserId, extensionInstanceId, body?.extensionName);
+    return this.extensionsService.heartbeat(
+      this.requireClerkUserId(clerkUserId),
+      extensionInstanceId,
+      body?.extensionName,
+      credential,
+    );
+  }
+
+  @Patch('name')
+  @HttpCode(HttpStatus.OK)
+  async rename(
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+    @Headers('x-extension-instance-id') extensionInstanceId?: string,
+    @Headers('x-extension-credential') credential?: string,
+    @Body() body?: ExtensionIdentityDto,
+  ) {
+    return this.extensionsService.rename(
+      this.requireClerkUserId(clerkUserId),
+      extensionInstanceId,
+      credential,
+      body?.extensionName,
+    );
   }
 
   /**
@@ -73,15 +310,15 @@ export class ExtensionsController {
   @Post('session')
   @HttpCode(HttpStatus.OK)
   async session(
-    @Headers('x-clerk-user-id') clerkUserId: string,
-    @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
-    @Body() body: SessionDto,
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+    @Headers('x-extension-instance-id') extensionInstanceId?: string,
+    @Headers('x-extension-credential') credential?: string,
+    @Body() body: SessionDto = new SessionDto(),
   ) {
-    if (!clerkUserId)
-      throw new UnauthorizedException('x-clerk-user-id header is required');
     return this.extensionsService.updateSession(
-      clerkUserId,
+      this.requireClerkUserId(clerkUserId),
       extensionInstanceId,
+      credential,
       body.sessionDetected,
       body.facebookUserId,
     );
@@ -90,20 +327,97 @@ export class ExtensionsController {
   @Post('status')
   @HttpCode(HttpStatus.OK)
   async status(
-    @Headers('x-clerk-user-id') clerkUserId: string,
-    @Headers('x-extension-instance-id') extensionInstanceId: string | undefined,
-    @Body() body: WorkerStatusDto,
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+    @Headers('x-extension-instance-id') extensionInstanceId?: string,
+    @Headers('x-extension-credential') credential?: string,
+    @Body() body: WorkerStatusDto = new WorkerStatusDto(),
   ) {
-    if (!clerkUserId)
-      throw new UnauthorizedException('x-clerk-user-id header is required');
-    if (!Object.values(FacebookConnectionWorkerStatus).includes(body.workerStatus)) {
-      throw new UnauthorizedException('Invalid extension worker status');
-    }
     return this.extensionsService.updateWorkerStatus(
-      clerkUserId,
+      this.requireClerkUserId(clerkUserId),
       extensionInstanceId,
+      credential,
       body.workerStatus,
       body.reason,
+    );
+  }
+
+  @Post('platform-status')
+  @HttpCode(HttpStatus.OK)
+  async platformStatus(
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+    @Headers('x-extension-instance-id') extensionInstanceId?: string,
+    @Headers('x-extension-credential') credential?: string,
+    @Body() body: PlatformWorkerStatusDto = new PlatformWorkerStatusDto(),
+  ) {
+    return this.extensionsService.updatePlatformConnectionWorkerStatus(
+      body.platform,
+      this.requireClerkUserId(clerkUserId),
+      extensionInstanceId,
+      credential,
+      body.workerStatus,
+      body.reason,
+    );
+  }
+
+  /** Called by a platform content script when its authenticated identity changes. */
+  @Post('platform-session')
+  @HttpCode(HttpStatus.OK)
+  async platformSession(
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+    @Headers('x-extension-instance-id') extensionInstanceId?: string,
+    @Headers('x-extension-credential') credential?: string,
+    @Body() body: PlatformSessionDto = new PlatformSessionDto(),
+  ) {
+    if (body.evidenceState) {
+      return this.extensionsService.updatePlatformSession(
+        body.platform, this.requireClerkUserId(clerkUserId), extensionInstanceId,
+        credential, body.sessionDetected, body.externalAccountId, body.externalUsername,
+        { state: body.evidenceState, source: body.evidenceSource },
+      );
+    }
+    return this.extensionsService.updatePlatformSession(
+      body.platform,
+      this.requireClerkUserId(clerkUserId),
+      extensionInstanceId,
+      credential,
+      body.sessionDetected,
+      body.externalAccountId,
+      body.externalUsername,
+    );
+  }
+
+  /**
+   * Explicit reinstall recovery: either rebinds this installation to an
+   * existing connection the user chose (reconnect) or completes the
+   * new-connection flow. Requires a verified Facebook identity and the
+   * installation credential; archived targets additionally require a
+   * dashboard-issued single-use approval code.
+   */
+  @Post('reconnect')
+  @HttpCode(HttpStatus.OK)
+  async reconnect(
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+    @Headers('x-extension-instance-id') extensionInstanceId?: string,
+    @Headers('x-extension-credential') credential?: string,
+    @Body() body: ReconnectDto = new ReconnectDto(),
+  ) {
+    return this.extensionsService.reconnect(
+      this.requireClerkUserId(clerkUserId),
+      extensionInstanceId,
+      credential,
+      body,
+    );
+  }
+
+  @Post('restore-disconnected')
+  @HttpCode(HttpStatus.OK)
+  async restoreDisconnected(
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+    @Headers('x-extension-instance-id') extensionInstanceId?: string,
+    @Body() body: RestoreDisconnectedDto = new RestoreDisconnectedDto(),
+  ) {
+    return this.extensionsService.restoreDisconnectedInstallation(
+      this.requireClerkUserId(clerkUserId), extensionInstanceId, body.approvalToken,
     );
   }
 }

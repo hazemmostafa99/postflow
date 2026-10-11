@@ -8,7 +8,7 @@ interface ScheduleJob {
   _id: string;
   targetLabel: string;
   status: string;
-  submissionStatus?: "PUBLISHED" | "PENDING_APPROVAL" | "UNKNOWN";
+  submissionStatus?: "PUBLISHED" | "PENDING_APPROVAL" | "PROCESSING" | "UNKNOWN";
   scheduledFor?: string;
 }
 

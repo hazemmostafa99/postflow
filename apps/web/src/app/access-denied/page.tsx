@@ -9,7 +9,7 @@ export default function AccessDeniedPage() {
         <ShieldX className="mx-auto h-10 w-10 text-destructive" />
         <h1 className="mt-5 text-2xl font-semibold">Access unavailable</h1>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">
-          Your account is signed in, but PostFlow could not activate access for it. Contact an administrator if this keeps happening.
+          Your account is signed in, but iPostFlow could not activate access for it. Contact an administrator if this keeps happening.
         </p>
         <div className="mt-6 flex justify-center gap-3">
           <SignOutButton>

@@ -76,6 +76,12 @@ function valueOf(value: string | string[] | undefined) {
   return Array.isArray(value) ? value[0] : value;
 }
 
+export const metadata = {
+  title: "Reports - iPostFlow",
+  description: "View and filter performance reports for posts, delivery, and engagement across teams and members.",
+};
+
+
 async function fetchReport(userId: string, params: Record<string, string | undefined>) {
   const url = new URL(`${API_BASE}/api/reports/overview`);
   for (const [key, value] of Object.entries(params)) {
