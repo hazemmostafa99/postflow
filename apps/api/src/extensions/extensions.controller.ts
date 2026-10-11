@@ -61,6 +61,10 @@ class ReconnectDto {
   approvalToken?: string;
 }
 
+class RestoreDisconnectedDto {
+  approvalToken?: string;
+}
+
 /**
  * Extension-facing surface.
  *
@@ -402,6 +406,18 @@ export class ExtensionsController {
       extensionInstanceId,
       credential,
       body,
+    );
+  }
+
+  @Post('restore-disconnected')
+  @HttpCode(HttpStatus.OK)
+  async restoreDisconnected(
+    @Headers('x-clerk-user-id') clerkUserId?: string,
+    @Headers('x-extension-instance-id') extensionInstanceId?: string,
+    @Body() body: RestoreDisconnectedDto = new RestoreDisconnectedDto(),
+  ) {
+    return this.extensionsService.restoreDisconnectedInstallation(
+      this.requireClerkUserId(clerkUserId), extensionInstanceId, body.approvalToken,
     );
   }
 }

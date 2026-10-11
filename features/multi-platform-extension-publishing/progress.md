@@ -1751,13 +1751,88 @@ Continue Phase 6 with controlled TikTok test publishing; keep broad rollout gate
   Manual refresh remains available when automatic TikTok analytics is disabled.
 - The extension opens the exact published post, verifies its route, and reads
   likes, comments, favorites, and numeric shares from TikTok's action bar. A
-  visible `Share` label without a number remains unknown; partial results keep
-  prior counters intact.
+  photo card is matched by its `data-more-menu-item-id`; a visible `Share`
+  label without a number remains unknown, and partial results keep prior
+  counters intact.
 - Added persisted favorite/share counters and TikTok-specific labels to the
   post details view. The production flag is enabled and the development flag
   remains disabled.
 - Validation: focused API tests (72 tests), API build, TikTok extension tests
-  (66 fixtures), extension development and production builds, 37 web regression
+  (68 fixtures), extension development and production builds, 37 web regression
   tests, and web production build pass. The production extension includes
   `TIKTOK_AUTOMATIC_ANALYTICS_ENABLED=true`. Live TikTok account validation
   remains pending.
+
+### 2026-10-10 - TikTok upload error-page and listener diagnostics
+
+- TikTok Studio can display its `Something went wrong / Please try again`
+  shell while keeping the allowlisted `/tiktokstudio/upload` URL. Readiness
+  now detects that visible error state, reloads the upload page once, and
+  refuses to execute if the composer does not recover.
+- Execution now pings the live content-script listener immediately before
+  binding the job. A missing listener is reattached before execution; an error
+  page is never treated as a ready composer. If the document fails after a
+  command has started, the result remains `UNKNOWN` and is not automatically
+  resumed.
+- Composer stage relay messages now include the expected username, allowing
+  the background bridge to accept and print the stage logs. Readiness and ping
+  responses include listener/error diagnostics.
+- Submission checkpoint telemetry now separates `submission-confirmation-waiting`
+  from `submission-confirmed`, making any TikTok page crash during the final
+  API round trip distinguishable from a crash immediately before Post.
+- After the checkpoint is confirmed, the composer now skips a redundant
+  identity DOM scan and clicks the still-connected verified Post control on
+  the first pass; replacement controls are still reacquired when TikTok
+  actually swaps the button.
+- TikTok publishing no longer repurposes an arbitrary profile/post tab. It
+  reuses only an existing TikTok Studio tab and otherwise opens a dedicated
+  Studio tab, avoiding SPA route hydration failures observed when navigating a
+  normal `/@account/video/{id}` tab directly into the upload surface.
+- Validation: extension development build, 7 adapter tests, 27 composer
+  tests, 12 selector tests, and the remaining focused TikTok suites pass.
+
+### 2026-10-10 - Owner-confirmed force retry for missing TikTok posts
+
+- Added a separate `POST /api/jobs/:id/force-retry` action for a TikTok job
+  whose submission is `UNKNOWN`, has a submission checkpoint, and has no
+  recorded post URL or external identity.
+- The dashboard shows `Force retry (no post)` only for that state. The action
+  requires an explicit confirmation that TikTok Studio Content was checked;
+  it clears the stale submission checkpoint and queues one manual retry.
+- The ordinary failed-job retry remains protected and still refuses any job
+  with submission evidence. The force action warns that a delayed TikTok
+  acceptance could still create a duplicate.
+- Validation: API manual-retry tests and API/web production builds pass.
+
+### 2026-10-10 - TikTok photo caption uses browser-level input
+
+- A live trace shows the editor is healthy after media upload. When caption
+  automation starts, TikTok displays its error page immediately after the
+  first inserted character. No submission checkpoint or Post click occurs.
+- Incremental content-script insertion reproduced the same failure on the
+  first character. Photo captions now use Chrome's debugger API and CDP
+  `Input.insertText`, scoped to the TikTok upload tab; the debugger detaches
+  immediately after the command.
+- The manifest now requests Chrome's `debugger` permission. The diagnostic
+  breakpoint after caption verification has been removed. The next clean retry
+  can proceed through the normal submission checkpoint and Post click. The
+  current prepared upload was already stopped before submission, so it can be
+  posted manually from Studio.
+
+### 2026-10-11 - Remove from Connections no longer archives
+
+- Remove now revokes the installation and hides it from both Active and
+  Archived connections. A hidden revoked instance record prevents the same
+  installed extension from registering itself again.
+- The action marks its Facebook and platform bindings removed and offline
+  while retaining jobs and audit history. A verified session on a new
+  installation can reattach a removed Instagram or TikTok account record.
+- The confirmation dialog now describes immediate removal.
+
+### 2026-10-11 - Disconnected connections tab
+
+- Reused the second Connections tab as Disconnected. It shows force-disconnected
+  installations and legacy disconnected connections, along with older archived
+  records. Removed connections stay hidden.
+- Disconnected rows show the extension identity and connected platform names,
+  and offer Remove. Existing archived Facebook rows retain their restore action.

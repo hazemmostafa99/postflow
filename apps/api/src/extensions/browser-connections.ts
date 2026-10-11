@@ -14,12 +14,14 @@ interface Installation {
   _id: unknown;
   displayName?: unknown;
   status?: unknown;
+  revocationReason?: unknown;
   lastHeartbeat?: unknown;
   facebookConnectionId?: unknown;
   extensionInstanceId?: unknown;
   archivedAt?: unknown;
   archivedByClerkUserId?: unknown;
   archiveReason?: unknown;
+  removedAt?: unknown;
 }
 interface SocialConnection {
   _id?: unknown;
@@ -42,7 +44,8 @@ export function groupBrowserConnections(
   platforms: SocialConnection[],
   includeRevoked = false,
 ) {
-  return installations.filter((installation) => includeRevoked || installation.status !== 'REVOKED').map((installation) => {
+  return installations.filter((installation) => !installation.removedAt &&
+    (includeRevoked || installation.status !== 'REVOKED')).map((installation) => {
     const id = String(installation._id);
     const extensionInstanceId = typeof installation.extensionInstanceId === 'string'
       ? installation.extensionInstanceId.trim()
@@ -74,6 +77,7 @@ export function groupBrowserConnections(
       displayName,
       extensionInstanceIdMasked: extensionInstanceIdMasked || 'missing',
       status: installation.status,
+      revocationReason: installation.revocationReason ?? null,
       lastHeartbeat: installation.lastHeartbeat,
       archivedAt: installation.archivedAt ?? null,
       archivedByClerkUserId: installation.archivedByClerkUserId ?? null,

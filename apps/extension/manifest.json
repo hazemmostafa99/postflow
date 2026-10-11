@@ -2,14 +2,15 @@
   "manifest_version": 3,
   "name": "PostFlow",
   "version": "0.1.0",
-  "description": "PostFlow Facebook Groups POC",
+  "description": "PostFlow publishing and sync for Facebook, Instagram, and TikTok",
   "permissions": [
     "storage",
     "tabs",
     "alarms",
     "activeTab",
     "scripting",
-    "cookies"
+    "cookies",
+    "debugger"
   ],
   "host_permissions": [
     "https://www.facebook.com/*",

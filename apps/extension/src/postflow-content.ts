@@ -12,8 +12,9 @@
 // observers/listeners.
 var postflowBridgeGlobal = globalThis as typeof globalThis & {
   __postflowContentBridgeInstalled?: boolean;
+  __postflowContentBridgeAlive?: () => boolean;
 };
-if (!postflowBridgeGlobal.__postflowContentBridgeInstalled) {
+if (!postflowBridgeGlobal.__postflowContentBridgeInstalled || !postflowBridgeGlobal.__postflowContentBridgeAlive?.()) {
 postflowBridgeGlobal.__postflowContentBridgeInstalled = true;
 
 const USER_ID_ATTR = 'data-postflow-user-id';
@@ -38,6 +39,8 @@ function isExtensionAlive(): boolean {
     return false;
   }
 }
+
+postflowBridgeGlobal.__postflowContentBridgeAlive = isExtensionAlive;
 
 function safeSend(message: object) {
   if (!isExtensionAlive()) return;
@@ -160,6 +163,10 @@ function extractAndStore() {
   }
 }
 
+function currentDashboardUserId(): string | null {
+  return document.getElementById('postflow-user-meta')?.getAttribute(USER_ID_ATTR)?.trim() || null;
+}
+
 // Run on load and observe DOM changes in case Next.js renders after script injection
 extractAndStore();
 consumePendingGroupSync();
@@ -190,6 +197,7 @@ const webAppPresenceInterval = window.setInterval(() => {
     window.clearInterval(webAppPresenceInterval);
     return;
   }
+  if (!currentDashboardUserId()) return;
   chrome.storage.local.set({
     webAppConnected: true,
     webAppLastSeenAt: Date.now(),
@@ -201,9 +209,14 @@ const webAppPresenceInterval = window.setInterval(() => {
 // dashboard reload or the registration retry alarm.
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type !== 'REFRESH_AUTH_CONTEXT') return;
+  const userId = currentDashboardUserId();
+  if (!userId) {
+    sendResponse({ ok: false });
+    return;
+  }
   extractAndStore();
   notifyAuthContextReady();
-  sendResponse({ ok: true });
+  sendResponse({ ok: true, userId });
 });
 
 // Listen for manual sync requests dispatched by the Web App dashboard
@@ -262,5 +275,20 @@ window.addEventListener('postflow:reconnect-approval', (event) => {
       }));
     },
   );
+});
+
+window.addEventListener('postflow:restore-disconnected', (event) => {
+  if (!isExtensionAlive()) return;
+  const detail = (event as CustomEvent).detail as Record<string, unknown> | null;
+  const installationId = typeof detail?.installationId === 'string' ? detail.installationId : '';
+  const approvalToken = typeof detail?.approvalToken === 'string' ? detail.approvalToken : '';
+  const requestId = typeof detail?.requestId === 'string' ? detail.requestId : '';
+  if (!installationId || !approvalToken || !requestId) return;
+  chrome.runtime.sendMessage({ type: 'RESTORE_DISCONNECTED_INSTALLATION', installationId, approvalToken }, (response) => {
+    const error = chrome.runtime.lastError?.message;
+    window.dispatchEvent(new CustomEvent('postflow:restore-disconnected-result', {
+      detail: { requestId, ok: !error && response?.ok === true, error: error || response?.error },
+    }));
+  });
 });
 }

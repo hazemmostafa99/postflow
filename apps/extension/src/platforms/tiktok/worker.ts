@@ -6,6 +6,7 @@ export type TikTokSessionApiFetch = (
 ) => Promise<any>;
 
 let sessionApiFetch: TikTokSessionApiFetch | null = null;
+let sessionRefreshPromise: Promise<boolean> | null = null;
 
 const TIKTOK_CONTENT_SCRIPT_FILES = [
   'platforms/tiktok/identity.js',
@@ -86,22 +87,27 @@ async function reattachTikTokContentScript(tabId: number): Promise<boolean> {
 export async function ensureTikTokComposer(tabId: number): Promise<{
   ok: boolean;
   busy?: boolean;
+  pageError?: boolean;
   lastExecution?: { jobId: string; result: Record<string, unknown>; completedAt: number } | null;
 }> {
   let state = await chrome.tabs.sendMessage(tabId, { type: 'TIKTOK_COMPOSER_PING' }).catch(() => null) as {
     ok?: boolean;
     busy?: boolean;
+    pageError?: boolean;
     lastExecution?: { jobId: string; result: Record<string, unknown>; completedAt: number } | null;
   } | null;
-  if (state?.ok) return { ok: true, busy: state.busy === true, lastExecution: state.lastExecution ?? null };
+  if (state?.ok) return { ok: true, busy: state.busy === true, pageError: state.pageError === true,
+    lastExecution: state.lastExecution ?? null };
   await waitForComplete(tabId, 5_000);
   state = await chrome.tabs.sendMessage(tabId, { type: 'TIKTOK_COMPOSER_PING' }).catch(() => null) as typeof state;
-  if (state?.ok) return { ok: true, busy: state.busy === true, lastExecution: state.lastExecution ?? null };
+  if (state?.ok) return { ok: true, busy: state.busy === true, pageError: state.pageError === true,
+    lastExecution: state.lastExecution ?? null };
   if (!(await reattachTikTokContentScript(tabId))) return { ok: false };
   await waitForComplete(tabId, 3_000);
   state = await chrome.tabs.sendMessage(tabId, { type: 'TIKTOK_COMPOSER_PING' }).catch(() => null) as typeof state;
   return state?.ok
-    ? { ok: true, busy: state.busy === true, lastExecution: state.lastExecution ?? null }
+    ? { ok: true, busy: state.busy === true, pageError: state.pageError === true,
+      lastExecution: state.lastExecution ?? null }
     : { ok: false };
 }
 
@@ -162,13 +168,25 @@ async function hasTikTokSessionCookie(): Promise<boolean> {
   return false;
 }
 
+/** Reuse an in-flight check so a popup retry does not open duplicate probe tabs. */
+export function refreshTikTokSession(): Promise<boolean> {
+  if (sessionRefreshPromise) return sessionRefreshPromise;
+  const work = refreshTikTokSessionInternal().finally(() => {
+    if (sessionRefreshPromise === work) sessionRefreshPromise = null;
+  });
+  sessionRefreshPromise = work;
+  return work;
+}
+
 /** Find (or open) a TikTok tab and bind its signed-in account to this extension. */
-export async function refreshTikTokSession(): Promise<boolean> {
+async function refreshTikTokSessionInternal(): Promise<boolean> {
   if (!sessionApiFetch) {
     console.warn('[PostFlow][TikTok] Session refresh skipped; API bridge is not registered');
     return false;
   }
   console.info('[PostFlow][TikTok] Session refresh started');
+  const refreshStartedAt = Date.now();
+  await chrome.storage.local.set({ tiktokConnectionError: null });
   let bindingFailure: { status?: number; message?: string } | null = null;
   const tabsApi = chrome.tabs as typeof chrome.tabs & { create?: typeof chrome.tabs.create };
   let tabs = await chrome.tabs.query({ url: ['*://tiktok.com/*', '*://*.tiktok.com/*'] });
@@ -229,14 +247,14 @@ export async function refreshTikTokSession(): Promise<boolean> {
       sessionDetected: true,
       externalUsername: username,
     }, 'POST', true);
-    if (!result || result.apiFetchError || result.status === 'ACCOUNT_MISMATCH' || result.status === 'LOGIN_REQUIRED') {
+    if (!result || result.apiFetchError || result.status !== 'CONNECTED') {
       bindingFailure = {
         status: result?.status,
         message: result?.apiFetchError
           ? result.message
           : result
             ? `TikTok connection returned ${result.status ?? 'no status'}`
-            : 'No TikTok connection is bound to this extension installation',
+            : 'TikTok session report returned no connection from the API',
       };
       console.warn('[PostFlow][TikTok] Session identity detected but API binding was rejected', {
         tabId: tab.id,
@@ -254,6 +272,7 @@ export async function refreshTikTokSession(): Promise<boolean> {
       tiktokSessionDetected: true,
       tiktokDetectedUsername: username,
       tiktokConnectionStatus: result.status ?? 'CONNECTED',
+      tiktokConnectionError: null,
       tiktokSessionLastCheckedAt: Date.now(),
     });
     console.info('[PostFlow][TikTok] Startup session connected', {
@@ -267,10 +286,36 @@ export async function refreshTikTokSession(): Promise<boolean> {
     return true;
   }
   if (profileProbeTabId !== undefined) await chrome.tabs.remove(profileProbeTabId).catch(() => undefined);
+  const latest = await chrome.storage.local.get([
+    'tiktokSessionDetected', 'tiktokConnectionStatus', 'tiktokSessionLastCheckedAt',
+  ]);
+  if (latest.tiktokSessionDetected === true && latest.tiktokConnectionStatus === 'CONNECTED' &&
+    typeof latest.tiktokSessionLastCheckedAt === 'number' && latest.tiktokSessionLastCheckedAt >= refreshStartedAt) {
+    return true;
+  }
   if (bindingFailure) {
     console.warn('[PostFlow][TikTok] Startup session check found a signed-in account but could not bind it', bindingFailure);
+    await chrome.storage.local.set({
+      tiktokSessionDetected: false,
+      tiktokConnectionStatus: 'UNAVAILABLE',
+      tiktokConnectionError: bindingFailure.message ?? 'TikTok account could not be connected.',
+      tiktokSessionLastCheckedAt: Date.now(),
+    });
   } else {
     console.info('[PostFlow][TikTok] Startup session check did not find a signed-in account');
+    // A signed-in cookie with an unfinished page shell is inconclusive. Keep
+    // an already verified binding until a new identity or logout is confirmed.
+    if (!(cookieSessionPresent && latest.tiktokSessionDetected === true &&
+      latest.tiktokConnectionStatus === 'CONNECTED')) {
+      await chrome.storage.local.set({
+        tiktokSessionDetected: false,
+        tiktokConnectionStatus: cookieSessionPresent ? 'CHECKING' : 'LOGIN_REQUIRED',
+        tiktokConnectionError: cookieSessionPresent
+          ? 'TikTok is signed in, but the account identity is not visible yet. Open your profile and retry.'
+          : null,
+        tiktokSessionLastCheckedAt: Date.now(),
+      });
+    }
   }
   return false;
 }
@@ -322,12 +367,14 @@ export function registerTikTokSessionWorker(
       sessionDetected: verified,
       ...(username ? { externalUsername: username } : {}),
     }, 'POST', true).then(async (connection) => {
-      const failed = Boolean(connection?.apiFetchError);
+      const failed = !connection || Boolean(connection.apiFetchError) ||
+        (verified && connection.status !== 'CONNECTED');
       console.info('[PostFlow][TikTok] Session report binding response', {
         tabId: sender.tab?.id,
         username: username ?? null,
         status: connection?.status ?? (failed ? connection?.status ?? 0 : 'NO_CONNECTION'),
         failed,
+        ...(failed ? { reason: connection?.message ?? (connection ? `Connection status: ${connection.status}` : 'API returned no connection') } : {}),
       });
       await chrome.storage.local.set({
         tiktokSessionDetected: verified && !failed,
@@ -335,9 +382,11 @@ export function registerTikTokSessionWorker(
         tiktokConnectionStatus: failed
           ? 'UNAVAILABLE'
           : connection?.status ?? (loginRequired ? 'LOGIN_REQUIRED' : 'PENDING'),
+        tiktokConnectionError: failed ? connection?.message ??
+          (connection ? `TikTok connection status: ${connection.status}` : 'TikTok account could not be connected.') : null,
         tiktokSessionLastCheckedAt: Date.now(),
       });
-      sendResponse({ ok: !failed });
+      sendResponse({ ok: !failed, ...(failed ? { reason: connection?.message ?? 'TikTok connection was not bound.' } : {}) });
     }).catch(() => sendResponse({ ok: false }));
     return true;
   });

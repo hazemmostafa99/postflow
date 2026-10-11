@@ -57,11 +57,10 @@ const createNewConnectionButton = document.getElementById("create-new-connection
 const connectionDetailElement = document.getElementById("connection-detail")!;
 const connectionAccountElement = document.getElementById("connection-account")!;
 const connectionUpdatedElement = document.getElementById("connection-updated")!;
-const refreshConnectionButton = document.getElementById("refresh-connection") as HTMLButtonElement;
+const retryDashboardButton = document.getElementById("retry-dashboard") as HTMLButtonElement;
 const connectionProgressElement = document.getElementById("connection-progress")!;
 const setupStepAccount = document.getElementById("setup-step-account")!;
 const setupStepInstallation = document.getElementById("setup-step-installation")!;
-const setupStepFacebook = document.getElementById("setup-step-facebook")!;
 
 let currentExtensionName = "";
 let phoneCollectorState = createEmptyPhoneCollectorState();
@@ -560,7 +559,7 @@ function setIndicator(dotId: string, textId: string, text: string, state: string
 function lifecycleLabel(status: string): { text: string; className: string; showDashboardLink: boolean } {
   switch (status) {
     case 'ACTIVE':
-      return { text: 'Connected and ready', className: 'ready', showDashboardLink: false };
+      return { text: 'Extension ready', className: 'ready', showDashboardLink: false };
     case 'PAUSED':
       return { text: 'Paused from PostFlow dashboard', className: 'paused', showDashboardLink: true };
     case 'REVOKE_PENDING':
@@ -691,8 +690,6 @@ function renderSetupProgress(connectionStage: string, hasUserId: boolean) {
     "waiting-for-dashboard",
     "user-found",
     "connecting",
-    "verifying-facebook",
-    "facebook-required",
     "backend-unavailable",
     "recovery-required",
   ]);
@@ -708,12 +705,10 @@ function renderSetupProgress(connectionStage: string, hasUserId: boolean) {
   setStep(setupStepAccount, hasUserId ? "complete" : "active", "1");
   if (!hasUserId) {
     setStep(setupStepInstallation, "pending", "2");
-    setStep(setupStepFacebook, "pending", "3");
     return;
   }
   const installationReady = ["verifying-facebook", "facebook-required", "recovery-required", "connected"].includes(connectionStage);
   setStep(setupStepInstallation, installationReady ? "complete" : "active", "2");
-  setStep(setupStepFacebook, installationReady ? "active" : "pending", "3");
 }
 
 async function loadConnectionStatus() {
@@ -761,57 +756,45 @@ async function loadConnectionStatus() {
 
   // Determine the primary lifecycle message (administrative lifecycle)
   const lifecycle = lifecycleLabel(lifecycleStatus);
-  // Determine the Facebook health message (separate from administrative lifecycle)
-  const health = facebookHealthLabel(facebookStatus);
-
   const stageLabels: Record<string, { text: string; className: string }> = {
     "waiting-for-dashboard": { text: "Open PostFlow dashboard to connect", className: "attention" },
     "user-found": { text: "PostFlow account found — connecting…", className: "" },
     connecting: { text: "Connecting to PostFlow…", className: "" },
-    "verifying-facebook": { text: "Checking Facebook session…", className: "" },
-    "facebook-required": { text: "Facebook login required", className: "attention" },
+    "verifying-facebook": { text: "Checking platform sessions…", className: "" },
+    "facebook-required": { text: "Extension ready", className: "ready" },
     "backend-unavailable": { text: "API unavailable — retrying…", className: "attention" },
-    connected: { text: "Connected", className: "ready" },
+    connected: { text: "Extension ready", className: "ready" },
   };
   const stageLabel = stageLabels[connectionStage];
   // Primary status describes the actual handshake step, rather than showing
   // ACTIVE while the installation is still unbound or waiting for auth.
-  statusElement.textContent = recoveryRequired
-    ? "Choose a connection to continue"
-    : stageLabel?.text ?? lifecycle.text;
-  statusElement.className = `page-status ${recoveryRequired ? "paused" : stageLabel?.className ?? lifecycle.className}`;
+  const lifecycleNeedsAttention = ["PAUSED", "REVOKE_PENDING", "REVOKED"].includes(lifecycleStatus);
+  statusElement.textContent = lifecycleNeedsAttention
+    ? lifecycle.text
+    : recoveryRequired ? "Choose a connection to continue" : stageLabel?.text ?? lifecycle.text;
+  statusElement.className = `page-status ${lifecycleNeedsAttention
+    ? lifecycle.className : recoveryRequired ? "paused" : stageLabel?.className ?? lifecycle.className}`;
 
   const stageDetails: Record<string, string> = {
     "waiting-for-dashboard": "The extension has not received your PostFlow user ID yet. Keep the signed-in dashboard open and click Connect below.",
     "user-found": "Your PostFlow account was found. Registering this browser installation.",
     connecting: "Authenticating this installation with the PostFlow API.",
-    "verifying-facebook": "Facebook is detected. Matching it to your PostFlow connection.",
-    "facebook-required": "Your PostFlow account is connected. Open Facebook and sign in so we can verify the Facebook identity.",
+    "verifying-facebook": "Checking the accounts signed in to this Chrome profile.",
+    "facebook-required": "Your extension is connected. Connect or retry the platforms you want to use below.",
     "backend-unavailable": "The API cannot be reached. We will retry automatically.",
-    connected: "Ready to claim publishing and maintenance work.",
+    connected: "Connected platforms can claim publishing and maintenance work.",
     "recovery-required": "A previous connection matches this Facebook account. Choose what to restore.",
   };
-  connectionDetailElement.textContent = recoveryRequired
-    ? stageDetails["recovery-required"]
-    : stageDetails[connectionStage] ?? `Lifecycle: ${lifecycle.text}`;
+  connectionDetailElement.textContent = lifecycleNeedsAttention
+    ? lifecycle.text
+    : recoveryRequired ? stageDetails["recovery-required"]
+      : stageDetails[connectionStage] ?? `Lifecycle: ${lifecycle.text}`;
   connectionAccountElement.textContent = detectedFacebookUserId
     ? `Facebook account detected ••••${detectedFacebookUserId.slice(-4)}`
-    : "Facebook account not detected yet";
+    : "Facebook, Instagram and TikTok connect independently.";
   connectionUpdatedElement.textContent = `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
-  refreshConnectionButton.hidden = !["waiting-for-dashboard", "backend-unavailable"].includes(connectionStage);
-  refreshConnectionButton.disabled = false;
-
   recoveryPanel.toggleAttribute("hidden", !recoveryRequired);
   if (recoveryRequired) renderRecoveryCandidates(recoveryCandidates);
-
-  // Show Facebook health separately
-  const healthElement = document.getElementById("facebook-health");
-  if (healthElement) {
-    healthElement.textContent = recoveryRequired
-      ? "Facebook detected — choose Reconnect or Create new connection"
-      : health.text;
-    healthElement.className = `facebook-health ${recoveryRequired ? "attention" : health.className}`;
-  }
 
   // Show/hide dashboard link for paused/revoked states
   const dashboardLinkContainer = document.getElementById("lifecycle-dashboard-link");
@@ -821,11 +804,12 @@ async function loadConnectionStatus() {
 
   const webAppOnline = typeof result.webAppLastSeenAt === "number" &&
     Date.now() - result.webAppLastSeenAt < 90_000;
-  setIndicator("web-app-dot", "web-app-status", webAppOnline ? "Connected" : "Offline", webAppOnline ? "online" : "offline");
+  const dashboardConnected = webAppOnline && typeof result.clerkUserId === "string" && Boolean(result.clerkUserId.trim());
+  setIndicator("web-app-dot", "web-app-status", dashboardConnected ? "Connected" : "Not connected", dashboardConnected ? "online" : "not-synced");
 
   const facebookDetected = identityVerified && facebookStatus === "CONNECTED";
   const facebookStatusText = facebookDetected
-    ? "Session detected"
+    ? "Connected"
     : facebookStatus === "LOGIN_REQUIRED"
       ? "Not detected"
       : facebookStatus === "UNKNOWN"
@@ -837,6 +821,9 @@ async function loadConnectionStatus() {
       ? "offline"
       : "not-synced";
   setIndicator("sync-dot", "sync-status", facebookStatusText, facebookIndicatorState);
+  const facebookRetry = document.getElementById("retry-facebook") as HTMLButtonElement | null;
+  if (facebookRetry) facebookRetry.hidden = facebookDetected ||
+    ["REVOKED", "REVOKE_PENDING"].includes(lifecycleStatus) || !result.clerkUserId;
   const facebookDetailElement = document.getElementById("facebook-detail");
   if (facebookDetailElement) {
     const readableStatus = facebookStatus.replace(/_/g, " ");
@@ -1095,19 +1082,72 @@ loadPhoneCollectorState();
 initInstagramPopup();
 initTikTokPopup();
 
-refreshConnectionButton.addEventListener("click", async () => {
-  refreshConnectionButton.disabled = true;
-  refreshConnectionButton.textContent = "Requesting dashboard identity…";
-  connectionDetailElement.textContent = "Asking the signed-in PostFlow dashboard for your user ID…";
+const platformUrls: Record<string, string> = {
+  FACEBOOK: "https://www.facebook.com/",
+  INSTAGRAM: "https://www.instagram.com/",
+  TIKTOK: "https://www.tiktok.com/",
+};
+document.querySelectorAll<HTMLButtonElement>(".platform-open").forEach((button) => {
+  button.addEventListener("click", () => {
+    const url = platformUrls[button.dataset.platform ?? ""];
+    if (url) void chrome.tabs.create({ url });
+  });
+});
+
+document.querySelectorAll<HTMLButtonElement>(".platform-retry").forEach((button) => {
+  button.addEventListener("click", async () => {
+    const platform = button.dataset.platform;
+    if (!platform || button.disabled) return;
+    const feedback = document.getElementById(`${platform.toLowerCase()}-retry-feedback`);
+    button.disabled = true;
+    button.classList.add("busy");
+    if (feedback) {
+      feedback.textContent = "Checking this platform…";
+      feedback.className = "retry-feedback";
+    }
+    try {
+      const result = await chrome.runtime.sendMessage({ type: "RETRY_PLATFORM_CONNECTION", platform }) as
+        { ok?: boolean; error?: string } | undefined;
+      if (feedback) {
+        feedback.textContent = result?.ok ? "Connected" : result?.error ?? "Could not check this platform. Try again.";
+        feedback.className = `retry-feedback ${result?.ok ? "success" : "error"}`;
+      }
+      await loadConnectionStatus();
+    } catch {
+      if (feedback) {
+        feedback.textContent = "Could not contact the extension worker. Reload the extension and retry.";
+        feedback.className = "retry-feedback error";
+      }
+    } finally {
+      button.disabled = false;
+      button.classList.remove("busy");
+    }
+  });
+});
+
+retryDashboardButton.addEventListener("click", async () => {
+  const feedback = document.getElementById("dashboard-retry-feedback");
+  retryDashboardButton.disabled = true;
+  retryDashboardButton.classList.add("busy");
+  if (feedback) {
+    feedback.textContent = "Checking dashboard…";
+    feedback.className = "retry-feedback";
+  }
   try {
     const result = await chrome.runtime.sendMessage({ type: "REFRESH_AUTH_CONTEXT" });
-    if (!result?.ok) {
-      connectionDetailElement.textContent = result?.error ?? "Open the signed-in PostFlow dashboard, then try again.";
+    if (feedback) {
+      feedback.textContent = result?.ok ? "Dashboard connected" :
+        result?.error ?? "Open the signed-in dashboard, then retry.";
+      feedback.className = `retry-feedback ${result?.ok ? "success" : "error"}`;
     }
   } catch {
-    connectionDetailElement.textContent = "Could not contact the extension worker. Reload the extension and try again.";
+    if (feedback) {
+      feedback.textContent = "Could not contact the extension worker.";
+      feedback.className = "retry-feedback error";
+    }
   } finally {
-    refreshConnectionButton.textContent = "Connect to PostFlow dashboard";
+    retryDashboardButton.disabled = false;
+    retryDashboardButton.classList.remove("busy");
     await loadConnectionStatus();
   }
 });

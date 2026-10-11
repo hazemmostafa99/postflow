@@ -48,6 +48,10 @@ export class FacebookConnection {
   @Prop()
   archiveReason?: string;
 
+  /** Removed from Connections without entering the archive; jobs retain this ID. */
+  @Prop({ index: true })
+  removedAt?: Date;
+
   /**
    * One-time reconnect approval issued by an authenticated dashboard action.
    * Only a hash of the approval token is stored; the plaintext is returned

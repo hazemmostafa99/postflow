@@ -316,7 +316,7 @@ describe('neutral browser connection actions', () => {
     await expect(service.browserConnectionAction('clerk-user-1', String(installation!._id), 'force-disconnect'))
       .resolves.toEqual({ status: 'REVOKED', archivedAt: null });
     expect(extensionModel.findOneAndUpdate).toHaveBeenCalledWith(
-      { _id: installation!._id, clerkUserId: 'clerk-user-1', status: 'ACTIVE', archivedAt: null },
+      { _id: installation!._id, clerkUserId: 'clerk-user-1', status: 'ACTIVE', removedAt: null },
       expect.objectContaining({ $set: expect.objectContaining({ status: 'REVOKED', credentialRevokedAt: expect.any(Date) }), $inc: { credentialVersion: 1 } }),
       { returnDocument: 'after' },
     );
@@ -324,19 +324,19 @@ describe('neutral browser connection actions', () => {
     expect(connectionModel.updateOne).not.toHaveBeenCalled();
     await expect(service.verifyWorkerIdentity('clerk-user-1', 'extension-1', credential)).rejects.toThrow('has been revoked');
   });
-  it('archives and revokes the installation while retaining platform bindings and jobs', async () => {
+  it('removes and revokes the installation without archiving it or deleting jobs', async () => {
     const { service, installation, extensionModel, connectionModel, auditModel } = createHarness({ connection: null });
     const result = await service.browserConnectionAction('clerk-user-1', String(installation!._id), 'remove');
-    expect(result).toEqual({ status: 'REVOKED', archivedAt: expect.any(Date) });
-    expect(installation!.archiveReason).toBe('REMOVED');
-    expect(installation!.archivedByClerkUserId).toBe('clerk-user-1');
+    expect(result).toEqual({ status: 'REVOKED', removed: true });
+    expect(installation!.removedAt).toBeInstanceOf(Date);
+    expect(installation!.archivedAt).toBeUndefined();
     expect(auditModel.create).toHaveBeenCalledTimes(2);
     expect(extensionModel.deleteOne).not.toHaveBeenCalled();
     expect(connectionModel.deleteOne).not.toHaveBeenCalled();
     expect(connectionModel.updateOne).not.toHaveBeenCalled();
     await expect(service.browserConnectionAction('clerk-user-1', String(installation!._id), 'resume')).rejects.toThrow('disconnecting or disconnected');
   });
-  it('can force a pending graceful disconnect and then archive once without reissuing credentials', async () => {
+  it('can force a pending graceful disconnect and then remove once without reissuing credentials', async () => {
     const installation = installationDoc({ status: ExtensionLifecycleStatus.REVOKE_PENDING });
     const { service, extensionModel, auditModel } = createHarness({ installation });
     const id = String((installation as Record<string, unknown>)._id);
@@ -347,7 +347,7 @@ describe('neutral browser connection actions', () => {
     expect(extensionModel.findOneAndUpdate).toHaveBeenCalledTimes(2);
     expect(auditModel.create).toHaveBeenCalledTimes(2);
   });
-  it('cannot force or archive another owner installation', async () => {
+  it('cannot force or remove another owner installation', async () => {
     const { service, extensionModel } = createHarness({ installation: null });
     const id = String(new Types.ObjectId());
     for (const action of ['force-disconnect', 'remove']) {
@@ -361,14 +361,17 @@ describe('neutral browser connection actions', () => {
     await expect(service.browserConnectionAction('clerk-user-1', String(installation!._id), 'remove')).rejects.toThrow('Connection changed');
     expect(auditModel.create).not.toHaveBeenCalled();
   });
-  it('does not revoke or archive a Facebook account rebound to another installation', async () => {
+  it('does not remove a Facebook account rebound to another installation', async () => {
     const facebookId = new Types.ObjectId();
     const connection = connectionDoc({ _id: facebookId, activeExtensionInstallationId: new Types.ObjectId() });
     const installation = installationDoc({ facebookConnectionId: facebookId });
     const { service, connectionModel } = createHarness({ connection, installation });
     await service.browserConnectionAction('clerk-user-1', String((installation as Record<string, unknown>)._id), 'remove');
     expect(connectionModel.findOne).not.toHaveBeenCalled();
-    expect(connectionModel.updateOne).not.toHaveBeenCalled();
+    expect(connectionModel.updateOne).toHaveBeenCalledWith(
+      expect.objectContaining({ $or: expect.arrayContaining([{ activeExtensionInstallationId: installation._id }] }) ),
+      expect.objectContaining({ $set: expect.objectContaining({ removedAt: expect.any(Date) }) }),
+    );
     expect((connection as Record<string, unknown>).archivedAt).toBeUndefined();
   });
 });
@@ -1989,7 +1992,7 @@ describe('ExtensionsService dashboard lifecycle', () => {
     expect(state.lifecycle).toBe(ExtensionLifecycleStatus.REVOKED);
   });
 
-  it('remove archives the connection and revokes the installation without deleting', async () => {
+  it('remove hides the connection and revokes the installation without deleting job history', async () => {
     const installation = installationDoc({
       credentialHash,
       status: ExtensionLifecycleStatus.ACTIVE,
@@ -2009,7 +2012,8 @@ describe('ExtensionsService dashboard lifecycle', () => {
     );
 
     expect(state.lifecycle).toBe(ExtensionLifecycleStatus.REVOKED);
-    expect(state.archivedAt).toBeInstanceOf(Date);
+    expect(connection.removedAt).toBeInstanceOf(Date);
+    expect(state.archivedAt).toBeNull();
     expect((installation as { status: ExtensionLifecycleStatus }).status).toBe(
       ExtensionLifecycleStatus.REVOKED,
     );

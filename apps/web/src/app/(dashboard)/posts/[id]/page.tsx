@@ -9,6 +9,7 @@ import { PostScheduleEditor } from "@/components/post-schedule-editor";
 import { PostControlButtons } from "@/components/post-control-buttons";
 import { TikTokReconciliationControls } from "@/components/tiktok-reconciliation-controls";
 import { RetryPublishingButton } from "@/components/retry-publishing-button";
+import { ForceRetryPublishingButton } from "@/components/force-retry-publishing-button";
 
 const API_BASE = process.env.API_URL || "http://localhost:8000";
 
@@ -443,6 +444,9 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                   {job.platform === "TIKTOK" && (job.submissionStatus === "UNKNOWN" || job.submissionStatus === "PROCESSING") && (
                     <TikTokReconciliationControls jobId={job._id} status={job.submissionStatus} postUrl={job.postUrl} reason={job.submissionReason} />
                   )}
+                  {job.platform === "TIKTOK" && job.submissionStatus === "UNKNOWN" && !job.postUrl && (
+                    <ForceRetryPublishingButton jobId={job._id} />
+                  )}
                   {job.status === "FAILED" && <RetryPublishingButton jobId={job._id} />}
 
                   <div className="mt-4 grid gap-3 text-xs sm:grid-cols-3">
@@ -456,8 +460,6 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                         <div className="mt-1 space-y-1 text-foreground">
                           <p>{job.engagement.reactionCount ?? "-"} {getReactionLabel(job)}</p>
                           <p>{job.engagement.commentCount ?? "-"} comments</p>
-                          {isTikTokJob(job) && job.engagement.favoriteCount !== undefined && <p>{job.engagement.favoriteCount} favorites</p>}
-                          {isTikTokJob(job) && job.engagement.shareCount !== undefined && <p>{job.engagement.shareCount} shares</p>}
                           <p className="text-muted-foreground">Updated {timeAgo(job.engagement.lastSyncedAt)}</p>
                         </div>
                       ) : (
@@ -549,6 +551,9 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                         {job.platform === "TIKTOK" && (job.submissionStatus === "UNKNOWN" || job.submissionStatus === "PROCESSING") && (
                           <TikTokReconciliationControls jobId={job._id} status={job.submissionStatus} postUrl={job.postUrl} reason={job.submissionReason} />
                         )}
+                        {job.platform === "TIKTOK" && job.submissionStatus === "UNKNOWN" && !job.postUrl && (
+                          <ForceRetryPublishingButton jobId={job._id} />
+                        )}
                         {job.status === "FAILED" && <RetryPublishingButton jobId={job._id} />}
                         {job.submissionStatus === "PUBLISHED" && job.postUrl && isAnalyticsJob(job) && (
                           <RefreshPostEngagementButton postId={job._id} />
@@ -579,8 +584,6 @@ export default async function PostDetailsPage({ params }: { params: Promise<{ id
                           <div className="flex gap-3 text-foreground">
                             <span>{job.engagement.reactionCount ?? "-"} {getReactionLabel(job)}</span>
                             <span>{job.engagement.commentCount ?? "-"} comments</span>
-                            {isTikTokJob(job) && job.engagement.favoriteCount !== undefined && <span>{job.engagement.favoriteCount} favorites</span>}
-                            {isTikTokJob(job) && job.engagement.shareCount !== undefined && <span>{job.engagement.shareCount} shares</span>}
                           </div>
                           <div className="text-muted-foreground">
                             Updated {timeAgo(job.engagement.lastSyncedAt)}

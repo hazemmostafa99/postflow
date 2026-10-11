@@ -295,6 +295,7 @@ export class JobsController {
     workType: MaintenanceClaimType,
     resultStatus: string,
     extensionInstanceId?: string,
+    receivedEngagement?: Pick<PostEngagementSyncResult, 'reactionCount' | 'commentCount' | 'favoriteCount' | 'shareCount'>,
   ) {
     const retryAt =
       workType === MaintenanceClaimType.PENDING_APPROVAL
@@ -303,9 +304,19 @@ export class JobsController {
     this.logMaintenanceEvent('maintenance.result.accepted', {
       jobId: String(job._id ?? 'unknown'),
       workType,
-      connectionId: String(job.facebookConnectionId),
+      connectionId: String(job.platformConnectionId ?? job.facebookConnectionId),
       extensionInstanceId: maskExtensionInstanceId(extensionInstanceId),
       resultStatus,
+      ...(workType === MaintenanceClaimType.ENGAGEMENT ? {
+        receivedReactionCount: receivedEngagement?.reactionCount,
+        receivedCommentCount: receivedEngagement?.commentCount,
+        receivedFavoriteCount: receivedEngagement?.favoriteCount,
+        receivedShareCount: receivedEngagement?.shareCount,
+        storedReactionCount: job.engagement?.reactionCount,
+        storedCommentCount: job.engagement?.commentCount,
+        storedFavoriteCount: job.engagement?.favoriteCount,
+        storedShareCount: job.engagement?.shareCount,
+      } : {}),
       retryAt: retryAt?.toISOString(),
     });
   }
@@ -887,16 +898,18 @@ export class JobsController {
     );
     this.extensionsService.assertInstallationActive(installation);
 
-    // Find all platform connections owned by this installation
+    // Find all platform connections owned by this installation. A PUBLISHING
+    // worker flag is only a valid queue lock while its job lease is active;
+    // interrupted extension flows can otherwise leave the connection hidden
+    // forever even though the queued job is still PENDING.
     const platformConnections = await this.platformConnectionModel
       .find({
         clerkUserId,
         activeExtensionInstallationId: installation._id,
         archivedAt: { $exists: false },
         status: PlatformConnectionStatus.CONNECTED,
-        workerStatus: { $ne: PlatformConnectionWorkerStatus.PUBLISHING },
       })
-      .select('_id platform legacyFacebookConnectionId')
+      .select('_id platform legacyFacebookConnectionId workerStatus')
       .lean()
       .exec();
 
@@ -910,7 +923,45 @@ export class JobsController {
       credential,
     );
 
-    if (platformConnections.length === 0) {
+    const now = new Date();
+    const publishingConnectionIds = platformConnections
+      .filter((pc) => pc.workerStatus === PlatformConnectionWorkerStatus.PUBLISHING)
+      .map((pc) => pc._id as Types.ObjectId);
+    const activePublishingConnectionIds = publishingConnectionIds.length > 0
+      ? await this.jobModel.distinct('platformConnectionId', {
+        platformConnectionId: { $in: publishingConnectionIds },
+        status: PublishingJobStatus.RUNNING,
+        claimExpiresAt: { $gt: now },
+      })
+      : [];
+    const activePublishingConnectionIdSet = new Set(
+      activePublishingConnectionIds.map((id: Types.ObjectId) => String(id)),
+    );
+    const stalePublishingConnections = platformConnections.filter((pc) =>
+      pc.workerStatus === PlatformConnectionWorkerStatus.PUBLISHING &&
+      !activePublishingConnectionIdSet.has(String(pc._id)),
+    );
+    if (stalePublishingConnections.length > 0) {
+      const staleIds = stalePublishingConnections.map((pc) => pc._id as Types.ObjectId);
+      await this.platformConnectionModel.updateMany(
+        {
+          _id: { $in: staleIds },
+          activeExtensionInstallationId: installation._id,
+          status: PlatformConnectionStatus.CONNECTED,
+          workerStatus: PlatformConnectionWorkerStatus.PUBLISHING,
+        },
+        { $set: { workerStatus: PlatformConnectionWorkerStatus.IDLE, lastSeenAt: now } },
+      ).exec();
+      this.logger.warn('[Publishing] cleared stale PUBLISHING worker status', {
+        platformConnectionIds: staleIds.map(String),
+        reason: 'NO_ACTIVE_JOB_LEASE',
+      });
+    }
+    const claimablePlatformConnections = platformConnections.filter((pc) =>
+      !activePublishingConnectionIdSet.has(String(pc._id)),
+    );
+
+    if (claimablePlatformConnections.length === 0) {
       if (!legacyFacebookConnection) return null;
 
       // Legacy path for backward compatibility
@@ -924,7 +975,7 @@ export class JobsController {
 
     // Build platform connection IDs by platform
     const platformConnectionIdsByPlatform = new Map<string, Types.ObjectId[]>();
-    for (const pc of platformConnections) {
+    for (const pc of claimablePlatformConnections) {
       const arr = platformConnectionIdsByPlatform.get(pc.platform) || [];
       arr.push(pc._id as Types.ObjectId);
       platformConnectionIdsByPlatform.set(pc.platform, arr);
@@ -940,13 +991,12 @@ export class JobsController {
 
     if (postIds.length === 0) return null;
 
-    const now = new Date();
     const leaseExpiresAt = new Date(now.getTime() + JobsController.JOB_CLAIM_LEASE_MS);
     const mediaGrant = createJobMediaAccessGrant(leaseExpiresAt);
 
     // Build query for platform-aware jobs
-    const platformConnectionIds = platformConnections.map((pc) => pc._id);
-    const legacyFacebookConnectionIds = platformConnections
+    const platformConnectionIds = claimablePlatformConnections.map((pc) => pc._id);
+    const legacyFacebookConnectionIds = claimablePlatformConnections
       .filter((pc) => pc.platform === PublishingPlatform.FACEBOOK)
       .map((pc) => pc.legacyFacebookConnectionId)
       .filter((id): id is Types.ObjectId => !!id);
@@ -1620,6 +1670,124 @@ export class JobsController {
     };
   }
 
+  /**
+   * POST /api/jobs/:id/force-retry - owner-confirmed retry for a TikTok
+   * submission whose acceptance result is unknown and which cannot be found
+   * in TikTok Studio Content. This intentionally bypasses the normal
+   * submission checkpoint only after an explicit owner confirmation.
+   */
+  @Post(':id/force-retry')
+  @HttpCode(HttpStatus.OK)
+  async forceRetryTikTokJob(
+    @Headers('x-clerk-user-id') clerkUserId: string,
+    @Param('id') id: string,
+    @Body() body: { confirmNoPost?: boolean },
+  ) {
+    if (!clerkUserId) {
+      throw new UnauthorizedException('x-clerk-user-id header is required');
+    }
+    if (body?.confirmNoPost !== true) {
+      throw new BadRequestException('Confirm that no TikTok post appears in TikTok Studio Content before retrying');
+    }
+
+    const job = await this.jobModel.findById(id).populate('postId').exec();
+    if (!job) throw new NotFoundException('Job not found');
+    const post = job.postId as unknown as PostDocument;
+    if (post.clerkUserId !== clerkUserId) {
+      throw new UnauthorizedException('Not your job');
+    }
+
+    const tiktokJob = job.platform === PublishingPlatform.TIKTOK ||
+      job.targetType === PublishingTargetType.TIKTOK_VIDEO ||
+      job.targetType === PublishingTargetType.TIKTOK_PHOTO;
+    if (!tiktokJob) {
+      throw new BadRequestException('Force retry is only available for TikTok jobs');
+    }
+    if (job.submissionStatus !== FacebookSubmissionStatus.UNKNOWN) {
+      throw new BadRequestException('Only TikTok jobs with an unknown submission can be force-retried');
+    }
+    if (!job.submittedAt) {
+      throw new ConflictException('This job has no submission checkpoint to force-retry');
+    }
+    if (job.postUrl || job.externalPublishId || job.externalPostId) {
+      throw new ConflictException('A TikTok post identity is already recorded; reconcile it instead of retrying');
+    }
+    if (job.status === PublishingJobStatus.RUNNING || job.status === PublishingJobStatus.PENDING) {
+      throw new ConflictException('This TikTok job is already queued or running');
+    }
+    if (!isTikTokPublishingEnabled()) {
+      throw new ForbiddenException('TikTok publishing is disabled for new work');
+    }
+
+    if (job.platformConnectionId && this.platformConnectionModel) {
+      const connection = await this.platformConnectionModel.findOne({
+        _id: job.platformConnectionId,
+        clerkUserId,
+        platform: PublishingPlatform.TIKTOK,
+        archivedAt: { $exists: false },
+      }).exec();
+      const identityVerified = Boolean(connection?.externalUsername && connection.detectedExternalUsername &&
+        connection.externalUsername.toLowerCase() === connection.detectedExternalUsername.toLowerCase());
+      if (!connection || connection.status !== PlatformConnectionStatus.CONNECTED ||
+        !connection.sessionDetected || !identityVerified) {
+        throw new BadRequestException('Reconnect and verify the TikTok account before retrying');
+      }
+    }
+
+    const requestedAt = new Date();
+    const retried = await this.jobModel.findOneAndUpdate(
+      {
+        _id: id,
+        $or: [
+          { platform: PublishingPlatform.TIKTOK },
+          { targetType: { $in: [PublishingTargetType.TIKTOK_VIDEO, PublishingTargetType.TIKTOK_PHOTO] } },
+        ],
+        status: { $in: [PublishingJobStatus.SUCCESS, PublishingJobStatus.FAILED] },
+        submissionStatus: FacebookSubmissionStatus.UNKNOWN,
+        submittedAt: { $exists: true },
+        postUrl: { $exists: false },
+        externalPublishId: { $exists: false },
+        externalPostId: { $exists: false },
+      },
+      {
+        $set: { status: PublishingJobStatus.PENDING, manualRetryRequestedAt: requestedAt },
+        $unset: {
+          error: 1,
+          submissionReason: 1,
+          startedAt: 1,
+          completedAt: 1,
+          scheduledFor: 1,
+          claimedByExtensionInstanceId: 1,
+          claimExpiresAt: 1,
+          mediaAccessTokenHash: 1,
+          mediaAccessExpiresAt: 1,
+          submittedAt: 1,
+          postUrl: 1,
+          externalPublishId: 1,
+          externalPostId: 1,
+          submissionStatus: 1,
+        },
+      },
+      { new: true },
+    ).exec();
+    if (!retried) {
+      throw new ConflictException('The TikTok job changed before it could be force-retried; inspect TikTok Studio Content again');
+    }
+
+    await this.updateParentPostStatus(post);
+    this.logger.warn('[Publishing] Owner-confirmed TikTok force retry queued', {
+      jobId: String(retried._id),
+      clerkUserId,
+    });
+    return {
+      id: retried._id.toString(),
+      status: retried.status,
+      attempts: retried.attempts,
+      queuedAt: requestedAt.toISOString(),
+      warning: 'Owner confirmed no TikTok post was visible; a delayed platform submission could still cause a duplicate.',
+    };
+  }
+
   @Post(':id/maintenance-request')
   @HttpCode(HttpStatus.ACCEPTED)
   async requestMaintenance(
@@ -1895,16 +2063,6 @@ export class JobsController {
     if (!['SUCCESS', 'PARTIAL', 'CHECK_FAILED'].includes(body.status)) {
       throw new BadRequestException('Invalid engagement sync result');
     }
-    const counts = [
-      body.reactionCount,
-      body.commentCount,
-      body.favoriteCount,
-      body.shareCount,
-    ];
-    if (counts.some((count) => count !== undefined && (!Number.isSafeInteger(count) || count < 0))) {
-      throw new BadRequestException('Engagement counters must be non-negative integers');
-    }
-
     const job = await this.jobModel.findById(id).populate('postId').exec();
     if (!job) throw new NotFoundException('Job not found');
     const post = job.postId as unknown as PostDocument;
@@ -1925,6 +2083,14 @@ export class JobsController {
       throw new BadRequestException('Job is not a published post');
     }
 
+    const isTikTokJob = job.platform === PublishingPlatform.TIKTOK;
+    const counts = isTikTokJob
+      ? [body.reactionCount, body.commentCount]
+      : [body.reactionCount, body.commentCount, body.favoriteCount, body.shareCount];
+    if (counts.some((count) => count !== undefined && (!Number.isSafeInteger(count) || count < 0))) {
+      throw new BadRequestException('Engagement counters must be non-negative integers');
+    }
+
     const syncedAt = new Date();
     job.engagementSyncAttempts = (job.engagementSyncAttempts ?? 0) + 1;
     job.lastEngagementSyncAt = syncedAt;
@@ -1935,6 +2101,21 @@ export class JobsController {
       syncedAt,
       body.status === 'CHECK_FAILED',
     );
+    // TikTok analytics only tracks likes and comments. Strip legacy values
+    // from earlier builds whenever this job is synced, including failed reads.
+    if (isTikTokJob && job.engagement &&
+      (job.engagement.favoriteCount !== undefined || job.engagement.shareCount !== undefined)) {
+      const previous = job.engagement;
+      if (previous.reactionCount !== undefined || previous.commentCount !== undefined) {
+        job.engagement = {
+          ...(previous.reactionCount !== undefined ? { reactionCount: previous.reactionCount } : {}),
+          ...(previous.commentCount !== undefined ? { commentCount: previous.commentCount } : {}),
+          lastSyncedAt: previous.lastSyncedAt,
+        };
+      } else {
+        job.engagement = undefined;
+      }
+    }
     if (body.status === 'CHECK_FAILED') {
       job.lastEngagementSyncError =
         body.reason?.slice(0, 500) || 'Engagement check failed';
@@ -1943,12 +2124,14 @@ export class JobsController {
         (job.engagement as
           | Partial<NonNullable<PublishingJobDocument['engagement']>>
           | undefined) ?? {};
-      if (
-        body.reactionCount !== undefined ||
-        body.commentCount !== undefined ||
-        body.favoriteCount !== undefined ||
-        body.shareCount !== undefined
-      ) {
+      const shouldStoreCounters = isTikTokJob
+        ? body.reactionCount !== undefined || body.commentCount !== undefined ||
+          previous.reactionCount !== undefined || previous.commentCount !== undefined
+        : body.reactionCount !== undefined || body.commentCount !== undefined ||
+          body.favoriteCount !== undefined || body.shareCount !== undefined ||
+          previous.reactionCount !== undefined || previous.commentCount !== undefined ||
+          previous.favoriteCount !== undefined || previous.shareCount !== undefined;
+      if (shouldStoreCounters) {
         job.engagement = {
           ...(previous.reactionCount !== undefined ||
           body.reactionCount !== undefined
@@ -1958,11 +2141,11 @@ export class JobsController {
           body.commentCount !== undefined
             ? { commentCount: body.commentCount ?? previous.commentCount }
             : {}),
-          ...(previous.favoriteCount !== undefined ||
-          body.favoriteCount !== undefined
+          ...(!isTikTokJob && (previous.favoriteCount !== undefined ||
+          body.favoriteCount !== undefined)
             ? { favoriteCount: body.favoriteCount ?? previous.favoriteCount }
             : {}),
-          ...(previous.shareCount !== undefined || body.shareCount !== undefined
+          ...(!isTikTokJob && (previous.shareCount !== undefined || body.shareCount !== undefined)
             ? { shareCount: body.shareCount ?? previous.shareCount }
             : {}),
           lastSyncedAt: syncedAt,
@@ -1981,6 +2164,9 @@ export class JobsController {
       MaintenanceClaimType.ENGAGEMENT,
       body.status,
       extensionInstanceId,
+      isTikTokJob
+        ? { reactionCount: body.reactionCount, commentCount: body.commentCount }
+        : body,
     );
     return job;
   }

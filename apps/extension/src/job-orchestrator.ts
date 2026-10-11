@@ -322,9 +322,30 @@ async function openPlatformTab(
     return null;
   }
 
-  // Find existing tab or create new one
+  // Find an existing tab or create a new one. TikTok Studio is a separate
+  // SPA surface from normal profile/post pages; reusing a `/@user/video/...`
+  // tab and replacing its URL can leave Studio in its own error shell after
+  // the upload editor starts. Reuse only an already-open Studio tab there.
   const tabs = await chrome.tabs.query({ url: allowedHostnames.map((h) => `*://${h}/*`) });
-  let tab = tabs.find((t) => t.id !== undefined);
+  const isTikTok = allowedHostnames.includes('www.tiktok.com');
+  const isTikTokStudioTab = (value?: string): boolean => {
+    if (!value) return false;
+    try {
+      const parsed = new URL(value);
+      return parsed.protocol === 'https:' && parsed.hostname === 'www.tiktok.com' &&
+        /^\/tiktokstudio\//.test(parsed.pathname);
+    } catch {
+      return false;
+    }
+  };
+  let tab = tabs.find((candidate) => candidate.id !== undefined &&
+    (!isTikTok || isTikTokStudioTab(candidate.url)));
+
+  if (isTikTok && !tab && tabs.some((candidate) => candidate.id !== undefined)) {
+    console.info('[PostFlow][TikTok] Existing TikTok tabs are not Studio tabs; opening a dedicated Studio tab', {
+      existingTabs: tabs.map((candidate) => ({ tabId: candidate.id, url: candidate.url ?? null })),
+    });
+  }
   
   if (tab?.id) {
     // Reuse existing tab

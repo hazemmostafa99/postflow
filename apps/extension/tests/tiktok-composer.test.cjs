@@ -12,17 +12,24 @@ function harness(options = {}) {
       <button>${options.draftDiscardText || 'Discard'}</button><button>Continue</button></div>` : ''}
     <form><input type="file" accept="${options.photo ? 'image/jpg,image/jpeg,image/png,image/webp' : 'video/mp4'}" ${options.photo ? 'multiple' : ''}><div role="status">${options.preparation || 'Uploaded'}</div>
     ${options.photo ? '<div>2 photos uploaded</div>' : ''}
-    <div contenteditable="true" aria-label="Caption">old caption</div>
+    <div contenteditable="true" aria-label="Caption" class="${options.photo ? 'public-DraftEditor-content' : ''}">${options.photo ? (options.photoCaption || '') : 'old caption'}</div>
     <button data-e2e="post_video_button" ${options.disabled || options.delayedPost ? 'disabled' : ''}>Post</button>${options.extraButton ? '<button>Post</button>' : ''}</form>
     ${options.oldUrl ? `<div data-e2e="post-success"><a href="${options.oldUrl}">Old post</a></div>` : ''}`;
   const { document, window } = parseHTML(`<html><body>${html}</body></html>`);
   const pageLocation = new URL('https://www.tiktok.com/tiktokstudio/upload');
   let now = Date.now(), clicks = 0, postNowClicks = 0, discardClicks = 0, confirmationClicks = 0;
-  let arms = 0, checks = 0, fetches = 0, postWaits = 0;
+  let arms = 0, checks = 0, fetches = 0, postWaits = 0, captionCommands = 0, syntheticCaptionEvents = 0, browserCaptionInputs = 0;
   let selected;
   const field = document.querySelector('[contenteditable]');
-  document.createRange = () => ({ selectNodeContents(node) { selected = node; } });
-  document.execCommand = (_command, _ui, text) => { if (options.captionFailure) return false; selected.textContent = text; return true; };
+  document.createRange = () => ({ selectNodeContents(node) { selected = node; }, collapse() {} });
+  document.execCommand = (_command, _ui, text) => {
+    if (options.captionFailure) return false;
+    captionCommands++;
+    selected.textContent = options.photo ? selected.textContent + text : text;
+    return true;
+  };
+  field.addEventListener('beforeinput', () => { syntheticCaptionEvents++; });
+  field.addEventListener('input', () => { syntheticCaptionEvents++; });
   const draft = document.querySelector('[data-e2e="local_draft_container"]');
   draft?.querySelector('button')?.addEventListener('click', () => {
     discardClicks++;
@@ -94,6 +101,11 @@ function harness(options = {}) {
     DataTransfer: class { constructor() { this.files = []; this.items = { add: (file) => this.files.push(file) }; } },
     chrome: { runtime: { async sendMessage(message) {
       if (message.type === 'TIKTOK_CHECK_JOB') { checks++; return { ok: !options.canceled, canceled: options.canceled }; }
+      if (message.type === 'TIKTOK_INSERT_CAPTION') {
+        browserCaptionInputs++;
+        field.textContent = message.text;
+        return { ok: true };
+      }
       if (message.type === 'TIKTOK_ARM_SUBMISSION') { arms++; if (options.lostArm) throw new Error('Channel lost'); return { ok: !options.deniedArm }; }
       if (message.type === 'TIKTOK_CONFIRM_SUBMISSION') {
         if (options.replacePostAfterConfirm) {
@@ -116,7 +128,8 @@ function harness(options = {}) {
       ? [{ contentType: 'image/png' }, { contentType: 'image/jpeg' }]
       : [{ contentType: 'video/mp4' }] } };
   return { run: () => context.PostFlowTikTokComposer.execute(command),
-    counts: () => ({ clicks, postNowClicks, discardClicks, confirmationClicks, arms, checks, fetches }), field, document };
+    counts: () => ({ clicks, postNowClicks, discardClicks, confirmationClicks, arms, checks, fetches,
+      captionCommands, syntheticCaptionEvents, browserCaptionInputs }), field, document };
 }
 
 test('attaches one file, replaces caption, and clicks Post once after checkpoint', async () => {
@@ -130,12 +143,16 @@ test('attaches one file, replaces caption, and clicks Post once after checkpoint
   assert.equal(h.field.textContent, 'caption #tag');
 });
 
-test('attaches multiple photos in one change and publishes through the shared editor', async () => {
+test('attaches photos and sends the Draft.js caption through browser-level input', async () => {
   const h = harness({ photo: true, outcome: 'published' });
   const result = await h.run();
   assert.equal(result.status, 'PUBLISHED', result.reason);
   assert.equal(h.counts().fetches, 2);
   assert.equal(h.counts().clicks, 1);
+  assert.equal(h.field.textContent, 'caption #tag');
+  assert.equal(h.counts().captionCommands, 0);
+  assert.equal(h.counts().syntheticCaptionEvents, 0);
+  assert.equal(h.counts().browserCaptionInputs, 1);
 });
 
 test('waits for the photo editor Post control to become enabled', async () => {

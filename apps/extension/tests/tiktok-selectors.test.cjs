@@ -45,6 +45,7 @@ test('recognizes TikTok Studio upload markup without a form wrapper', () => {
     localDraftConfirmationPresent: false,
     copyrightContinuationPresent: false,
     contentRowCount: 0,
+    pageErrorPresent: false,
   });
 });
 
@@ -64,6 +65,7 @@ test('reports an unscoped file input instead of claiming readiness', () => {
     localDraftConfirmationPresent: false,
     copyrightContinuationPresent: false,
     contentRowCount: 0,
+    pageErrorPresent: false,
   });
 });
 
@@ -83,6 +85,19 @@ test('recognizes the Photos tab multiple-image input and completed photo editor'
   const editor = selectors.editorRoot();
   assert.equal(selectors.preparationComplete(editor, 'TIKTOK_PHOTO'), true);
   assert.equal(selectors.diagnostics('TIKTOK_PHOTO').imageInputCount, 1);
+});
+
+test('detects TikTok Studio full-page upload errors instead of treating the URL as ready', () => {
+  const selectors = loadSelectors(`
+    <main>
+      <div>Something went wrong</div>
+      <div>Please try again.</div>
+      <button>Retry</button>
+    </main>
+  `);
+  assert.equal(selectors.pageError(), true);
+  assert.equal(selectors.interruption(), 'TIKTOK_PAGE_ERROR');
+  assert.equal(selectors.diagnostics().pageErrorPresent, true);
 });
 
 test('reports an unsaved local draft instead of silently waiting', () => {

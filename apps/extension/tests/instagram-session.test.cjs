@@ -101,6 +101,20 @@ test('an unbound loading session is not logged as an API failure', async () => {
   assert.equal(await manager.verifyTab(1, 'doc-1', 'account.a'), false);
 });
 
+test('session persistence errors include the API status and response message', async () => {
+  const h = harness(); h.tab(1);
+  const { InstagramSessionManager } = h.load(resolve(__dirname, '../src/platforms/instagram/session-manager.ts'));
+  const manager = new InstagramSessionManager(async () => ({
+    apiFetchError: true,
+    status: 403,
+    message: 'Installation credential has been revoked',
+  }));
+  await assert.rejects(
+    () => manager.observe(1, 'doc-1'),
+    /could not be persisted \(HTTP 403: Installation credential has been revoked\)/,
+  );
+});
+
 test('publishing refresh revalidates the current Instagram document for the bound account', async () => {
   const h = harness(); h.tab(1);
   await h.manager.observe(1, 'doc-1');

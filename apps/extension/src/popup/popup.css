@@ -367,7 +367,7 @@ h2 {
 
 .setup-steps {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 5px;
   margin: 7px 0 9px;
 }
@@ -1288,4 +1288,337 @@ h2 {
 
 .sync-dialog-actions .primary-button {
   white-space: nowrap;
+}
+
+/* The connection overview treats Facebook, Instagram, and TikTok equally. */
+.service-status {
+  margin-top: 12px;
+}
+
+.web-status-card {
+  min-height: 42px;
+  background: #f8fafc;
+}
+
+.platforms-panel {
+  margin-top: 14px;
+}
+
+.platforms-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.platforms-heading .eyebrow {
+  margin: 0 0 3px;
+}
+
+.platforms-heading h2 {
+  margin: 0;
+  color: #172033;
+  font-size: 15px;
+}
+
+.platforms-heading > span {
+  max-width: 155px;
+  color: #64748b;
+  font-size: 10px;
+  line-height: 1.3;
+  text-align: right;
+}
+
+.platforms-panel .status-grid {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.platforms-panel .status-card {
+  align-items: flex-start;
+  min-height: 64px;
+  padding: 10px 11px;
+}
+
+.platforms-panel .status-dot {
+  margin-top: 7px;
+}
+
+.status-copy {
+  flex: 1;
+  min-width: 0;
+}
+
+.status-copy strong,
+.status-copy small {
+  display: block;
+}
+
+.status-copy strong {
+  margin-top: 2px;
+}
+
+.status-copy small {
+  overflow-wrap: anywhere;
+  margin-top: 3px;
+  color: #64748b;
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.platform-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  margin-top: 5px;
+}
+
+.platform-open,
+.platform-retry {
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 5px 9px;
+  border: 1px solid #bfdbfe;
+  border-radius: 7px;
+  color: #1d4ed8;
+  background: #eff6ff;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.platform-open {
+  border-color: #dbe3ef;
+  color: #475569;
+  background: #fff;
+}
+
+.platform-open:hover {
+  border-color: #94a3b8;
+  background: #f8fafc;
+}
+
+.platform-retry:hover {
+  border-color: #60a5fa;
+  background: #dbeafe;
+}
+
+.platform-retry:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.platform-retry[hidden] {
+  display: none;
+}
+
+.status-copy .retry-feedback:empty {
+  display: none;
+}
+
+.status-copy .retry-feedback.error {
+  color: #b91c1c;
+}
+
+.status-copy .retry-feedback.success {
+  color: #15803d;
+}
+
+.quick-actions {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.groups-panel {
+  margin-top: 12px;
+}
+
+.groups-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+  color: #334155;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.groups-toggle:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 3px;
+}
+
+.groups-content {
+  margin-top: 10px;
+}
+
+.groups-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.groups-actions .secondary-button {
+  min-height: 36px;
+  padding: 7px;
+  font-size: 11px;
+}
+
+.connections-overview {
+  margin-top: 11px;
+}
+
+.connections-overview > .eyebrow {
+  margin: 0 0 7px;
+  font-size: 9px;
+}
+
+.connection-card-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.connection-card {
+  min-width: 0;
+  min-height: 76px;
+  padding: 8px;
+  border: 1px solid #e5e7eb;
+  border-radius: 9px;
+  background: #fff;
+}
+
+.card-heading {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.card-heading .status-dot {
+  width: 6px;
+  height: 6px;
+  box-shadow: none;
+}
+
+.card-heading p {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  margin: 0;
+  color: #64748b;
+  font-size: 9px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 3px;
+}
+
+.icon-action {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  min-height: 22px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid #dbe3ef;
+  border-radius: 6px;
+  color: #475569;
+  background: #fff;
+  cursor: pointer;
+}
+
+.icon-action.platform-open,
+.icon-action.platform-retry {
+  min-height: 22px;
+  flex: 0 0 auto;
+}
+
+.icon-action:hover {
+  border-color: #93c5fd;
+  color: #1d4ed8;
+  background: #eff6ff;
+}
+
+.icon-action:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
+
+.icon-action.retry-action {
+  color: #1d4ed8;
+  background: #eff6ff;
+}
+
+.icon-action svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.icon-action[hidden] {
+  display: none;
+}
+
+.icon-action:disabled {
+  cursor: wait;
+  opacity: .6;
+}
+
+.icon-action.busy svg {
+  animation: retry-spin 1s linear infinite;
+}
+
+@keyframes retry-spin {
+  to { transform: rotate(360deg); }
+}
+
+.connection-card > strong {
+  display: block;
+  margin-top: 8px;
+  color: #172033;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.connection-card > small {
+  display: block;
+  overflow-wrap: anywhere;
+  margin-top: 3px;
+  color: #64748b;
+  font-size: 9px;
+  line-height: 1.3;
+}
+
+.connection-card > .retry-feedback:empty {
+  display: none;
+}
+
+.connection-card > .retry-feedback.error {
+  color: #b91c1c;
+}
+
+.connection-card > .retry-feedback.success {
+  color: #15803d;
+}
+
+.view-tab {
+  font-size: 12px;
+}
+
+.identity-copy h2 {
+  font-size: 12px;
 }

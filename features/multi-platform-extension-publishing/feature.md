@@ -942,6 +942,14 @@ Instagram  Connected as ... / Login required / Wrong account
 TikTok     Connected as ... / Login required / Wrong account
 ```
 
+The overview shows extension registration separately from account health.
+Dashboard tab, Facebook, Instagram, and TikTok appear together in a compact
+two-column grid with icon Open and Retry controls. Facebook is optional for
+installations that use only Instagram or TikTok. A platform's Retry reruns only
+that platform's session check and reports the binding error in its card. The
+Dashboard tab Retry requests fresh dashboard identity. Facebook group tools
+remain available in an optional section below the grid.
+
 Actions may include:
 
 - Open platform
@@ -1395,7 +1403,7 @@ collection, registry, or automatic initialization/migration on page load. Store 
 shared display name there, with a read fallback to the existing Facebook label;
 preserve legacy Facebook names for recovery compatibility. Group platform records
 only by explicit installation binding, never by matching names or usernames.
-Retain the original Connections UI: Active/Archived tabs, summary metrics,
+Retain the original Connections UI: Active/Disconnected tabs, summary metrics,
 search/filter, expandable rows, diagnostics, and action dialogs. Show Facebook,
 Instagram, and TikTok inside each connection's expanded details, including
 not-detected slots; do not replace this screen with a separate card dashboard.
@@ -1404,21 +1412,27 @@ Active lists only current non-archived, non-revoked installations; disconnected
 historical or unbound legacy records must not inflate its counts. Current paused,
 offline, or gracefully disconnecting connections remain visible for management.
 Connections without Facebook must support naming, pause/resume, graceful and
-forced disconnect, and Remove/Archive. Force disconnect immediately revokes the
-installation credential across platforms; Remove also archives the installation
-without deleting/rebinding accounts or jobs. These actions must be owner-scoped,
-race-guarded and audited, independent of a Facebook record. Archived installation
-records appear in Archived, not Active. Do not imply generic account recovery is
-implemented: retain existing explicit Facebook recovery; generic reinstall
-recovery remains gated until a verified account/credential handshake exists.
+forced disconnect, and Remove. Force disconnect immediately revokes the
+installation credential across platforms. Remove revokes it and takes the
+connection out of both Active and Disconnected immediately. Keep a hidden revoked
+instance record so the same installed extension cannot register again, and keep
+jobs and audit history. A verified platform session on a new installation may
+reattach its removed platform account record. These actions must be owner-scoped,
+race-guarded and audited, independent of a Facebook record. Existing historical
+archives remain visible in Disconnected; explicit Facebook recovery remains available.
+Force-disconnected installations can be restored from Disconnected in their
+original Chrome Profile. The dashboard issues a short-lived, single-use approval;
+the matching extension redeems it for a new credential, resumes its worker
+alarms, and rechecks its platform sessions. Removed installations remain hidden
+and cannot be restored by this flow.
 Lifecycle controls apply to the whole installation; account health remains
 independent. Keep credentials private and dashboard mutations owner-scoped.
 Do not retarget jobs, rebind accounts, migrate data destructively, enable TikTok
 publishing, or change session verification merely to group the UI. Preserve the
 legacy Facebook record IDs and recovery behavior as compatibility data, not a
 second visible product connection. Keep Facebook recovery inside the relevant
-connection card, with disconnected cards accessible; generic multi-platform
-reinstall recovery is deferred until implemented and validated. Stale heartbeat
+connection card, with disconnected cards accessible; multi-platform recovery
+after reinstall remains deferred. Stale heartbeat
 names must not undo a dashboard rename. New platforms must use the explicit
 installation binding and the same reusable grouping/identity helpers.
 

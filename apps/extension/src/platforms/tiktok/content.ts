@@ -13,8 +13,6 @@ type TikTokEngagementApi = {
     status: 'SUCCESS' | 'PARTIAL' | 'CHECK_FAILED';
     reactionCount?: number;
     commentCount?: number;
-    favoriteCount?: number;
-    shareCount?: number;
     reason?: string;
   }>;
 };
@@ -78,15 +76,26 @@ try {
     try {
       if (message?.type === 'TIKTOK_COMPOSER_READY') {
         const targetType = message.targetType === 'TIKTOK_PHOTO' ? 'TIKTOK_PHOTO' : 'TIKTOK_VIDEO';
+        const pageError = tiktokSelectors.pageError();
+        if (pageError) {
+          const diagnostics = tiktokComposer.diagnostics(targetType);
+          console.warn('[PostFlow][TikTok] Composer readiness probe found TikTok error page', {
+            diagnostics,
+            url: location.href,
+          });
+          sendResponse({ ready: false, listenerReady: true, pageError: true, diagnostics });
+          return;
+        }
         void tiktokComposer.prepare(targetType).then((ready) => {
           const diagnostics = tiktokComposer.diagnostics(targetType);
           console.info('[PostFlow][TikTok] Composer readiness probe', { ready, ...diagnostics, url: location.href });
-          sendResponse({ ready, diagnostics });
-        }).catch(() => sendResponse({ ready: false, diagnostics: tiktokComposer.diagnostics(targetType) }));
+          sendResponse({ ready, listenerReady: true, pageError: false, diagnostics });
+        }).catch(() => sendResponse({ ready: false, listenerReady: true,
+          pageError: tiktokSelectors.pageError(), diagnostics: tiktokComposer.diagnostics(targetType) }));
         return true;
       }
       if (message?.type === 'TIKTOK_COMPOSER_PING') {
-        sendResponse({ ok: true, busy: tiktokComposer.isBusy(), lastExecution });
+        sendResponse({ ok: true, busy: tiktokComposer.isBusy(), lastExecution, pageError: tiktokSelectors.pageError() });
         return;
       }
       if (message?.type === 'CHECK_TIKTOK_POST_ENGAGEMENT') {
@@ -97,7 +106,13 @@ try {
         console.info('[PostFlow][TikTok] Engagement check received', { postUrl: message.postUrl });
         void tiktokEngagement.check(message.postUrl)
           .then((result) => {
-            console.info('[PostFlow][TikTok] Engagement check completed', { status: result.status });
+            console.info('[PostFlow][TikTok] Engagement check completed', {
+              postUrl: message.postUrl,
+              status: result.status,
+              reactionCount: result.reactionCount,
+              commentCount: result.commentCount,
+              reason: result.reason,
+            });
             sendResponse({ ok: true, result });
           })
           .catch((error) => {

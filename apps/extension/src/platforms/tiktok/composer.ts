@@ -5,6 +5,10 @@ type TikTokComposerCommand = {
   apiBaseUrl: string;
   /** Continue an upload that already reached TikTok's editor after a page/context reload. */
   resume?: boolean;
+  /** Temporary diagnostic stop used to inspect Studio immediately after media ingestion. */
+  pauseAfterUpload?: boolean;
+  /** Temporary diagnostic stop used after caption injection/verification. */
+  pauseAfterCaption?: boolean;
   post: { content?: string; media?: PostFlowJobMediaReference[] };
 };
 type TikTokComposerResult = { success: boolean; status: 'PUBLISHED' | 'PROCESSING' | 'UNKNOWN' | 'FAILED';
@@ -26,7 +30,13 @@ const tiktokComposer = (() => {
     // Content-script console output is only visible from the TikTok tab's
     // DevTools. Relay sanitized stage metadata to the background console too.
     try {
-      void chrome.runtime.sendMessage({ type: 'TIKTOK_COMPOSER_STAGE', jobId: command.jobId, stage, details })
+      void chrome.runtime.sendMessage({
+        type: 'TIKTOK_COMPOSER_STAGE',
+        jobId: command.jobId,
+        username: command.expectedUsername,
+        stage,
+        details,
+      })
         .catch(() => undefined);
     } catch {
       // The page may be unloading; the background execution watchdog remains
@@ -109,21 +119,85 @@ const tiktokComposer = (() => {
     }
     throw new Error('LOCAL_DRAFT_DISCARD_TIMEOUT');
   }
-  function writeCaption(field: HTMLElement, text: string): void {
+  async function writeCaption(field: HTMLElement, text: string,
+    command: TikTokComposerCommand): Promise<void> {
     field.focus();
-    if (field instanceof HTMLTextAreaElement) {
-      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
-      setter?.call(field, text);
-      field.dispatchEvent(new Event('input', { bubbles: true }));
-    } else {
+    const readValue = () => field instanceof HTMLTextAreaElement ? field.value : field.textContent;
+    const expected = text.replace(/\r\n/g, '\n');
+    const selectAll = () => {
       const range = document.createRange();
       range.selectNodeContents(field);
       window.getSelection()?.removeAllRanges();
       window.getSelection()?.addRange(range);
+    };
+    const waitForStableValue = async (timeoutMs: number, value = expected): Promise<boolean> => {
+      const deadline = Date.now() + timeoutMs;
+      let stableSamples = 0;
+      while (Date.now() < deadline) {
+        if (selectors.pageError()) throw new Error('TIKTOK_PAGE_ERROR');
+        if (readValue()?.replace(/\r\n/g, '\n') === value) {
+          stableSamples++;
+          if (stableSamples >= 2) return true;
+        } else {
+          stableSamples = 0;
+        }
+        await sleep(20);
+      }
+      return false;
+    };
+    if (field instanceof HTMLTextAreaElement) {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+      setter?.call(field, text);
+      field.dispatchEvent(new Event('input', { bubbles: true }));
+    } else if (command.targetType === 'TIKTOK_PHOTO') {
+      // Use Chrome's tab-scoped input protocol for TikTok's Draft.js photo
+      // editor. Synthetic DOM edits cause TikTok Studio to replace the page
+      // with its error shell, while browser-level input matches real typing.
+      if (readValue() === expected) return;
+      if (readValue()?.trim()) throw new Error('CAPTION_FIELD_NOT_EMPTY');
+      const range = document.createRange();
+      range.selectNodeContents(field);
+      range.collapse(true);
+      window.getSelection()?.removeAllRanges();
+      window.getSelection()?.addRange(range);
+      await sleep(100);
+      logStage('browser-caption-input-started', command, { length: expected.length });
+      const input = await chrome.runtime.sendMessage({
+        type: 'TIKTOK_INSERT_CAPTION',
+        jobId: command.jobId,
+        username: command.expectedUsername,
+        text,
+      });
+      if (!input?.ok) throw new Error(input?.reason || 'BROWSER_CAPTION_INPUT_FAILED');
+      logStage('browser-caption-input-completed', command, { length: expected.length });
+    } else {
+      // Draft.js handles beforeinput as its closest equivalent to real typing.
+      // Try that first; it avoids mutating the editor DOM behind React's back.
+      // Older/fixture contexts may not expose InputEvent, so retain the
+      // execCommand path as a compatibility fallback.
+      selectAll();
+      if (typeof InputEvent === 'function') {
+        field.dispatchEvent(new InputEvent('beforeinput', {
+          bubbles: true,
+          cancelable: true,
+          inputType: 'insertText',
+          data: text,
+        }));
+        field.dispatchEvent(new InputEvent('input', {
+          bubbles: true,
+          inputType: 'insertText',
+          data: text,
+        }));
+        if (await waitForStableValue(250)) return;
+      }
+
+      selectAll();
       if (!document.execCommand('insertText', false, text)) throw new Error('CAPTION_INSERT_FAILED');
+      field.dispatchEvent(typeof InputEvent === 'function'
+        ? new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text })
+        : new Event('input', { bubbles: true }));
     }
-    const actual = field instanceof HTMLTextAreaElement ? field.value : field.textContent;
-    if (actual?.replace(/\r\n/g, '\n') !== text.replace(/\r\n/g, '\n')) throw new Error('CAPTION_VERIFICATION_FAILED');
+    if (!await waitForStableValue(3_000)) throw new Error('CAPTION_VERIFICATION_FAILED');
   }
   async function attach(scope: HTMLElement, command: TikTokComposerCommand): Promise<void> {
     const media = command.post.media;
@@ -136,7 +210,7 @@ const tiktokComposer = (() => {
     const files = await Promise.all(media.map((item) => runtime.fetchJobMediaFile(item, command.apiBaseUrl)));
     logStage('media-fetched', command, { count: files.length });
     await guard(command);
-    const input = scope.querySelector<HTMLInputElement>('input[type="file"]');
+    const input = selectors.mediaInput(scope, command.targetType);
     if (!input) throw new Error('UPLOAD_INPUT_UNAVAILABLE');
     const transfer = new DataTransfer();
     for (const file of files) transfer.items.add(file);
@@ -151,6 +225,7 @@ const tiktokComposer = (() => {
     let stableReadySamples = 0;
     logStage('preparation-wait-started', command);
     while (Date.now() < deadline) {
+      if (selectors.pageError()) throw new Error('TIKTOK_PAGE_ERROR');
       await guard(command);
       const liveScope = selectors.editorRoot() ?? (scope.isConnected ? scope : null);
       if (!liveScope) {
@@ -166,7 +241,7 @@ const tiktokComposer = (() => {
         logStage('editor-scope-reacquired', command, { diagnostics: selectors.diagnostics() });
       }
       scope = liveScope;
-      if (selectors.preparationComplete(scope, command.targetType)) {
+      if (selectors.preparationComplete(scope, command.targetType, command.post.media?.length ?? 0)) {
         stableReadySamples++;
         if (stableReadySamples >= 2) {
           logStage('preparation-complete', command, { diagnostics: selectors.diagnostics(command.targetType) });
@@ -186,6 +261,7 @@ const tiktokComposer = (() => {
     const deadline = Date.now() + 30_000;
     let waitingLogged = false;
     while (Date.now() < deadline) {
+      if (selectors.pageError()) throw new Error('TIKTOK_PAGE_ERROR');
       await guard(command);
       scope = selectors.editorRoot() ?? (scope.isConnected ? scope : null) ?? scope;
       const button = selectors.postButton(scope);
@@ -209,6 +285,12 @@ const tiktokComposer = (() => {
     const deadline = Date.now() + 10_000;
     let changedLogged = false;
     while (Date.now() < deadline) {
+      // The confirmation checkpoint is the last asynchronous boundary before
+      // Post. If TikTok has not replaced the verified control, click it on the
+      // first pass instead of spending another DOM scan on a fragile SPA.
+      if (previousButton.isConnected && selectors.enabled(previousButton)) {
+        return { scope, button: previousButton };
+      }
       scope = selectors.editorRoot() ?? (scope.isConnected ? scope : null) ?? scope;
       const button = selectors.postButton(scope);
       if (button && selectors.enabled(button)) {
@@ -276,7 +358,7 @@ const tiktokComposer = (() => {
     let armed = false;
     try {
       logStage('started', command, { path: location.pathname });
-      if (!/^\/(?:tiktokstudio\/upload|creator-center\/upload|upload)\/?$/.test(location.pathname)) throw new Error('UNSUPPORTED_UPLOAD_PAGE');
+      if (!/^\/(?:tiktokstudio\/upload(?:\/post\/(?:photo|video))?|creator-center\/upload|upload)\/?$/.test(location.pathname)) throw new Error('UNSUPPORTED_UPLOAD_PAGE');
       if (!command.resume) {
         await clearLocalDraft(command);
         await guard(command);
@@ -293,10 +375,36 @@ const tiktokComposer = (() => {
       }));
       if (!command.resume) await attach(scope, command);
       scope = await waitPreparation(scope, command);
+      if (command.pauseAfterUpload) {
+        logStage('debug-paused-after-upload', command, {
+          diagnostics: selectors.diagnostics(command.targetType),
+        });
+        return {
+          success: false,
+          status: 'FAILED',
+          reason: 'DEBUG_PAUSED_AFTER_UPLOAD',
+          diagnostics: selectors.diagnostics(command.targetType),
+        };
+      }
       const field = selectors.caption(scope);
       if (!field) throw new Error('CAPTION_FIELD_UNAVAILABLE');
-      writeCaption(field, command.post.content ?? '');
-      logStage('caption-verified', command);
+      logStage('caption-entry-started', command, {
+        length: (command.post.content ?? '').length,
+        editor: command.targetType === 'TIKTOK_PHOTO' ? 'draft-js' : field.tagName.toLowerCase(),
+      });
+      await writeCaption(field, command.post.content ?? '', command);
+      logStage('caption-verified', command, { length: (command.post.content ?? '').length });
+      if (command.pauseAfterCaption && command.targetType === 'TIKTOK_PHOTO') {
+        logStage('debug-paused-after-caption', command, {
+          diagnostics: selectors.diagnostics(command.targetType),
+        });
+        return {
+          success: false,
+          status: 'FAILED',
+          reason: 'DEBUG_PAUSED_AFTER_CAPTION',
+          diagnostics: selectors.diagnostics(command.targetType),
+        };
+      }
       const postControl = await waitPostControl(scope, command);
       scope = postControl.scope;
       const button = postControl.button;
@@ -307,9 +415,15 @@ const tiktokComposer = (() => {
       const permission = await chrome.runtime.sendMessage({ type: 'TIKTOK_ARM_SUBMISSION', jobId: command.jobId, username: command.expectedUsername });
       if (!permission?.ok) return unknown('Submission permission was not confirmed; inspect the job before any retry', command.targetType);
       logStage('submission-armed', command);
+      logStage('submission-confirmation-waiting', command);
       const confirmed = await chrome.runtime.sendMessage({ type: 'TIKTOK_CONFIRM_SUBMISSION', jobId: command.jobId, username: command.expectedUsername });
       if (!confirmed?.ok) return unknown('Job stopped after submission was armed; confirm the upload manually', command.targetType);
-      assertIdentity(command.expectedUsername);
+      logStage('submission-confirmed', command);
+      // Identity and cancellation were already checked by guard() and the
+      // installation-bound API checkpoint. Avoid another DOM-wide identity
+      // scan here: TikTok can tear down the Studio editor immediately after
+      // confirmation, and that scan would prevent the already-verified Post
+      // control from being clicked.
       const finalControl = await reacquirePostControlAfterArm(scope, command, button);
       if (!finalControl) return unknown('Post control changed after submission was armed', command.targetType);
       scope = finalControl.scope;

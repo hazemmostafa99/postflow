@@ -13,6 +13,6 @@ export function isTikTokUploadUrl(value: string): boolean {
   try {
     const url = new URL(value);
     return url.protocol === 'https:' && url.hostname === 'www.tiktok.com' && !url.username && !url.password &&
-      /^\/(?:tiktokstudio\/upload|creator-center\/upload|upload)\/?$/.test(url.pathname);
+      /^\/(?:tiktokstudio\/upload(?:\/post\/(?:photo|video))?|creator-center\/upload|upload)\/?$/.test(url.pathname);
   } catch { return false; }
 }

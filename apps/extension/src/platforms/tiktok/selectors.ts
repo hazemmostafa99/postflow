@@ -13,19 +13,33 @@ const tiktokSelectors = (() => {
         ? /image|\.jpe?g|\.png|\.webp/i.test(input.getAttribute('accept') ?? '') && input.hasAttribute('multiple')
         : /video|\.mp4|\.mov/i.test(input.getAttribute('accept') ?? ''));
   }
+  function mediaInput(scope: HTMLElement, targetType: TikTokTargetType): HTMLInputElement | null {
+    const matches = mediaInputs(targetType).filter((input) => scope.contains(input));
+    return matches.length === 1 ? matches[0] : null;
+  }
   function root(targetType: TikTokTargetType = 'TIKTOK_VIDEO'): HTMLElement | null {
     const inputs = mediaInputs(targetType);
     if (inputs.length !== 1) return null;
-    return inputs[0].closest<HTMLElement>(
+    const scoped = inputs[0].closest<HTMLElement>(
       '[role="tabpanel"], form, [data-e2e="upload-container"], [data-e2e="upload-form"], [aria-live="polite"]',
     );
+    if (scoped) return scoped;
+    // Arabic TikTok Studio photo pages place the multi-file input beside the
+    // photo grid inside the page container, without a form or tabpanel.
+    if (targetType === 'TIKTOK_PHOTO') {
+      const editor = editorRoot();
+      if (editor?.contains(inputs[0]) && editor.querySelector('[class*="photoGrid"]')) return editor;
+    }
+    return null;
   }
   function uploadTab(targetType: TikTokTargetType): HTMLElement | null {
-    const label = targetType === 'TIKTOK_PHOTO' ? 'Photos' : 'Videos';
+    const label = targetType === 'TIKTOK_PHOTO'
+      ? /^(?:photos?|الصور|صور)$/i
+      : /^(?:videos?|الفيديو|فيديو|الفيديوهات|مقاطع الفيديو)$/i;
     const controls = targetType === 'TIKTOK_PHOTO' ? 'panel-photo' : 'panel-video';
     const matches = Array.from(document.querySelectorAll<HTMLElement>('[role="tab"], button')).filter((node) =>
       visible(node) && (node.getAttribute('aria-controls') === controls ||
-        new RegExp(`^${label}$`, 'i').test((node.textContent ?? '').trim())));
+        label.test((node.textContent ?? '').replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '').trim())));
     return matches.length === 1 ? matches[0] : null;
   }
   function editorRoot(): HTMLElement | null {
@@ -43,7 +57,7 @@ const tiktokSelectors = (() => {
   }
   function localDraftDiscardButton(scope: HTMLElement): HTMLElement | null {
     const matches = Array.from(scope.querySelectorAll<HTMLElement>('button, [role="button"]')).filter((node) =>
-      visible(node) && /^(discard)$/i.test((node.getAttribute('aria-label') ?? node.textContent ?? '').trim()));
+      visible(node) && /^(discard|ignore|تجاهل)$/i.test((node.getAttribute('aria-label') ?? node.textContent ?? '').trim()));
     return matches.length === 1 ? matches[0] : null;
   }
   function localDraftDiscardDialog(): HTMLElement | null {
@@ -51,13 +65,13 @@ const tiktokSelectors = (() => {
       if (!visible(node)) return false;
       const title = node.getAttribute('title') ??
         node.querySelector<HTMLElement>('.common-modal-header, [id$="_title"]')?.textContent ?? '';
-      return /^discard this post\?$/i.test(title.trim());
+      return /^(?:discard this post\?|هل تريد تجاهل هذا المنشور؟)$/i.test(title.trim());
     });
     return matches.length === 1 ? matches[0] : null;
   }
   function localDraftConfirmButton(scope: HTMLElement): HTMLElement | null {
     const matches = Array.from(scope.querySelectorAll<HTMLElement>('button')).filter((node) =>
-      visible(node) && /^(discard)$/i.test((node.getAttribute('aria-label') ?? node.textContent ?? '').trim()));
+      visible(node) && /^(discard|ignore|remove|تجاهل|إزالة)$/i.test((node.getAttribute('aria-label') ?? node.textContent ?? '').trim()));
     return matches.length === 1 ? matches[0] : null;
   }
   function copyrightContinuationDialog(): HTMLElement | null {
@@ -66,19 +80,31 @@ const tiktokSelectors = (() => {
       const title = node.getAttribute('title') ??
         node.querySelector<HTMLElement>('.common-modal-header, [id$="_title"]')?.textContent ?? '';
       const content = node.textContent ?? '';
-      return /^continue to post\?$/i.test(title.trim()) &&
-        /copyright check is incomplete/i.test(content) && /posting your video now will stop the check/i.test(content);
+      return /^(?:continue to post\?|هل تريد المتابعة للنشر؟)$/i.test(title.trim()) &&
+        /(?:copyright check is incomplete|ما زلنا نفحص الفيديو)/i.test(content) &&
+        /(?:posting your video now will stop the check|مواصلة النشر قبل اكتمال الفحص)/i.test(content);
     });
     return matches.length === 1 ? matches[0] : null;
   }
   function copyrightPostNowButton(scope: HTMLElement): HTMLElement | null {
     const matches = Array.from(scope.querySelectorAll<HTMLElement>('button')).filter((node) =>
-      visible(node) && /^(post now)$/i.test((node.getAttribute('aria-label') ?? node.textContent ?? '').trim()));
+      visible(node) && /^(?:post now|النشر الآن)$/i.test((node.getAttribute('aria-label') ?? node.textContent ?? '').trim()));
     return matches.length === 1 ? matches[0] : null;
   }
   function contentRows(): HTMLElement[] {
     return Array.from(document.querySelectorAll<HTMLElement>('[data-tt="components_PostTable_Absolute"]'))
       .filter((row) => visible(row) && Boolean(row.querySelector('[data-tt="components_PostInfoCell_Container"]')));
+  }
+  /**
+   * TikTok sometimes replaces the upload composer with a full-page error
+   * shell.  The URL remains `/tiktokstudio/upload`, so URL-only readiness
+   * checks incorrectly treat that shell as a live editor.
+   */
+  function pageError(): boolean {
+    const bodyText = document.body?.textContent ?? '';
+    if (!/something went wrong/i.test(bodyText) || !/please try again/i.test(bodyText)) return false;
+    return Array.from(document.querySelectorAll<HTMLElement>('button, [role="button"]'))
+      .some((node) => visible(node) && /^retry$/i.test((node.textContent ?? '').trim()));
   }
   function diagnostics(targetType: TikTokTargetType = 'TIKTOK_VIDEO') {
     const inputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]'));
@@ -99,6 +125,7 @@ const tiktokSelectors = (() => {
       localDraftConfirmationPresent: Boolean(localDraftDiscardDialog()),
       copyrightContinuationPresent: Boolean(copyrightContinuationDialog()),
       contentRowCount: contentRows().length,
+      pageErrorPresent: pageError(),
     };
   }
   function postButtons(scope: HTMLElement): HTMLElement[] {
@@ -119,6 +146,7 @@ const tiktokSelectors = (() => {
   }
   function interruption(ignoreLocalDraft = false): string | null {
     if (/^\/(login|signup)(\/|$)/.test(location.pathname)) return 'LOGIN_REQUIRED';
+    if (pageError()) return 'TIKTOK_PAGE_ERROR';
     if (!ignoreLocalDraft && Array.from(document.querySelectorAll('[data-e2e="local_draft_container"]')).some(visible)) {
       return 'LOCAL_DRAFT_PRESENT';
     }
@@ -127,24 +155,40 @@ const tiktokSelectors = (() => {
     return alerts.some((node) => /captcha|verify your identity|security check|تحقق من هويتك|التحقق الأمني/i.test(node.textContent ?? ''))
       ? 'MANUAL_INTERVENTION_REQUIRED' : null;
   }
-  function preparationComplete(scope: HTMLElement, targetType: TikTokTargetType = 'TIKTOK_VIDEO'): boolean {
+  function preparationComplete(
+    scope: HTMLElement,
+    targetType: TikTokTargetType = 'TIKTOK_VIDEO',
+    expectedMediaCount = 0,
+  ): boolean {
     if (scope.querySelector('[aria-busy="true"], progress:not([value="100"])')) return false;
+    const completedUploadText = (value: string) => {
+      const normalized = value.normalize('NFKC')
+        .replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return /(?:uploaded|upload complete|ready to post|تم\s+التحميل|اكتمل\s+التحميل|تم\s+رفع(?:\s+الفيديو)?|اكتمل\s+الرفع)/i.test(normalized);
+    };
     const uploadCard = scope.querySelector('[data-e2e="upload_status_container"]');
-    if (uploadCard && /uploaded|upload complete|ready to post/i.test(uploadCard.textContent ?? '')) return true;
+    if (uploadCard?.querySelector('.info-status.success')) return true;
+    if (uploadCard && completedUploadText(uploadCard.textContent ?? '')) return true;
     const successfulStatuses = Array.from(scope.querySelectorAll('.info-status.success')).filter(visible);
-    if (successfulStatuses.some((node) => /uploaded|upload complete|ready to post/i.test(node.textContent ?? ''))) return true;
+    if (successfulStatuses.some((node) => completedUploadText(node.textContent ?? '') ||
+      Boolean(node.querySelector('[data-icon="CheckCircleFill"], [data-testid="CheckCircleFill"]')))) return true;
     if (targetType === 'TIKTOK_PHOTO' && postButton(scope)) {
+      const photoGrid = scope.querySelector<HTMLElement>('[class*="photoGrid"]');
+      const photoTileCount = photoGrid?.querySelectorAll('[aria-roledescription="draggable"] img').length ?? 0;
+      if (expectedMediaCount > 0 && photoTileCount === expectedMediaCount) return true;
       // TikTok often renders the count directly next to the Post label, so
       // avoid requiring a word boundary after "uploaded".
       const uploaded = Number((scope.textContent ?? '').match(/(\d+)\s+photos?\s+uploaded/i)?.[1] ?? 0);
-      const selected = mediaInputs(targetType).reduce((count, input) => count + (input.files?.length ?? 0), 0);
+      const selected = mediaInput(scope, targetType)?.files?.length ?? 0;
       // TikTok may clear the file input after ingesting the files. When it
       // keeps the FileList, require the editor's uploaded count to catch up
       // before allowing the caption/Post phase to begin.
       if (uploaded > 0 && (selected === 0 || uploaded >= selected)) return true;
     }
     const statuses = Array.from(scope.querySelectorAll('[data-e2e="upload-status"], [role="status"]')).filter(visible);
-    return statuses.some((node) => /^(uploaded|upload complete|ready to post|تم التحميل|اكتمل التحميل)$/i.test(node.textContent?.trim() ?? ''));
+    return statuses.some((node) => completedUploadText(node.textContent ?? ''));
   }
   function contentPageOutcome(expected: string, expectedCaption: string, submissionStartedAt: number) {
     if (!/^\/tiktokstudio\/content\/?$/.test(location.pathname)) return null;
@@ -195,8 +239,8 @@ const tiktokSelectors = (() => {
     }
     return null;
   }
-  return { root, uploadTab, editorRoot, localDraft, localDraftDiscardButton, localDraftDiscardDialog,
+  return { root, mediaInput, uploadTab, editorRoot, localDraft, localDraftDiscardButton, localDraftDiscardDialog,
     localDraftConfirmButton, copyrightContinuationDialog, copyrightPostNowButton, diagnostics,
-    postButton, caption, interruption, preparationComplete, contentPageOutcome, outcome, enabled };
+    postButton, caption, interruption, pageError, preparationComplete, contentPageOutcome, outcome, enabled };
 })();
 (globalThis as typeof globalThis & { PostFlowTikTokSelectors?: typeof tiktokSelectors }).PostFlowTikTokSelectors = tiktokSelectors;

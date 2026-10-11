@@ -14,6 +14,7 @@ export interface ExtensionConnection {
   _id: string;
   displayName: string;
   status: string;
+  revocationReason?: string | null;
   lastHeartbeat?: string;
   extensionInstanceIdMasked?: string;
   legacyFacebookConnectionId?: string | null;
@@ -49,6 +50,7 @@ export function connectionRows(
       platformAccounts: extension.accounts,
       displayName: extension.displayName,
       lifecycle: extension.status,
+      revocationReason: extension.revocationReason ?? null,
       installationStatus: extension.status,
       lastHeartbeat: extension.lastHeartbeat,
       extensionInstanceIdMasked: extension.extensionInstanceIdMasked,

@@ -176,8 +176,8 @@ test('confirm specs explain job and queue effects', () => {
   assert.ok(force.effects.some((effect) => effect.includes('credential is invalidated')));
 
   const remove = getConfirmSpec('remove');
-  assert.ok(remove.effects.some((effect) => effect.includes('kept')));
-  assert.ok(remove.effects.some((effect) => effect.includes('restore')));
+  assert.ok(remove.effects.some((effect) => effect.includes('Post and audit history remain')));
+  assert.ok(remove.effects.some((effect) => effect.includes('Active and Disconnected')));
 
   const pause = getConfirmSpec('pause');
   assert.ok(pause.effects.some((effect) => effect.includes('already leased')));

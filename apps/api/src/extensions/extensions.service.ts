@@ -359,13 +359,14 @@ export class ExtensionsService {
       const byBinding = await this.connectionModel
         .findById(installation.facebookConnectionId)
         .exec();
-      if (byBinding) return byBinding;
+      if (byBinding && !byBinding.removedAt) return byBinding;
     }
     if (installation.extensionInstanceId) {
       return this.connectionModel
         .findOne({
           clerkUserId,
           extensionInstanceId: installation.extensionInstanceId,
+          removedAt: null,
         })
         .exec();
     }
@@ -385,7 +386,7 @@ export class ExtensionsService {
       clerkUserId,
       installation,
     );
-    if (!connection || connection.archivedAt) return null;
+    if (!connection || connection.archivedAt || connection.removedAt) return null;
     if (
       connection.activeExtensionInstallationId &&
       String(connection.activeExtensionInstallationId) !==
@@ -412,7 +413,8 @@ export class ExtensionsService {
         clerkUserId,
         platform: platform as any,
         activeExtensionInstallationId: installation._id,
-        archivedAt: { $exists: false },
+        archivedAt: null,
+        removedAt: null,
       })
       .exec();
     if (!connection) return null;
@@ -471,8 +473,9 @@ export class ExtensionsService {
   }
 
   async browserConnectionAction(clerkUserId: string, installationId: string, action: string) {
-    if (!['pause', 'resume', 'disconnect', 'force-disconnect', 'remove'].includes(action)) throw new BadRequestException('Invalid browser action.');
+    if (!['pause', 'resume', 'disconnect', 'force-disconnect', 'remove', 'restore-approval'].includes(action)) throw new BadRequestException('Invalid browser action.');
     if (!Types.ObjectId.isValid(installationId)) throw new BadRequestException('Invalid installation id.');
+    if (action === 'restore-approval') return this.issueDisconnectedRestoreApproval(clerkUserId, installationId);
     const installation = await this.extensionModel.findOne({ _id: installationId, clerkUserId }).exec();
     if (!installation) throw new NotFoundException('Browser connection not found.');
     if (action === 'force-disconnect' || action === 'remove') {
@@ -504,21 +507,101 @@ export class ExtensionsService {
     return { status: updated.status };
   }
 
+  async issueDisconnectedRestoreApproval(clerkUserId: string, installationId: string) {
+    if (!Types.ObjectId.isValid(installationId)) throw new BadRequestException('Invalid installation id.');
+    const token = generateInstallationCredential();
+    const expiresAt = new Date(Date.now() + RECONNECT_APPROVAL_TTL_MS);
+    const installation = await this.extensionModel.findOneAndUpdate({
+      _id: installationId,
+      clerkUserId,
+      status: ExtensionLifecycleStatus.REVOKED,
+      revocationReason: ExtensionRevocationReason.USER_DISCONNECTED,
+      removedAt: null,
+      archivedAt: null,
+    }, {
+      $set: {
+        restoreApprovalTokenHash: hashInstallationCredential(token),
+        restoreApprovalExpiresAt: expiresAt,
+      },
+    }, { returnDocument: 'after' }).exec();
+    if (!installation) throw new ConflictException('Only a disconnected, non-removed installation can be restored.');
+    return { installationId: String(installation._id), approvalToken: token, expiresAt };
+  }
+
+  async restoreDisconnectedInstallation(clerkUserId: string, extensionInstanceId: string | undefined, approvalToken: string | undefined) {
+    const instanceId = extensionInstanceId?.trim();
+    if (!instanceId || !approvalToken) throw new BadRequestException('Installation identity and restore approval are required.');
+    const installation = await this.extensionModel.findOne({ clerkUserId, extensionInstanceId: instanceId }).exec();
+    if (!installation || installation.status !== ExtensionLifecycleStatus.REVOKED ||
+      installation.revocationReason !== ExtensionRevocationReason.USER_DISCONNECTED ||
+      installation.removedAt || installation.archivedAt ||
+      !installation.restoreApprovalTokenHash || !installation.restoreApprovalExpiresAt ||
+      installation.restoreApprovalExpiresAt.getTime() <= Date.now() ||
+      !verifyInstallationCredential(approvalToken, installation.restoreApprovalTokenHash)) {
+      throw new ForbiddenException('This disconnected installation cannot be restored with this approval.');
+    }
+    if (installation.facebookConnectionId) {
+      const facebook = await this.connectionModel.findOne({ _id: installation.facebookConnectionId, clerkUserId }).exec();
+      if (facebook?.activeExtensionInstallationId &&
+        String(facebook.activeExtensionInstallationId) !== String(installation._id)) {
+        throw new ConflictException('The Facebook connection belongs to another installation.');
+      }
+    }
+    const credential = generateInstallationCredential();
+    const restored = await this.extensionModel.findOneAndUpdate({
+      _id: installation._id,
+      clerkUserId,
+      status: ExtensionLifecycleStatus.REVOKED,
+      revocationReason: ExtensionRevocationReason.USER_DISCONNECTED,
+      removedAt: null,
+      archivedAt: null,
+      restoreApprovalTokenHash: installation.restoreApprovalTokenHash,
+      restoreApprovalExpiresAt: { $gt: new Date() },
+    }, {
+      $set: {
+        status: ExtensionLifecycleStatus.ACTIVE,
+        statusChangedAt: new Date(),
+        statusChangedByClerkUserId: clerkUserId,
+        credentialHash: hashInstallationCredential(credential),
+        credentialIssuedAt: new Date(),
+        facebookSessionDetected: false,
+      },
+      $inc: { credentialVersion: 1 },
+      $unset: {
+        statusReason: 1, revokedAt: 1, revokedByClerkUserId: 1,
+        revocationReason: 1, credentialRevokedAt: 1,
+        restoreApprovalTokenHash: 1, restoreApprovalExpiresAt: 1,
+      },
+    }, { returnDocument: 'after' }).exec();
+    if (!restored) throw new ConflictException('Restore approval was already used or the installation changed.');
+    await this.recordAudit(ExtensionLifecycleAuditEventName.INSTALLATION_RESTORED, {
+      clerkUserId, installation: restored, connectionId: restored.facebookConnectionId,
+      actor: ExtensionLifecycleActor.DASHBOARD, previousLifecycle: ExtensionLifecycleStatus.REVOKED,
+      nextLifecycle: ExtensionLifecycleStatus.ACTIVE,
+    });
+    return { status: 'ACTIVE', credentialIssued: credential, installationId: String(restored._id) };
+  }
+
   /** Atomically revoke this installation, never a Facebook account's newer binding. */
   private async revokeBrowserConnection(
     clerkUserId: string,
     installation: ExtensionInstallationDocument,
-    archive: boolean,
+    remove: boolean,
   ) {
     const previous = installation.status;
     const revoke = previous !== ExtensionLifecycleStatus.REVOKED;
-    const archiveNow = archive && !installation.archivedAt;
-    if (!revoke && !archiveNow) return { status: installation.status, archivedAt: installation.archivedAt ?? null };
+    const removeNow = remove && !installation.removedAt;
+    if (!revoke && !removeNow) {
+      if (remove) await this.markBrowserAccountsRemoved(clerkUserId, installation, installation.removedAt!);
+      return remove
+        ? { status: installation.status, removed: Boolean(installation.removedAt) }
+        : { status: installation.status, archivedAt: installation.archivedAt ?? null };
+    }
     const now = new Date();
-    const reason = archive ? ExtensionRevocationReason.REMOVED : ExtensionRevocationReason.USER_DISCONNECTED;
+    const reason = remove ? ExtensionRevocationReason.REMOVED : ExtensionRevocationReason.USER_DISCONNECTED;
     const updated = await this.extensionModel.findOneAndUpdate({
       _id: installation._id, clerkUserId, status: previous,
-      archivedAt: installation.archivedAt ?? null,
+      removedAt: installation.removedAt ?? null,
     }, {
       $set: {
         ...(revoke ? {
@@ -527,7 +610,7 @@ export class ExtensionsService {
           revokedAt: now, revokedByClerkUserId: clerkUserId, revocationReason: reason,
           credentialRevokedAt: now,
         } : {}),
-        ...(archiveNow ? { archivedAt: now, archivedByClerkUserId: clerkUserId, archiveReason: reason } : {}),
+        ...(removeNow ? { removedAt: now } : {}),
       },
       ...(revoke ? { $inc: { credentialVersion: 1 } } : {}),
     }, { returnDocument: 'after' }).exec();
@@ -537,18 +620,50 @@ export class ExtensionsService {
       actor: ExtensionLifecycleActor.DASHBOARD, previousLifecycle: previous,
       nextLifecycle: ExtensionLifecycleStatus.REVOKED, reason,
     });
-    if (archiveNow) await this.recordAudit(ExtensionLifecycleAuditEventName.CONNECTION_ARCHIVED, {
-      clerkUserId, installation: updated, connectionId: updated.facebookConnectionId,
-      actor: ExtensionLifecycleActor.DASHBOARD, reason,
+    if (removeNow) {
+      await this.markBrowserAccountsRemoved(clerkUserId, updated, now);
+      await this.recordAudit(ExtensionLifecycleAuditEventName.CONNECTION_REMOVED, {
+        clerkUserId, installation: updated, connectionId: updated.facebookConnectionId,
+        actor: ExtensionLifecycleActor.DASHBOARD, reason,
+      });
+    }
+    // Keep account IDs as historical evidence. The revoked instance cannot
+    // register again; a newly verified installation may reattach an account.
+    return remove
+      ? { status: updated.status, removed: Boolean(updated.removedAt) }
+      : { status: updated.status, archivedAt: updated.archivedAt ?? null };
+  }
+
+  private async markBrowserAccountsRemoved(
+    clerkUserId: string,
+    installation: ExtensionInstallationDocument,
+    removedAt: Date,
+  ) {
+    if (installation.facebookConnectionId) await this.connectionModel.updateOne({
+      _id: installation.facebookConnectionId,
+      clerkUserId,
+      removedAt: null,
+      $or: [
+        { activeExtensionInstallationId: installation._id },
+        { activeExtensionInstallationId: null },
+      ],
+    }, {
+      $set: { removedAt, status: FacebookConnectionStatus.DISCONNECTED,
+        workerStatus: FacebookConnectionWorkerStatus.OFFLINE, facebookSessionDetected: false },
+      $unset: { displayNameKey: 1 },
     });
-    // Keep account FKs as historical evidence. Worker identity checks revoke
-    // access across every platform; jobs/history must not be deleted or rebound.
-    return { status: updated.status, archivedAt: updated.archivedAt ?? null };
+    if (this.platformConnectionModel) await this.platformConnectionModel.updateMany({
+      clerkUserId, activeExtensionInstallationId: installation._id, removedAt: null,
+    }, {
+      $set: { removedAt, status: PlatformConnectionStatus.DISCONNECTED,
+        workerStatus: PlatformConnectionWorkerStatus.OFFLINE, sessionDetected: false },
+      $unset: { displayNameKey: 1 },
+    });
   }
 
   async listInstallations(clerkUserId: string) {
     const installations = await this.extensionModel
-      .find({ clerkUserId })
+      .find({ clerkUserId, removedAt: null })
       .sort({ lastHeartbeat: -1, createdAt: -1 })
       .lean()
       .exec();
@@ -561,6 +676,7 @@ export class ExtensionsService {
       facebookConnectionId: installation.facebookConnectionId ?? null,
       extensionInstanceId: installation.extensionInstanceId ?? null,
       status: installation.status ?? null,
+      revocationReason: installation.revocationReason ?? null,
       lastHeartbeat: installation.lastHeartbeat ?? null,
       facebookSessionDetected: installation.facebookSessionDetected ?? false,
     }));
@@ -626,7 +742,8 @@ export class ExtensionsService {
         clerkUserId,
         platform: platform as any,
         activeExtensionInstallationId: installation._id,
-        archivedAt: { $exists: false },
+        archivedAt: null,
+        removedAt: null,
       })
       .exec();
     if (activeBinding) {
@@ -639,7 +756,7 @@ export class ExtensionsService {
         clerkUserId,
         platform: platform as any,
         ...(externalAccountId ? { externalAccountId } : { externalUsername }),
-        archivedAt: { $exists: false },
+        archivedAt: null,
       })
       .exec();
     if (duplicateAccount) {
@@ -719,7 +836,7 @@ export class ExtensionsService {
     );
     if (!connection) return null;
     // A removed connection must never be refreshed back onto the dashboard.
-    if (connection.archivedAt) return connection;
+    if (connection.archivedAt || connection.removedAt) return connection;
     connection.set(updates);
     connection.lastSeenAt = new Date();
     return connection.save();
@@ -1119,7 +1236,8 @@ export class ExtensionsService {
       .findOne({
         activeExtensionInstallationId: installation._id,
         platform: platform as any,
-        archivedAt: { $exists: false },
+        archivedAt: null,
+        removedAt: null,
       })
       .exec();
 
@@ -1146,8 +1264,9 @@ export class ExtensionsService {
    * Update one platform's detected session identity. A platform's first
    * verified session follows the same hands-off flow as Facebook: when this
    * installation has no connection yet, create a new connection from the
-   * detected platform account identity. Existing connections are never stolen from another
-   * installation; those still require an explicit recovery action.
+   * detected platform account identity. Live and archived connections are not
+   * rebound automatically; an explicitly removed account may be reattached
+   * after a new installation reports the same verified identity.
    */
   async updatePlatformSession(
     platform: 'FACEBOOK' | 'INSTAGRAM' | 'TIKTOK',
@@ -1182,7 +1301,8 @@ export class ExtensionsService {
         clerkUserId,
         platform: platform as any,
         activeExtensionInstallationId: installation._id,
-        archivedAt: { $exists: false },
+        archivedAt: null,
+        removedAt: null,
       })
       .exec()) as PlatformConnectionDocument | null;
 
@@ -1305,9 +1425,8 @@ export class ExtensionsService {
       return null;
     }
 
-    // A matching account on another installation is a recovery case, not an
-    // implicit rebind. This preserves the same safety boundary as Facebook's
-    // reconnect flow while keeping first-time platform setup automatic.
+    // Live or archived accounts on another installation need explicit recovery.
+    // An account removed by the owner may reattach after verified session proof.
     const accountIdentity = externalAccountId
       ? { externalAccountId }
       : { externalUsername };
@@ -1320,12 +1439,47 @@ export class ExtensionsService {
       platform: platform as any,
       ...accountIdentity,
     }).exec() as PlatformConnectionDocument | null;
+    if (existingAccount?.removedAt) {
+      const restored = await this.platformConnectionModel!.findOneAndUpdate({
+        _id: existingAccount._id, clerkUserId, removedAt: existingAccount.removedAt,
+      }, {
+        $set: { activeExtensionInstallationId: installation._id,
+          status: PlatformConnectionStatus.CONNECTED, workerStatus: PlatformConnectionWorkerStatus.IDLE,
+          sessionDetected: true, lastSeenAt: new Date(),
+          ...(platform === 'INSTAGRAM' ? { sessionEvidenceState: 'VERIFIED', sessionVerifiedAt: new Date() } : {}) },
+        $unset: { removedAt: 1, archivedAt: 1, archivedByClerkUserId: 1, archiveReason: 1, statusReason: 1 },
+      }, { returnDocument: 'after' }).exec() as PlatformConnectionDocument | null;
+      if (restored) {
+        await installation.save();
+        return sanitizePlatformConnection(restored);
+      }
+    }
+    if (existingAccount?.archivedAt &&
+      String(existingAccount.activeExtensionInstallationId ?? '') === String(installation._id)) {
+      const restored = await this.platformConnectionModel!.findOneAndUpdate({
+        _id: existingAccount._id, clerkUserId,
+        activeExtensionInstallationId: installation._id,
+        archivedAt: existingAccount.archivedAt,
+        removedAt: null,
+      }, {
+        $set: { status: PlatformConnectionStatus.CONNECTED,
+          workerStatus: PlatformConnectionWorkerStatus.IDLE,
+          sessionDetected: true, lastSeenAt: new Date(),
+          ...(platform === 'INSTAGRAM' ? { sessionEvidenceState: 'VERIFIED', sessionVerifiedAt: new Date() } : {}) },
+        $unset: { archivedAt: 1, archivedByClerkUserId: 1, archiveReason: 1, statusReason: 1 },
+      }, { returnDocument: 'after' }).exec() as PlatformConnectionDocument | null;
+      if (restored) {
+        await installation.save();
+        return sanitizePlatformConnection(restored);
+      }
+    }
     if (existingAccount) {
-      this.logger.warn(
-        `[${platform}] automatic connection blocked: account is already bound to another installation`,
-      );
-      await installation.save();
-      return null;
+      const ownerInstallation = existingAccount.activeExtensionInstallationId
+        ? await this.extensionModel.findById(existingAccount.activeExtensionInstallationId).exec()
+        : null;
+      throw new ConflictException(ownerInstallation?.status === ExtensionLifecycleStatus.REVOKED
+        ? `This ${platform.toLowerCase()} account belongs to another disconnected extension connection. Restore or remove that connection first.`
+        : `This ${platform.toLowerCase()} account is already linked to another connection. Open that connection or remove it before connecting this extension.`);
     }
 
     const platformName = platform === 'INSTAGRAM'
@@ -1363,7 +1517,7 @@ export class ExtensionsService {
         clerkUserId,
         platform: platform as any,
         activeExtensionInstallationId: installation._id,
-        archivedAt: { $in: [null] },
+        archivedAt: null,
       }).exec() as PlatformConnectionDocument | null;
       if (winner) {
         await installation.save();
@@ -1379,11 +1533,9 @@ export class ExtensionsService {
         ...accountIdentity,
       }).exec() as PlatformConnectionDocument | null;
       if (owner) {
-        await installation.save();
-        this.logger.warn(
-          `[${platform}] automatic connection blocked after duplicate-key race: account is already bound`,
+        throw new ConflictException(
+          `This ${platform.toLowerCase()} account is already linked to another connection. Open that connection or remove it before connecting this extension.`,
         );
-        return null;
       }
       throw new ConflictException(
         `The ${platform.toLowerCase()} account is already linked to another connection.`,
@@ -1596,6 +1748,7 @@ export class ExtensionsService {
       .find({
         clerkUserId,
         archivedAt: null,
+        removedAt: null,
         facebookUserId: detectedFacebookUserId,
         workerStatus: { $ne: FacebookConnectionWorkerStatus.PUBLISHING },
         _id: { $ne: installation.facebookConnectionId ?? null },
@@ -2128,13 +2281,19 @@ export class ExtensionsService {
       await this.clearConnectionBindingIfSame(connection, installation);
     }
 
-    if (!connection.archivedAt) {
-      connection.archivedAt = new Date();
-      connection.archivedByClerkUserId = clerkUserId;
-      connection.archiveReason = ExtensionRevocationReason.REMOVED;
+    if (installation && !installation.removedAt) {
+      installation.removedAt = new Date();
+      await installation.save();
+    }
+    if (!connection.removedAt) {
+      connection.removedAt = new Date();
+      connection.status = FacebookConnectionStatus.DISCONNECTED;
+      connection.workerStatus = FacebookConnectionWorkerStatus.OFFLINE;
+      connection.facebookSessionDetected = false;
+      connection.displayNameKey = undefined;
       await connection.save();
       await this.recordAudit(
-        ExtensionLifecycleAuditEventName.CONNECTION_ARCHIVED,
+        ExtensionLifecycleAuditEventName.CONNECTION_REMOVED,
         {
           clerkUserId,
           installation,
@@ -2144,6 +2303,14 @@ export class ExtensionsService {
         },
       );
     }
+
+    if (installation && this.platformConnectionModel) await this.platformConnectionModel.updateMany({
+      clerkUserId, activeExtensionInstallationId: installation._id, removedAt: null,
+    }, {
+      $set: { removedAt: new Date(), status: PlatformConnectionStatus.DISCONNECTED,
+        workerStatus: PlatformConnectionWorkerStatus.OFFLINE, sessionDetected: false },
+      $unset: { displayNameKey: 1 },
+    });
 
     return this.toConnectionState(connection, installation);
   }
@@ -2216,7 +2383,7 @@ export class ExtensionsService {
   async listConnections(clerkUserId: string): Promise<ConnectionState[]> {
     const [connections, installations] = await Promise.all([
       this.connectionModel
-        .find({ clerkUserId, archivedAt: null })
+        .find({ clerkUserId, archivedAt: null, removedAt: null })
         .sort({ lastSeenAt: -1, createdAt: -1 })
         .lean()
         .exec(),
@@ -2257,7 +2424,7 @@ export class ExtensionsService {
       .find({
         clerkUserId,
         ...(platform ? { platform: platform as any } : {}),
-        archivedAt: { $exists: false },
+        archivedAt: null, removedAt: null,
       })
       .sort({ lastSeenAt: -1, createdAt: -1 })
       .lean()
@@ -2316,7 +2483,7 @@ export class ExtensionsService {
   ): Promise<ConnectionState[]> {
     const [connections, installations] = await Promise.all([
       this.connectionModel
-        .find({ clerkUserId, archivedAt: { $ne: null } })
+        .find({ clerkUserId, archivedAt: { $ne: null }, removedAt: null })
         .sort({ archivedAt: -1 })
         .lean()
         .exec(),
@@ -2423,6 +2590,7 @@ export class ExtensionsService {
       : installation;
     const safe = { ...(document as Record<string, unknown>) };
     delete safe.credentialHash;
+    delete safe.restoreApprovalTokenHash;
     return { ...safe, _id: String(installation._id) };
   }
 
@@ -2438,7 +2606,7 @@ export class ExtensionsService {
     const connection = await this.connectionModel
       .findOne({ _id: connectionId, clerkUserId })
       .exec();
-    if (!connection) {
+    if (!connection || connection.removedAt) {
       throw new NotFoundException('Facebook connection not found.');
     }
     return connection;
@@ -2499,7 +2667,7 @@ export class ExtensionsService {
         String(installation._id)
     ) {
       await this.connectionModel.updateOne(
-        { _id: connection._id },
+        { _id: connection._id, activeExtensionInstallationId: installation._id },
         { $unset: { activeExtensionInstallationId: 1 } },
       );
       connection.activeExtensionInstallationId = undefined;

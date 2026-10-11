@@ -2,8 +2,6 @@ type TikTokEngagementResult = {
   status: 'SUCCESS' | 'PARTIAL' | 'CHECK_FAILED';
   reactionCount?: number;
   commentCount?: number;
-  favoriteCount?: number;
-  shareCount?: number;
   reason?: string;
 };
 
@@ -16,11 +14,17 @@ type TikTokPostIdentity = {
 const COUNT_SELECTORS = {
   reactionCount: ['[data-e2e="like-count"]', '[data-e2e="like-icon"]'],
   commentCount: ['[data-e2e="comment-count"]', '[data-e2e="comment-icon"]'],
-  favoriteCount: ['[data-e2e="favorite-count"]', '[data-e2e="favorite-icon"]'],
-  shareCount: ['[data-e2e="share-count"]', '[data-e2e="share-icon"]'],
 } as const;
 
 type TikTokCounterName = keyof typeof COUNT_SELECTORS;
+type CounterDiagnostic = {
+  value: number | null;
+  source: 'count-element' | 'action-label' | 'conflict' | 'unavailable';
+  countText: string[];
+  actionLabels: string[];
+  parsedCountValues: number[];
+  parsedActionValues: number[];
+};
 
 function extractTikTokIdentity(value: string): TikTokPostIdentity | null {
   try {
@@ -75,8 +79,6 @@ function countFromActionLabel(value: string, counter: TikTokCounterName): number
   const labels: Record<TikTokCounterName, RegExp> = {
     reactionCount: new RegExp(`${suffix}\\s*(?:likes?)`, 'i'),
     commentCount: new RegExp(`${suffix}\\s*(?:comments?)`, 'i'),
-    favoriteCount: new RegExp(`${suffix}\\s*(?:(?:added\\s+to\\s+)?favorites?)`, 'i'),
-    shareCount: new RegExp(`${suffix}\\s*(?:shares?)`, 'i'),
   };
   const match = text.match(labels[counter]);
   return match ? parseTikTokCount(match[1]) : null;
@@ -90,19 +92,38 @@ function elementText(element: Element): string[] {
   ];
 }
 
-function readCounter(post: Element, counter: TikTokCounterName): number | null {
+function readCounter(post: Element, counter: TikTokCounterName): CounterDiagnostic {
   const selectors = COUNT_SELECTORS[counter];
   const countElementSelector = selectors[0];
   const actionElementSelector = selectors[1];
   const countElements = Array.from(post.querySelectorAll<HTMLElement>(countElementSelector));
-  const values = countElements.flatMap(elementText).map(parseTikTokCount).filter((value): value is number => value !== null);
-  if (values.length) return new Set(values).size === 1 ? values[0] : null;
+  const countText = countElements.flatMap(elementText).map((value) => value.trim()).filter(Boolean);
+  const parsedCountValues = countText.map(parseTikTokCount).filter((value): value is number => value !== null);
+  if (parsedCountValues.length) {
+    const unique = [...new Set(parsedCountValues)];
+    return {
+      value: unique.length === 1 ? unique[0] : null,
+      source: unique.length === 1 ? 'count-element' : 'conflict',
+      countText,
+      actionLabels: [],
+      parsedCountValues,
+      parsedActionValues: [],
+    };
+  }
 
   const actionElements = Array.from(post.querySelectorAll<HTMLElement>(actionElementSelector));
-  const actionCounts = actionElements.flatMap((element) =>
-    elementText(element).map((value) => countFromActionLabel(value, counter)),
-  ).filter((value): value is number => value !== null);
-  return actionCounts.length && new Set(actionCounts).size === 1 ? actionCounts[0] : null;
+  const actionLabels = actionElements.flatMap(elementText).map((value) => value.trim()).filter(Boolean);
+  const actionCounts = actionLabels.map((value) => countFromActionLabel(value, counter))
+    .filter((value): value is number => value !== null);
+  const unique = [...new Set(actionCounts)];
+  return {
+    value: unique.length === 1 ? unique[0] : null,
+    source: unique.length > 1 ? 'conflict' : unique.length === 1 ? 'action-label' : 'unavailable',
+    countText,
+    actionLabels,
+    parsedCountValues,
+    parsedActionValues: actionCounts,
+  };
 }
 
 function closestPostContainer(element: Element): Element | null {
@@ -111,13 +132,16 @@ function closestPostContainer(element: Element): Element | null {
 
 function findTargetPost(identity: TikTokPostIdentity): Element | null {
   const containers = new Set<Element>();
-  for (const marker of Array.from(document.querySelectorAll<HTMLElement>('[data-video-id], [id^="xgwrapper-"], a[href]'))) {
+  for (const marker of Array.from(document.querySelectorAll<HTMLElement>(
+    '[data-video-id], [id^="xgwrapper-"], [data-more-menu-item-id], a[href]',
+  ))) {
     const videoId = marker.getAttribute('data-video-id') ?? '';
     const idMatch = marker.id.match(/^xgwrapper-\d+-(\d+)$/)?.[1] ?? '';
+    const menuItemId = marker.getAttribute('data-more-menu-item-id') ?? '';
     const linkIdentity = marker.tagName === 'A'
       ? extractTikTokIdentity((marker as HTMLAnchorElement).href)
       : null;
-    const matches = videoId === identity.id || idMatch === identity.id || Boolean(
+    const matches = videoId === identity.id || idMatch === identity.id || menuItemId === identity.id || Boolean(
       linkIdentity && linkIdentity.id === identity.id && linkIdentity.kind === identity.kind,
     );
     if (!matches) continue;
@@ -127,27 +151,63 @@ function findTargetPost(identity: TikTokPostIdentity): Element | null {
   if (containers.size === 1) return [...containers][0];
   if (containers.size > 1) return null;
 
+  // Photo permalinks can render the action bar without an article wrapper or
+  // a permalink/video ID marker. On the exact requested permalink, accept one
+  // uniquely identifiable like/comment action bar as the post container.
+  const current = extractTikTokIdentity(location.href);
+  if (current && current.id === identity.id && current.kind === identity.kind &&
+    current.username.toLowerCase() === identity.username.toLowerCase()) {
+    const actionBars = new Set<Element>();
+    for (const likeCount of Array.from(document.querySelectorAll<HTMLElement>(COUNT_SELECTORS.reactionCount[0]))) {
+      let ancestor = likeCount.parentElement;
+      for (let depth = 0; ancestor && depth < 12; depth += 1, ancestor = ancestor.parentElement) {
+        const hasOneLike = ancestor.querySelectorAll(COUNT_SELECTORS.reactionCount[0]).length === 1;
+        const hasOneComment = ancestor.querySelectorAll(COUNT_SELECTORS.commentCount[0]).length === 1;
+        const hasLikeAction = Boolean(ancestor.querySelector(COUNT_SELECTORS.reactionCount[1]));
+        const hasCommentAction = Boolean(ancestor.querySelector(COUNT_SELECTORS.commentCount[1]));
+        if (hasOneLike && hasOneComment && hasLikeAction && hasCommentAction) {
+          actionBars.add(ancestor);
+          break;
+        }
+      }
+    }
+    if (actionBars.size === 1) return [...actionBars][0];
+  }
+
   // On a direct permalink page TikTok sometimes omits a permalink anchor and
   // the xgplayer ID. Accept the lone post card only; never guess among a feed.
   const cards = Array.from(document.querySelectorAll('[data-e2e="recommend-list-item-container"], article'));
   return cards.length === 1 ? cards[0] : null;
 }
 
-function readResult(post: Element): TikTokEngagementResult {
-  const reactionCount = readCounter(post, 'reactionCount');
-  const commentCount = readCounter(post, 'commentCount');
-  const favoriteCount = readCounter(post, 'favoriteCount');
-  const shareCount = readCounter(post, 'shareCount');
+function readResult(post: Element): { result: TikTokEngagementResult; counters: Record<TikTokCounterName, CounterDiagnostic> } {
+  const counters = {
+    reactionCount: readCounter(post, 'reactionCount'),
+    commentCount: readCounter(post, 'commentCount'),
+  };
+  const reactionCount = counters.reactionCount.value;
+  const commentCount = counters.commentCount.value;
   const result = {
     ...(reactionCount !== null ? { reactionCount } : {}),
     ...(commentCount !== null ? { commentCount } : {}),
-    ...(favoriteCount !== null ? { favoriteCount } : {}),
-    ...(shareCount !== null ? { shareCount } : {}),
   };
   const count = Object.keys(result).length;
-  if (count === 4) return { status: 'SUCCESS', ...result };
-  if (count > 0) return { status: 'PARTIAL', ...result, reason: 'TikTok did not expose every engagement counter' };
-  return { status: 'CHECK_FAILED', reason: 'TikTok engagement counters were not detected' };
+  if (count === 2) return { result: { status: 'SUCCESS', ...result }, counters };
+  if (count > 0) return { result: { status: 'PARTIAL', ...result, reason: 'TikTok did not expose both likes and comments' }, counters };
+  return { result: { status: 'CHECK_FAILED', reason: 'TikTok engagement counters were not detected' }, counters };
+}
+
+function logInspection(target: TikTokPostIdentity, post: Element, counters: Record<TikTokCounterName, CounterDiagnostic>, result: TikTokEngagementResult): void {
+  const postIds = Array.from(post.querySelectorAll<HTMLElement>('[data-more-menu-item-id], [data-video-id], [id^="xgwrapper-"]'))
+    .map((element) => element.getAttribute('data-more-menu-item-id') ?? element.getAttribute('data-video-id') ?? element.id)
+    .filter(Boolean);
+  globalThis.console?.info('[PostFlow][TikTok] Engagement counters inspected', {
+    target: { username: target.username, kind: target.kind, id: target.id },
+    currentUrl: location.href,
+    selectedCard: { id: post.id || null, e2e: post.getAttribute('data-e2e'), postIds: [...new Set(postIds)] },
+    counters,
+    result,
+  });
 }
 
 async function checkTikTokPostEngagement(targetUrl: string, timeoutMs = 20_000): Promise<TikTokEngagementResult> {
@@ -161,22 +221,46 @@ async function checkTikTokPostEngagement(targetUrl: string, timeoutMs = 20_000):
   const startedAt = Date.now();
   let partial: TikTokEngagementResult | null = null;
   let partialSince: number | null = null;
+  let partialSignature = '';
+  let lastInspection: { post: Element; counters: Record<TikTokCounterName, CounterDiagnostic>; result: TikTokEngagementResult } | null = null;
   while (Date.now() - startedAt < timeoutMs) {
     const post = findTargetPost(target);
     if (post) {
-      const result = readResult(post);
-      if (result.status === 'SUCCESS') return result;
-      if (result.status === 'PARTIAL') {
-        partial = result;
-        partialSince ??= Date.now();
-        if (Date.now() - partialSince >= 1_500) return partial;
-      } else {
-        partialSince = null;
+      const inspection = readResult(post);
+      const result = inspection.result;
+      lastInspection = { post, ...inspection };
+      if (result.status === 'SUCCESS') {
+        logInspection(target, post, inspection.counters, result);
+        return result;
       }
+      if (result.status === 'PARTIAL') {
+        const signature = JSON.stringify(result);
+        if (signature !== partialSignature) {
+          partialSince = Date.now();
+          partialSignature = signature;
+        }
+        partial = result;
+        if (partialSince !== null && Date.now() - partialSince >= 1_500) {
+          logInspection(target, post, inspection.counters, result);
+          return result;
+        }
+      } else {
+        partial = null;
+        partialSince = null;
+        partialSignature = '';
+      }
+    } else {
+      partial = null;
+      partialSince = null;
+      partialSignature = '';
+      lastInspection = null;
     }
     await new Promise((resolve) => window.setTimeout(resolve, 400));
   }
-  return partial ?? { status: 'CHECK_FAILED', reason: 'TikTok engagement counters were not detected' };
+  const result = partial ?? { status: 'CHECK_FAILED' as const, reason: 'TikTok engagement counters were not detected' };
+  if (lastInspection) logInspection(target, lastInspection.post, lastInspection.counters, result);
+  else globalThis.console?.warn('[PostFlow][TikTok] Engagement target card not found', { target, currentUrl: location.href });
+  return result;
 }
 
 const tikTokEngagementHelpers = {

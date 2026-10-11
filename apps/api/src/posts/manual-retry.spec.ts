@@ -28,10 +28,14 @@ describe('manual publishing retry', () => {
       _id: 'connection-1', platform: 'TIKTOK', status: 'CONNECTED', sessionDetected: true,
       externalUsername: 'creator', detectedExternalUsername: 'creator',
     };
-    const update = jest.fn(() => ({ exec: async () => {
-      if (job.status !== 'FAILED' || job.submittedAt || job.postUrl || job.submissionStatus) return null;
+    const update = jest.fn((filter: any) => ({ exec: async () => {
+      const forceRetry = filter?.submissionStatus === 'UNKNOWN';
+      if (forceRetry
+        ? (job.status !== 'SUCCESS' && job.status !== 'FAILED') || !job.submittedAt || job.postUrl || job.externalPublishId || job.externalPostId || job.submissionStatus !== 'UNKNOWN'
+        : job.status !== 'FAILED' || job.submittedAt || job.postUrl || job.submissionStatus) return null;
       Object.assign(job, { status: 'PENDING', error: undefined, submissionReason: undefined,
-        startedAt: undefined, completedAt: undefined, scheduledFor: undefined });
+        startedAt: undefined, completedAt: undefined, scheduledFor: undefined, submittedAt: undefined,
+        submissionStatus: undefined });
       return job;
     } }));
     const find = jest.fn(() => ({
@@ -76,6 +80,38 @@ describe('manual publishing retry', () => {
       externalUsername: 'creator', detectedExternalUsername: 'different',
     }) });
     await expect(h.controller.retryFailedJob('owner', 'job-1')).rejects.toThrow('Reconnect and verify');
+    expect(h.update).not.toHaveBeenCalled();
+  });
+
+  it('force-requeues an unknown TikTok submission after the owner confirms no post exists', async () => {
+    jest.spyOn(tikTokPolicy, 'isTikTokPublishingEnabled').mockReturnValue(true);
+    const h = harness({ status: 'SUCCESS', submittedAt: new Date(), submissionStatus: 'UNKNOWN', error: 'TIKTOK_PAGE_ERROR' });
+    const result = await h.controller.forceRetryTikTokJob('owner', 'job-1', { confirmNoPost: true });
+    expect(result).toMatchObject({ id: 'job-1', status: 'PENDING', attempts: 1 });
+    expect(h.job.status).toBe('PENDING');
+    expect(h.update).toHaveBeenCalledWith(expect.objectContaining({
+      status: { $in: ['SUCCESS', 'FAILED'] },
+      submissionStatus: 'UNKNOWN',
+      submittedAt: { $exists: true },
+    }), expect.objectContaining({
+      $set: expect.objectContaining({ status: 'PENDING', manualRetryRequestedAt: expect.any(Date) }),
+    }), { new: true });
+    expect(h.post.status).toBe('PUBLISHING');
+  });
+
+  it('requires explicit owner confirmation before a TikTok force retry', async () => {
+    jest.spyOn(tikTokPolicy, 'isTikTokPublishingEnabled').mockReturnValue(true);
+    const h = harness({ status: 'SUCCESS', submittedAt: new Date(), submissionStatus: 'UNKNOWN' });
+    await expect(h.controller.forceRetryTikTokJob('owner', 'job-1', { confirmNoPost: false }))
+      .rejects.toThrow('Confirm that no TikTok post appears');
+    expect(h.update).not.toHaveBeenCalled();
+  });
+
+  it('does not force-retry an unknown TikTok job when a platform identity is recorded', async () => {
+    jest.spyOn(tikTokPolicy, 'isTikTokPublishingEnabled').mockReturnValue(true);
+    const h = harness({ status: 'SUCCESS', submittedAt: new Date(), submissionStatus: 'UNKNOWN', postUrl: 'https://www.tiktok.com/@creator/video/123' });
+    await expect(h.controller.forceRetryTikTokJob('owner', 'job-1', { confirmNoPost: true }))
+      .rejects.toThrow('identity is already recorded');
     expect(h.update).not.toHaveBeenCalled();
   });
 });

@@ -17,6 +17,7 @@ import {
 } from './publishing-target.js';
 import { refreshInstagramSession, registerInstagramSessionWorker } from './platforms/instagram/worker.js';
 import { refreshTikTokSession, registerTikTokSessionWorker, registerTikTokPublishingBridge } from './platforms/tiktok/index.js';
+import { normalizeTikTokAnalyticsPermalink } from './platforms/tiktok/engagement-url.js';
 import {
   checkPendingJobs as checkPlatformJobs,
   handlePlatformQueueResume,
@@ -985,6 +986,24 @@ async function completeExtensionRecovery(options: {
   return { ok: true };
 }
 
+async function restoreDisconnectedExtension(installationId: string, approvalToken: string): Promise<{ ok: boolean; error?: string }> {
+  const storedInstallationId = (await chrome.storage.local.get('extensionInstallationId')).extensionInstallationId;
+  if (!installationId || !approvalToken || (storedInstallationId && installationId !== storedInstallationId)) {
+    return { ok: false, error: 'Open the dashboard in the Chrome Profile of this disconnected extension.' };
+  }
+  const result = await apiFetch('/api/extensions/restore-disconnected', { approvalToken }, 'POST', true, false);
+  if (isApiFetchFailure(result) || result?.status !== 'ACTIVE' || typeof result?.credentialIssued !== 'string') {
+    return { ok: false, error: isApiFetchFailure(result) ? result.message ?? 'Could not restore this extension.' : 'The backend did not issue a restored credential.' };
+  }
+  await persistExtensionCredential(result.credentialIssued);
+  await persistExtensionLifecycleStatus('ACTIVE');
+  await chrome.storage.local.set({ extensionConnectionStage: 'connecting' });
+  await registerExtension();
+  await initializeWorkerAlarms();
+  void checkPendingJobs();
+  return { ok: true };
+}
+
 chrome.cookies.onChanged.addListener((changeInfo) => {
   const domain = changeInfo.cookie.domain.replace(/^\./, '').toLowerCase();
   const isFacebookDomain = domain === 'facebook.com' || domain.endsWith('.facebook.com');
@@ -1175,6 +1194,42 @@ chrome.runtime.onConnect.addListener((port) => {
 // ── Session + sync messages ──
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'RETRY_PLATFORM_CONNECTION') {
+    if (sender.tab || sender.id !== chrome.runtime.id) {
+      sendResponse({ ok: false, error: 'Platform retries can only be started from the extension popup.' });
+      return;
+    }
+    const platform = message.platform;
+    if (platform !== 'FACEBOOK' && platform !== 'INSTAGRAM' && platform !== 'TIKTOK') {
+      sendResponse({ ok: false, error: 'Unknown platform.' });
+      return;
+    }
+    void (async () => {
+      const lifecycle = await getExtensionLifecycleStatus();
+      if (lifecycle === 'REVOKED' || lifecycle === 'REVOKE_PENDING') {
+        return { ok: false, error: 'Restore this connection from the PostFlow dashboard before retrying.' };
+      }
+      if (!await getClerkUserId() || !await getExtensionCredential()) {
+        return { ok: false, error: 'Open the signed-in PostFlow dashboard to finish connecting this extension.' };
+      }
+      const connected = platform === 'FACEBOOK'
+        ? await refreshFacebookSession()
+        : platform === 'INSTAGRAM'
+          ? await refreshInstagramSession()
+          : await refreshTikTokSession();
+      if (connected) return { ok: true };
+      const state = await chrome.storage.local.get(['instagramConnectionError', 'tiktokConnectionError']);
+      const detail = platform === 'INSTAGRAM' ? state.instagramConnectionError
+        : platform === 'TIKTOK' ? state.tiktokConnectionError : null;
+      const name = platform === 'FACEBOOK' ? 'Facebook' : platform === 'INSTAGRAM' ? 'Instagram' : 'TikTok';
+      return { ok: false, error: typeof detail === 'string' && detail
+        ? detail : `${name} is still not connected. Check that you are signed in, then retry.` };
+    })()
+      .then(sendResponse)
+      .catch((error) => sendResponse({ ok: false, error: error instanceof Error ? error.message : 'Could not retry this platform.' }));
+    return true;
+  }
+
   if (message.type === 'COMPLETE_EXTENSION_RECOVERY') {
     void completeExtensionRecovery({
       ...(typeof message.connectionId === 'string'
@@ -1212,6 +1267,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         ok: false,
         error: error instanceof Error ? error.message : 'Could not restore this connection.',
       }));
+    return true;
+  }
+
+  if (message.type === 'RESTORE_DISCONNECTED_INSTALLATION') {
+    if (!sender.tab?.url || !isPostFlowDashboardUrl(sender.tab.url)) {
+      sendResponse({ ok: false, error: 'Restore approval must come from the PostFlow dashboard.' });
+      return;
+    }
+    void restoreDisconnectedExtension(message.installationId, message.approvalToken)
+      .then(sendResponse)
+      .catch((error) => sendResponse({ ok: false, error: error instanceof Error ? error.message : 'Could not restore this extension.' }));
     return true;
   }
 
@@ -3264,20 +3330,6 @@ async function checkSingleInstagramPostEngagement(
   }
 }
 
-function normalizeTikTokAnalyticsPermalink(value: string): string | null {
-  const markdownMatch = value.trim().match(/^\[[^\]]+\]\((https?:\/\/[^)]+)\)$/i);
-  const candidate = markdownMatch?.[1] ?? value.trim();
-  try {
-    const url = new URL(candidate);
-    if (!['www.tiktok.com', 'tiktok.com'].includes(url.hostname.toLowerCase())) return null;
-    const match = url.pathname.match(/^\/@([A-Za-z0-9._]{1,24})\/(video|photo)\/(\d+)\/?$/i);
-    if (!match || url.protocol !== 'https:' || url.username || url.password) return null;
-    return `https://www.tiktok.com/@${match[1]}/${match[2].toLowerCase()}/${match[3]}`;
-  } catch {
-    return null;
-  }
-}
-
 async function waitForTikTokTabAfterNavigation(tabId: number, targetUrl: string, timeoutMs: number): Promise<boolean> {
   const target = normalizeTikTokAnalyticsPermalink(targetUrl);
   if (!target) return false;
@@ -3304,11 +3356,21 @@ async function waitForTikTokTabAfterNavigation(tabId: number, targetUrl: string,
 async function checkSingleTikTokPostEngagement(
   post: PublishedPlatformPost,
 ): Promise<PostEngagementSyncResult> {
-  const postUrl = normalizeTikTokAnalyticsPermalink(post.postUrl);
+  const postUrl = normalizeTikTokAnalyticsPermalink(
+    post.postUrl,
+    post.targetType === 'TIKTOK_PHOTO' || post.targetType === 'TIKTOK_VIDEO'
+      ? post.targetType
+      : undefined,
+  );
   if (!postUrl) return { status: 'CHECK_FAILED', reason: 'Stored TikTok post URL is invalid' };
   let tabId: number | undefined;
   try {
-    console.info('[PostAnalytics][TikTok] Opening published post', { postId: post.id, postUrl });
+    console.info('[PostAnalytics][TikTok] Opening published post', {
+      postId: post.id,
+      targetType: post.targetType ?? null,
+      storedPostUrl: post.postUrl,
+      postUrl,
+    });
     const tab = await chrome.tabs.create({ url: postUrl, active: false });
     tabId = tab.id;
     const ready = Boolean(tabId && await waitForTikTokTabAfterNavigation(
@@ -3316,6 +3378,14 @@ async function checkSingleTikTokPostEngagement(
       postUrl,
       TIKTOK_ANALYTICS_TAB_READY_TIMEOUT_MS,
     ));
+    const landedTab = tabId === undefined ? null : await chrome.tabs.get(tabId).catch(() => null);
+    console.info('[PostAnalytics][TikTok] Published post page readiness', {
+      postId: post.id,
+      targetType: post.targetType ?? null,
+      ready,
+      landedUrl: landedTab?.url ?? null,
+      tabStatus: landedTab?.status ?? null,
+    });
     if (!tabId || !ready) {
       return { status: 'CHECK_FAILED', reason: 'Target TikTok post did not finish loading' };
     }
@@ -3329,7 +3399,8 @@ async function checkSingleTikTokPostEngagement(
         if (response?.ok && response.result) {
           console.info('[PostAnalytics][TikTok] Engagement result received', {
             postId: post.id,
-            status: response.result.status,
+            postUrl,
+            ...response.result,
           });
           return response.result as PostEngagementSyncResult;
         }
@@ -3685,11 +3756,8 @@ chrome.runtime.onInstalled.addListener((details) => {
 });
 
 async function injectPostflowBridgeIntoOpenDashboardTabs(): Promise<void> {
-  const stored = await chrome.storage.local.get('clerkUserId');
-  // Avoid installing duplicate observers into already-connected dashboard
-  // tabs on every service-worker wake-up. We only need the bridge when the
-  // user ID has not reached extension storage yet.
-  if (typeof stored.clerkUserId === 'string' && stored.clerkUserId.trim()) return;
+  // A stored user ID does not mean the open tab still has a live bridge after
+  // an extension reload. The content script guards against duplicate installs.
   const tabs = await chrome.tabs.query({
     url: [
       'http://localhost:3001/*',
@@ -3732,29 +3800,31 @@ async function requestDashboardAuthContext(): Promise<{ ok: boolean; error?: str
   // Ensure an already-open dashboard has the bridge after an extension reload,
   // then explicitly ask it to publish its current Clerk user ID.
   await injectPostflowBridgeIntoOpenDashboardTabs();
-  let requested = false;
+  let dashboardUserId: string | null = null;
   for (const tab of dashboardTabs) {
     if (tab.id === undefined) continue;
     try {
       const response = await chrome.tabs.sendMessage(tab.id, {
         type: 'REFRESH_AUTH_CONTEXT',
       });
-      requested = requested || response?.ok === true;
+      if (response?.ok === true && typeof response.userId === 'string') {
+        dashboardUserId = response.userId;
+      }
     } catch {
       // A tab may have navigated between query and send; try the remaining tabs.
     }
   }
-  if (!requested) {
+  if (!dashboardUserId) {
     return {
       ok: false,
-      error: 'The dashboard tab is not ready. Refresh it once, then try again.',
+      error: 'Could not read a signed-in dashboard. Open PostFlow and sign in, then retry.',
     };
   }
 
   // The content bridge writes storage asynchronously. Give it a short window
   // to complete before retrying registration immediately.
   for (let attempt = 0; attempt < 10; attempt += 1) {
-    if (await getClerkUserId()) {
+    if (await getClerkUserId() === dashboardUserId) {
       await registerExtension();
       return { ok: true };
     }

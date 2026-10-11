@@ -17,6 +17,9 @@ const media = load('shared/media/media-types');
 
 test('strict upload and account-owned permalink allowlists', () => {
   assert.equal(policy.isTikTokUploadUrl('https://www.tiktok.com/tiktokstudio/upload'), true);
+  assert.equal(policy.isTikTokUploadUrl('https://www.tiktok.com/tiktokstudio/upload/post/photo'), true);
+  assert.equal(policy.isTikTokUploadUrl('https://www.tiktok.com/tiktokstudio/upload/post/video'), true);
+  assert.equal(policy.isTikTokUploadUrl('https://www.tiktok.com/tiktokstudio/upload/post/other'), false);
   assert.equal(policy.isTikTokUploadUrl('http://www.tiktok.com/upload'), false);
   assert.equal(policy.isTikTokUploadUrl('https://www.tiktok.com/@creator'), false);
   assert.equal(policy.normalizeTikTokPostUrl('https://www.tiktok.com/@creator/video/123?tracking=1', 'creator'), 'https://www.tiktok.com/@creator/video/123');
@@ -25,7 +28,7 @@ test('strict upload and account-owned permalink allowlists', () => {
   assert.equal(policy.normalizeTikTokPostUrl('https://www.tiktok.com.evil/@creator/video/123'), null);
 });
 
-function adapter(chrome, worker = { async ensureTikTokComposer() { return { ok: false }; } }) {
+function adapter(chrome, worker = { async ensureTikTokComposer() { return { ok: true, busy: false }; } }) {
   let bound = 0, released = 0;
   const { tiktokAdapter } = load('platforms/tiktok/adapter', {
     '../../shared/media/index.js': media, '../../env.js': { API_BASE_URL: 'https://api.example' }, './result.js': policy,

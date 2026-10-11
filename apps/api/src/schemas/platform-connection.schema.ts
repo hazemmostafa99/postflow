@@ -119,6 +119,10 @@ export class PlatformConnection {
   @Prop()
   archiveReason?: string;
 
+  /** Hidden until a verified account on a new installation reconnects it. */
+  @Prop({ index: true })
+  removedAt?: Date;
+
   // Added by timestamps: true
   createdAt?: Date;
   updatedAt?: Date;

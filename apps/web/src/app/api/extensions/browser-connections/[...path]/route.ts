@@ -5,7 +5,7 @@ async function forward(request: Request, context: { params: Promise<{ path: stri
   const { userId } = await auth();
   if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   const { path } = await context.params;
-  if (path.length > 2 || !/^[a-f\d]{24}$/i.test(path[0]) || (path[1] && !["pause", "resume", "disconnect", "force-disconnect", "remove"].includes(path[1]))) {
+  if (path.length > 2 || !/^[a-f\d]{24}$/i.test(path[0]) || (path[1] && !["pause", "resume", "disconnect", "force-disconnect", "remove", "restore-approval"].includes(path[1]))) {
     return NextResponse.json({ error: "Invalid action" }, { status: 400 });
   }
   try {

@@ -43,6 +43,17 @@ export class ExtensionInstallation {
   @Prop()
   archiveReason?: string;
 
+  /** Hidden removal tombstone keeps this instance ID revoked after dashboard removal. */
+  @Prop({ index: true })
+  removedAt?: Date;
+
+  /** Single-use dashboard approval for restoring a user-disconnected instance. */
+  @Prop()
+  restoreApprovalTokenHash?: string;
+
+  @Prop()
+  restoreApprovalExpiresAt?: Date;
+
   @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'FacebookConnection', index: true })
   facebookConnectionId?: Types.ObjectId;
 

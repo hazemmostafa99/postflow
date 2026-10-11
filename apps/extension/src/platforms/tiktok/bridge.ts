@@ -15,10 +15,17 @@ export function releaseTikTokExecution(tabId: number): void {
 
 export function registerTikTokPublishingBridge(apiFetch: TikTokSessionApiFetch): void {
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (!['TIKTOK_CHECK_JOB', 'TIKTOK_ARM_SUBMISSION', 'TIKTOK_CONFIRM_SUBMISSION', 'TIKTOK_COMPOSER_STAGE'].includes(message?.type)) return;
+    if (!['TIKTOK_CHECK_JOB', 'TIKTOK_ARM_SUBMISSION', 'TIKTOK_CONFIRM_SUBMISSION',
+      'TIKTOK_COMPOSER_STAGE', 'TIKTOK_INSERT_CAPTION'].includes(message?.type)) return;
     const active = sender.tab?.id === undefined ? undefined : activeTikTokExecutions.get(sender.tab.id);
+    // Stage messages are diagnostics only. Accept a legacy stage payload that
+    // predates the username field, while still rejecting an explicitly wrong
+    // identity and keeping all job/checkpoint messages strict.
+    const identityMatches = message?.type === 'TIKTOK_COMPOSER_STAGE' && message.username === undefined
+      ? true
+      : message?.username?.toLowerCase() === active?.username;
     if (!active || sender.frameId !== 0 || !isTikTokUploadUrl(sender.url ?? sender.tab?.url ?? '') ||
-      message.jobId !== active.jobId || message.username?.toLowerCase() !== active.username) {
+      message.jobId !== active.jobId || !identityMatches) {
       sendResponse({ ok: false, reason: 'Execution ownership or identity mismatch' });
       return;
     }
@@ -32,10 +39,49 @@ export function registerTikTokPublishingBridge(apiFetch: TikTokSessionApiFetch):
       sendResponse({ ok: true });
       return;
     }
+    if (message.type === 'TIKTOK_INSERT_CAPTION') {
+      if (typeof message.text !== 'string' || message.text.length > 4_000) {
+        sendResponse({ ok: false, reason: 'Caption text is invalid or too long' });
+        return;
+      }
+      void insertTikTokCaption(sender.tab!.id!, message.text)
+        .then((result) => {
+          console.info('[PostFlow][TikTok] Browser caption input completed', {
+            tabId: sender.tab?.id,
+            jobId: active.jobId,
+            characterCount: message.text.length,
+            success: result.ok,
+          });
+          sendResponse(result);
+        })
+        .catch((error: unknown) => {
+          const reason = error instanceof Error ? error.message : 'Browser caption input failed';
+          console.warn('[PostFlow][TikTok] Browser caption input failed', {
+            tabId: sender.tab?.id,
+            jobId: active.jobId,
+            reason,
+          });
+          sendResponse({ ok: false, reason: 'BROWSER_CAPTION_INPUT_FAILED' });
+        });
+      return true;
+    }
     void checkTikTokExecution(apiFetch, active, message.type).then(sendResponse)
       .catch(() => sendResponse({ ok: false, reason: 'Worker check unavailable' }));
     return true;
   });
+}
+
+async function insertTikTokCaption(tabId: number, text: string): Promise<{ ok: boolean; reason?: string }> {
+  let attached = false;
+  const target = { tabId };
+  try {
+    await chrome.debugger.attach(target, '1.3');
+    attached = true;
+    await chrome.debugger.sendCommand(target, 'Input.insertText', { text });
+    return { ok: true };
+  } finally {
+    if (attached) await chrome.debugger.detach(target).catch(() => undefined);
+  }
 }
 
 async function checkTikTokExecution(apiFetch: TikTokSessionApiFetch,

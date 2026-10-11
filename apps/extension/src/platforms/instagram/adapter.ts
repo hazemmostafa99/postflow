@@ -6,8 +6,9 @@ import type {
 } from '../../platform-adapter.js';
 import type { PublishJob } from '../../publishing-target.js';
 import { normalizeInstagramPostUrl } from './result.js';
+import { verifyPublishedInstagramCaption } from './published-caption.js';
 import { isFreshInstagramSession, type InstagramSessionSnapshot } from './session-state.js';
-import { refreshInstagramSession } from './worker.js';
+import { bindInstagramExecution, refreshInstagramSession, releaseInstagramExecution } from './worker.js';
 import {
   refreshAndResolveInstagramPostUrl,
   resolveInstagramPostUrl,
@@ -24,6 +25,25 @@ function isInstagramTarget(target: PublishJob['target']): target is InstagramTar
 function isComposerChannelClosed(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /message channel closed|asynchronous response.*channel closed|returning true/i.test(message);
+}
+
+async function confirmInstagramCaption(result: PublishResult, job: PublishJob): Promise<PublishResult> {
+  const caption = typeof job.post.content === 'string' ? job.post.content.trim() : '';
+  if (!caption || !result.success || result.status !== 'PUBLISHED') return result;
+  const verified = result.postUrl
+    ? await verifyPublishedInstagramCaption(result.postUrl, caption)
+    : false;
+  console.info('[PostFlow][Instagram] Published caption check', {
+    jobId: job.id,
+    postUrlPresent: Boolean(result.postUrl),
+    captionLength: caption.length,
+    verified,
+  });
+  return verified ? result : {
+    ...result,
+    status: 'UNKNOWN',
+    reason: `Instagram shared the post, but its published caption could not be verified. Inspect it before retrying.${result.postUrl ? ` Post: ${result.postUrl}` : ''}`,
+  };
 }
 
 const RESERVED_INSTAGRAM_PATHS = new Set([
@@ -232,6 +252,7 @@ export class InstagramAdapter implements PlatformPublisherAdapter {
         });
       };
       chrome.tabs.onUpdated.addListener(navigationListener as any);
+      bindInstagramExecution(tabId, job.id);
       const response = await chrome.tabs.sendMessage(tabId, {
         type: 'INSTAGRAM_EXECUTE_JOB',
         jobId: job.id,
@@ -249,13 +270,13 @@ export class InstagramAdapter implements PlatformPublisherAdapter {
         reason: response?.reason,
       });
       if (observedPostUrl) {
-        return {
+        return confirmInstagramCaption({
           ...(response ?? {}),
           success: true,
           status: 'PUBLISHED',
           postUrl: response?.postUrl ?? observedPostUrl,
           reason: 'Instagram post permalink was observed during tab navigation.',
-        };
+        }, job);
       }
       if (response?.success === true && response.status === 'PUBLISHED' && !response.postUrl) {
         const recoveredPostUrl = await resolveInstagramPostUrl(tabId, existingPostProbe)
@@ -266,10 +287,13 @@ export class InstagramAdapter implements PlatformPublisherAdapter {
             jobId: job.id,
             postUrl: recoveredPostUrl,
           });
-          return { ...response, postUrl: recoveredPostUrl };
+          return confirmInstagramCaption({ ...response, postUrl: recoveredPostUrl }, job);
         }
       }
-      return response ?? { success: false, status: 'FAILED', reason: 'Instagram composer returned no result' };
+      return confirmInstagramCaption(
+        response ?? { success: false, status: 'FAILED', reason: 'Instagram composer returned no result' },
+        job,
+      );
     } catch (error) {
       if (isComposerChannelClosed(error)) {
         const recoveredPostUrl = observedPostUrl
@@ -285,12 +309,12 @@ export class InstagramAdapter implements PlatformPublisherAdapter {
           postUrl: recoveredPostUrl,
           status: recoveredPostUrl ? 'PUBLISHED' : 'UNKNOWN',
         });
-        return {
+        return confirmInstagramCaption({
           success: true,
           status: recoveredPostUrl ? 'PUBLISHED' : 'UNKNOWN',
           ...(recoveredPostUrl ? { postUrl: recoveredPostUrl } : {}),
           reason: recoveryReason,
-        };
+        }, job);
       }
       console.error('[PostFlow][Instagram] Composer command failed', {
         tabId,
@@ -299,6 +323,7 @@ export class InstagramAdapter implements PlatformPublisherAdapter {
       });
       return { success: false, status: 'FAILED', reason: error instanceof Error ? error.message : String(error) };
     } finally {
+      releaseInstagramExecution(tabId);
       if (navigationListener) {
         chrome.tabs.onUpdated.removeListener(navigationListener as any);
       }

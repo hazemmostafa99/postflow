@@ -60,6 +60,12 @@ function createContext(html, preShareResponse = { ok: true }) {
       runtime: {
         sendMessage: (message, callback) => {
           runtimeMessages.push(message);
+          if (message.type === 'INSTAGRAM_INSERT_CAPTION') {
+            if (!selectedField) return callback({ ok: false });
+            selectedField.textContent = message.text;
+            selectedField.dispatchEvent(new window.Event('input', { bubbles: true }));
+            return callback({ ok: true });
+          }
           callback(preShareResponse);
         },
         lastError: undefined,
@@ -305,7 +311,7 @@ test('Instagram rejects visible caption text without a native editor input event
   assert.equal(context.PostFlowInstagramCaption.verified(field, 'DOM only'), false);
 });
 
-test('Instagram stops before Share when native editing is unavailable', async () => {
+test('Instagram stops before Share when browser caption input is unavailable', async () => {
   const context = createContext(`
     <button id="create">Create</button>
     <div role="dialog">
@@ -314,7 +320,11 @@ test('Instagram stops before Share when native editing is unavailable', async ()
       <button id="share">Share</button>
     </div>
   `);
-  context.document.execCommand = () => false;
+  const sendMessage = context.chrome.runtime.sendMessage;
+  context.chrome.runtime.sendMessage = (message, callback) => {
+    if (message.type === 'INSTAGRAM_INSERT_CAPTION') return callback({ ok: false });
+    return sendMessage(message, callback);
+  };
   let shareClicks = 0;
   context.document.querySelector('#share').click = () => { shareClicks += 1; };
   loadComposer(context, '[contenteditable="true"]');

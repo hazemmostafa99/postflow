@@ -7,6 +7,7 @@ type InstagramCaptionPost = {
 type InstagramCaptionApi = {
   read: (post?: InstagramCaptionPost) => { text: string; source: 'content' | 'caption' | 'text' | 'none' };
   insert: (field: HTMLElement, content: string) => boolean;
+  confirmBrowserInsert: (field: HTMLElement, content: string) => boolean;
   matches: (field: HTMLElement, expected: string) => boolean;
   verified: (field: HTMLElement, expected: string) => boolean;
 };
@@ -83,6 +84,12 @@ function captionVerified(field: HTMLElement, expected: string): boolean {
     captionMatches(field, expected);
 }
 
+function confirmBrowserInsert(field: HTMLElement, content: string): boolean {
+  if (!field.isConnected || !captionMatches(field, content)) return false;
+  instagramCaptionTransactions.set(field, normalizeCaptionText(content));
+  return true;
+}
+
 function readCaption(post?: InstagramCaptionPost): { text: string; source: 'content' | 'caption' | 'text' | 'none' } {
   if (typeof post?.content === 'string') return { text: post.content.trim(), source: 'content' };
   if (typeof post?.caption === 'string') return { text: post.caption.trim(), source: 'caption' };
@@ -93,6 +100,7 @@ function readCaption(post?: InstagramCaptionPost): { text: string; source: 'cont
 (globalThis as typeof globalThis & { PostFlowInstagramCaption?: InstagramCaptionApi }).PostFlowInstagramCaption = {
   read: readCaption,
   insert: insertCaption,
+  confirmBrowserInsert,
   matches: captionMatches,
   verified: captionVerified,
 };

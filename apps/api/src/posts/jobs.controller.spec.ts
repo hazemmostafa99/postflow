@@ -544,10 +544,12 @@ describe('JobsController target-specific sync guards', () => {
 
   function createProfileController(options?: {
     claimed?: boolean;
+    platform?: PublishingPlatform;
     engagement?: { reactionCount?: number; commentCount?: number; favoriteCount?: number; shareCount?: number };
     claimExpiresAt?: Date;
   }) {
     const profileJob = {
+      platform: options?.platform ?? PublishingPlatform.FACEBOOK,
       targetType: PublishingTargetType.PROFILE_FEED,
       facebookConnectionId: connectionObjectId,
       postId: { clerkUserId: 'clerk-user-1' },
@@ -670,24 +672,30 @@ describe('JobsController target-specific sync guards', () => {
     });
   });
 
-  it('persists TikTok favorite/share counts and preserves counters omitted by a partial result', async () => {
+  it('persists only TikTok likes and comments and removes legacy favorite/share counts', async () => {
     const previous = { reactionCount: 5, commentCount: 7, favoriteCount: 2, shareCount: 3 };
-    const { controller, profileJob } = createProfileController({ claimed: true, engagement: previous });
+    const { controller, profileJob } = createProfileController({
+      claimed: true,
+      platform: PublishingPlatform.TIKTOK,
+      engagement: previous,
+    });
 
     await controller.updateEngagement('clerk-user-1', extensionInstanceId, 'job-1', {
-      status: 'PARTIAL',
-      reactionCount: 9,
+      status: 'SUCCESS',
+      reactionCount: 1,
+      commentCount: 0,
       favoriteCount: 4,
+      shareCount: 8,
       reason: 'TikTok did not expose every engagement counter',
       claimToken: 'claim-token',
     });
 
     expect((profileJob as { engagement?: unknown }).engagement).toMatchObject({
-      reactionCount: 9,
-      commentCount: 7,
-      favoriteCount: 4,
-      shareCount: 3,
+      reactionCount: 1,
+      commentCount: 0,
     });
+    expect((profileJob as { engagement?: object }).engagement).not.toHaveProperty('favoriteCount');
+    expect((profileJob as { engagement?: object }).engagement).not.toHaveProperty('shareCount');
   });
 
   it('preserves all previous counters when an analytics check fails', async () => {

@@ -49,25 +49,53 @@ function findInstagramCaptionFieldNow(): HTMLElement | null {
   );
 }
 
+async function insertInstagramCaptionWithBrowser(field: HTMLElement, caption: string, jobId?: string): Promise<boolean> {
+  if (!jobId || !instagramCaption) return false;
+  if (instagramCaption.verified(field, caption)) return true;
+  const selection = window.getSelection?.();
+  const range = document.createRange?.();
+  if (!selection || !range) return false;
+  field.focus();
+  range.selectNodeContents(field);
+  selection.removeAllRanges();
+  selection.addRange(range);
+  const response = await new Promise<{ ok?: boolean; reason?: string }>((resolve) => {
+    chrome.runtime.sendMessage({ type: 'INSTAGRAM_INSERT_CAPTION', jobId, text: caption }, (result) => {
+      const error = chrome.runtime.lastError;
+      resolve(error ? { ok: false, reason: error.message } : result ?? { ok: false });
+    });
+  });
+  if (!response.ok) {
+    console.warn('[PostFlow][Instagram] Browser caption input was rejected', {
+      jobId,
+      reason: response.reason ?? 'No response',
+    });
+    return false;
+  }
+  return instagramCaption.confirmBrowserInsert(field, caption);
+}
+
 /**
  * Instagram may replace the Lexical editor node immediately after an input
  * event. Re-find the field after every attempt and require two consecutive
  * reads before continuing to Share; checking one stale HTMLElement is what
  * made caption insertion appear intermittent.
  */
-async function insertAndVerifyInstagramCaption(caption: string): Promise<HTMLElement | null> {
+async function insertAndVerifyInstagramCaption(caption: string, jobId?: string): Promise<HTMLElement | null> {
   for (let attempt = 1; attempt <= 8; attempt += 1) {
     const field = findInstagramCaptionFieldNow();
     if (!field) {
       await instagramComposerDelay(150);
       continue;
     }
-    const inserted = instagramCaption?.insert(field, caption) === true;
+    const inserted = field instanceof HTMLTextAreaElement
+      ? instagramCaption?.insert(field, caption) === true
+      : await insertInstagramCaptionWithBrowser(field, caption, jobId);
     console.info('[PostFlow][Instagram] Caption insertion attempt', {
       attempt,
       inserted,
       fieldConnected: field.isConnected,
-      method: field instanceof HTMLTextAreaElement ? 'native_value_setter' : 'native_edit_transaction',
+      method: field instanceof HTMLTextAreaElement ? 'native_value_setter' : 'browser_input',
     });
     if (!inserted) {
       await instagramComposerDelay(180);
@@ -308,7 +336,7 @@ async function executeInstagramComposer(
     length: caption.length,
   });
   if (caption) {
-    const verifiedCaptionField = await insertAndVerifyInstagramCaption(caption);
+    const verifiedCaptionField = await insertAndVerifyInstagramCaption(caption, message.jobId);
     if (!verifiedCaptionField) {
       const currentField = findInstagramCaptionFieldNow();
       console.warn('[PostFlow][Instagram] Caption verification failed', {
@@ -337,7 +365,7 @@ async function executeInstagramComposer(
     const finalCaptionField = findInstagramCaptionFieldNow();
     if (!finalCaptionField || !instagramCaption?.verified(finalCaptionField, caption)) {
       console.warn('[PostFlow][Instagram] Caption changed before Share; repairing');
-      if (!(await insertAndVerifyInstagramCaption(caption))) {
+      if (!(await insertAndVerifyInstagramCaption(caption, message.jobId))) {
         return { success: false, status: 'FAILED', reason: 'Instagram caption could not be inserted' };
       }
       share = await waitForInstagramElement(

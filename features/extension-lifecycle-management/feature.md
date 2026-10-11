@@ -41,8 +41,9 @@ The following decisions are part of this feature:
 5. Reconnecting a new installation to an existing connection requires an
    explicit user decision. Matching user or Facebook identity alone is not
    sufficient to rebind automatically.
-6. Removing a connection is a soft archive plus worker revocation. It is not a
-   destructive database delete.
+6. Removing a connection revokes its worker and removes it from both connection
+   lists. A hidden revoked instance record prevents automatic registration;
+   jobs and audit history remain intact.
 7. Administrative lifecycle, live connectivity, Facebook health, and worker
    activity are separate state dimensions. They must not be collapsed into one
    ambiguous `status` field or UI label.
@@ -140,7 +141,7 @@ type RevocationMetadata = {
 The logical Facebook connection has an optional `archivedAt` timestamp.
 
 - Not archived: visible in the normal Connections page.
-- Archived: hidden from the normal list and visible in an Archived section.
+- Archived: hidden from Active and visible in the Disconnected tab.
 - Restore: clears `archivedAt` only after the user explicitly reconnects or
   restores the connection.
 
@@ -227,13 +228,13 @@ Remove performs:
 ```text
 revoke active installation
         +
-archive logical Facebook connection
+remove the connection from Active and Archived
         +
-retain connection, group, job, and audit records
+retain a hidden revocation record and job/audit history
 ```
 
 The removed extension must not reappear when it sends register or heartbeat.
-The archived connection is available from an Archived Connections view.
+The removed connection is not available from Archived Connections.
 
 ### Restore or Reconnect
 
@@ -414,11 +415,11 @@ Action menu:
 - Force disconnect, behind a separate warning.
 - Remove from Connections.
 
-Archived view actions:
+Disconnected view actions:
 
 - View history.
-- Restore/Reconnect.
-- Keep archived.
+- Remove a force-disconnected connection.
+- Restore/Reconnect an older archived Facebook connection.
 
 The UI must not label a paused extension as offline when heartbeats are still
 arriving. It must not label a revoked extension as merely offline.
@@ -462,7 +463,7 @@ PATCH  /api/extensions/connections/:id/name
 POST   /api/extensions/connections/:id/pause
 POST   /api/extensions/connections/:id/resume
 POST   /api/extensions/connections/:id/disconnect
-DELETE /api/extensions/connections/:id        # soft archive, not hard delete
+DELETE /api/extensions/connections/:id        # immediate removal from connection lists
 GET    /api/extensions/connections/archived
 POST   /api/extensions/connections/:id/reconnect-approval
 
@@ -555,7 +556,7 @@ No migration may hard-delete connections, groups, jobs, or publishing history.
 - Pause blocks new claims but allows heartbeat.
 - Resume restores claims only after Facebook identity verification.
 - Revoked register and heartbeat cannot reactivate the installation.
-- Remove archives the connection and revokes its active installation.
+- Remove revokes the installation and removes the connection from both lists.
 - Repeated pause, resume, disconnect, and remove requests are idempotent.
 
 ### Connectivity
@@ -663,7 +664,7 @@ The feature is complete when:
 - Pause/resume works without new claims leaking to paused workers.
 - Disconnect prevents ordinary registration or heartbeat from reactivating an
   installation.
-- Remove is a safe revoke-plus-archive operation.
+- Remove is a revoke-and-hide operation that retains a registration tombstone.
 - Reinstall creates a new instance ID.
 - Explicit recovery can bind the new installation to the durable old
   connection while revoking the previous installation.

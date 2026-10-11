@@ -43,6 +43,7 @@ export interface FacebookConnection {
   status: string;
   workerStatus: string;
   lifecycle?: string | null;
+  revocationReason?: string | null;
   installationStatus?: string | null;
   facebookSessionDetected: boolean;
   lastSeenAt?: string;
@@ -59,7 +60,7 @@ export interface FacebookConnection {
 export type OperationalState = "READY" | "PUBLISHING" | "ATTENTION" | "OFFLINE" | "SETUP";
 export type ConnectionFilter = "ALL" | "READY" | "PUBLISHING" | "ATTENTION" | "OFFLINE";
 export type LifecycleStatus = "ACTIVE" | "PAUSED" | "REVOKE_PENDING" | "REVOKED";
-type DashboardView = "ACTIVE" | "ARCHIVED";
+type DashboardView = "ACTIVE" | "DISCONNECTED";
 
 export interface ConnectionView {
   connection: FacebookConnection;
@@ -169,7 +170,7 @@ export function getConnectionView(connection: FacebookConnection, now: number): 
       ...base,
       state: "ATTENTION",
       stateLabel: "Disconnected",
-      message: "This extension is disconnected. Restore it from Archived connections or remove it.",
+      message: "This extension is disconnected. Find it in Disconnected connections or remove it.",
     };
   }
 
@@ -258,8 +259,20 @@ export interface ConfirmSpec {
   typedConfirmation?: string;
 }
 
-export function getConfirmSpec(action: Exclude<LifecycleAction, "rename" | "restore">): ConfirmSpec {
+export function getConfirmSpec(action: Exclude<LifecycleAction, "rename">, connection?: FacebookConnection): ConfirmSpec {
   switch (action) {
+    case "restore":
+      return {
+        title: "Restore this connection?",
+        description: `Restore “${connection ? accountName(connection) : "this connection"}” in this Chrome profile.`,
+        effects: [
+          "The extension in this Chrome profile must be installed and available.",
+          "The connection will become active after the extension accepts a one-time approval.",
+          "Publishing can resume after its platform sessions are verified.",
+        ],
+        confirmLabel: "Restore connection",
+        destructive: false,
+      };
     case "pause":
       return {
         title: "Pause this connection?",
@@ -314,12 +327,12 @@ export function getConfirmSpec(action: Exclude<LifecycleAction, "rename" | "rest
     case "remove":
       return {
         title: "Remove from Connections?",
-        description: "The connection is archived, not deleted.",
+        description: "This extension connection will be removed immediately.",
         effects: [
-          "Ownership, history, and audit records are kept.",
           "The extension loses access to worker APIs.",
-          "Queued jobs stay queued and wait for another connection.",
-          "You can restore it later from Archived connections.",
+          "Queued jobs are not canceled; publishing needs a connected extension.",
+          "It will disappear from Active and Disconnected connections.",
+          "Post and audit history remain available.",
         ],
         confirmLabel: "Remove connection",
         destructive: true,
@@ -456,6 +469,28 @@ function sendReconnectApprovalToExtension(payload: {
   });
 }
 
+function sendDisconnectedRestoreApproval(payload: {
+  installationId: string;
+  approvalToken: string;
+}): Promise<{ ok: boolean; error?: string }> {
+  const requestId = crypto.randomUUID();
+  return new Promise((resolve) => {
+    const timeout = window.setTimeout(() => {
+      window.removeEventListener("postflow:restore-disconnected-result", onResult);
+      resolve({ ok: false, error: "The extension did not respond. Open this dashboard in the Chrome Profile you want to restore, then try again." });
+    }, 90_000);
+    function onResult(event: Event) {
+      const detail = (event as CustomEvent).detail as Record<string, unknown> | null;
+      if (detail?.requestId !== requestId) return;
+      window.clearTimeout(timeout);
+      window.removeEventListener("postflow:restore-disconnected-result", onResult);
+      resolve({ ok: detail.ok === true, ...(typeof detail.error === "string" ? { error: detail.error } : {}) });
+    }
+    window.addEventListener("postflow:restore-disconnected-result", onResult);
+    window.dispatchEvent(new CustomEvent("postflow:restore-disconnected", { detail: { requestId, ...payload } }));
+  });
+}
+
 interface ConnectionsDashboardProps {
   connections: FacebookConnection[];
   unavailable: boolean;
@@ -467,7 +502,7 @@ interface ConnectionsDashboardProps {
 type DialogState =
   | { kind: "none" }
   | { kind: "rename"; connection: FacebookConnection }
-  | { kind: "confirm"; connection: FacebookConnection; action: Exclude<LifecycleAction, "rename" | "restore"> };
+  | { kind: "confirm"; connection: FacebookConnection; action: Exclude<LifecycleAction, "rename"> };
 
 export function ConnectionsDashboard({
   connections: initialConnections,
@@ -527,11 +562,13 @@ export function ConnectionsDashboard({
       ]);
       const [data, active, extensions] = await Promise.all(responses.map((response) => response.json()));
       if (responses.some((response) => !response.ok) || ![data, active, extensions].every(Array.isArray)) {
-        setArchivedError("Archived connections could not be loaded.");
+        setArchivedError("Disconnected connections could not be loaded.");
         return;
       }
       setArchived(connectionRows([...data, ...active] as FacebookConnection[], extensions as ExtensionConnection[], Date.now(), true)
-        .filter((connection) => connection.archivedAt && (!scopeConnectionId || connection._id === scopeConnectionId)));
+        .filter((connection) => (connection.archivedAt || normalizeLifecycle(connection) === "REVOKED" ||
+          (!connection.installationId && connection.status === "DISCONNECTED")) &&
+          (!scopeConnectionId || connection._id === scopeConnectionId)));
     } catch {
       setArchivedError(BACKEND_UNAVAILABLE_MESSAGE);
     } finally {
@@ -616,7 +653,8 @@ export function ConnectionsDashboard({
         [accountName(connection), connection.facebookUserId, connection.extensionInstanceId]
           .some((value) => value?.toLowerCase().includes(normalizedQuery))
       ))
-      .sort((a, b) => new Date(b.archivedAt ?? 0).getTime() - new Date(a.archivedAt ?? 0).getTime());
+      .sort((a, b) => new Date(b.archivedAt ?? b.lastHeartbeat ?? b.lastSeenAt ?? 0).getTime() -
+        new Date(a.archivedAt ?? a.lastHeartbeat ?? a.lastSeenAt ?? 0).getTime());
   }, [archived, query]);
 
   const openRename = useCallback((connection: FacebookConnection) => {
@@ -627,7 +665,7 @@ export function ConnectionsDashboard({
 
   const openConfirm = useCallback((
     connection: FacebookConnection,
-    action: Exclude<LifecycleAction, "rename" | "restore">,
+    action: Exclude<LifecycleAction, "rename">,
   ) => {
     setDialogError(null);
     setDialog({ kind: "confirm", connection, action });
@@ -644,40 +682,8 @@ export function ConnectionsDashboard({
       openRename(connection);
       return;
     }
-    if (action === "restore") {
-      void (async () => {
-        setArchivedError(null);
-        const result = await callConnectionApi(
-          `/api/extensions/connections/${connection._id}/reconnect-approval`,
-          { method: "POST" },
-        );
-        if (!result.ok) {
-          setArchivedError(actionErrorMessage(result));
-          return;
-        }
-        const approvalToken = typeof result.data.approvalToken === "string"
-          ? result.data.approvalToken
-          : "";
-        if (!approvalToken) {
-          setArchivedError("The backend did not return a reconnect approval. Nothing changed.");
-          return;
-        }
-        const extensionResult = await sendReconnectApprovalToExtension({
-          connectionId: connection._id,
-          approvalToken,
-        });
-        if (!extensionResult.ok) {
-          setArchivedError(extensionResult.error ?? "The extension could not restore this connection.");
-          return;
-        }
-        setNotice(`Restored “${accountName(connection)}” in this Chrome Profile.`);
-        void refresh(false);
-        void refreshArchived();
-      })();
-      return;
-    }
     openConfirm(connection, action);
-  }, [openConfirm, openRename, refresh, refreshArchived]);
+  }, [openConfirm, openRename]);
 
   const submitRename = useCallback(async () => {
     if (dialog.kind !== "rename") return;
@@ -709,9 +715,48 @@ export function ConnectionsDashboard({
   const submitConfirm = useCallback(async () => {
     if (dialog.kind !== "confirm") return;
     const { connection, action } = dialog;
-    const spec = getConfirmSpec(action);
+    const spec = getConfirmSpec(action, connection);
     setDialogBusy(true);
     setDialogError(null);
+
+    if (action === "restore") {
+      const restoreDisconnected = !connection.archivedAt;
+      if (restoreDisconnected && !connection.installationId) {
+        setDialogError("This historical connection needs a registered extension installation to restore.");
+        setDialogBusy(false);
+        return;
+      }
+      const result = await callConnectionApi(
+        restoreDisconnected
+          ? `/api/extensions/browser-connections/${connection.installationId}/restore-approval`
+          : `/api/extensions/connections/${connection._id}/reconnect-approval`,
+        { method: "POST" },
+      );
+      if (!result.ok) {
+        setDialogError(actionErrorMessage(result));
+        setDialogBusy(false);
+        return;
+      }
+      const approvalToken = typeof result.data.approvalToken === "string" ? result.data.approvalToken : "";
+      if (!approvalToken) {
+        setDialogError("The backend did not return a reconnect approval. Nothing changed.");
+        setDialogBusy(false);
+        return;
+      }
+      const extensionResult = restoreDisconnected
+        ? await sendDisconnectedRestoreApproval({ installationId: connection.installationId!, approvalToken })
+        : await sendReconnectApprovalToExtension({ connectionId: connection._id, approvalToken });
+      setDialogBusy(false);
+      if (!extensionResult.ok) {
+        setDialogError(extensionResult.error ?? "The extension could not restore this connection.");
+        return;
+      }
+      setDialog({ kind: "none" });
+      setNotice(`Restored “${accountName(connection)}” in this Chrome Profile.`);
+      void refresh(false);
+      void refreshArchived();
+      return;
+    }
 
     let result: { ok: boolean; status: number; data: Record<string, unknown> };
     if (action === "remove") {
@@ -733,7 +778,7 @@ export function ConnectionsDashboard({
     setDialog({ kind: "none" });
     setNotice(`${spec.title.replace(/[?]$/, "")} — done.`);
     void refresh(false);
-    if (dashboardView === "ARCHIVED") void refreshArchived();
+    if (dashboardView === "DISCONNECTED") void refreshArchived();
   }, [dialog, refresh, dashboardView, refreshArchived]);
 
   const searchAndFilter = (
@@ -767,7 +812,7 @@ export function ConnectionsDashboard({
           type="button"
           onClick={() => {
             void refresh();
-            if (dashboardView === "ARCHIVED") void refreshArchived();
+            if (dashboardView === "DISCONNECTED") void refreshArchived();
           }}
           disabled={isRefreshing}
           className="col-span-2 inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-border bg-background px-3 text-xs font-medium shadow-sm transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60 sm:col-span-1"
@@ -803,23 +848,23 @@ export function ConnectionsDashboard({
         <button
           type="button"
           role="tab"
-          aria-selected={dashboardView === "ARCHIVED"}
+          aria-selected={dashboardView === "DISCONNECTED"}
           onClick={() => {
-            setDashboardView("ARCHIVED");
-            if (archived === null && !archivedLoading) void refreshArchived();
+            setDashboardView("DISCONNECTED");
+            if (!archivedLoading) void refreshArchived();
           }}
-          className={`inline-flex h-9 items-center gap-1.5 rounded-lg border px-3 text-xs font-medium transition-colors ${dashboardView === "ARCHIVED" ? "border-primary/40 bg-primary/10 text-primary" : "border-border bg-background text-muted-foreground hover:bg-accent"}`}
+          className={`inline-flex h-9 items-center gap-1.5 rounded-lg border px-3 text-xs font-medium transition-colors ${dashboardView === "DISCONNECTED" ? "border-primary/40 bg-primary/10 text-primary" : "border-border bg-background text-muted-foreground hover:bg-accent"}`}
         >
-          <Archive className="h-3.5 w-3.5" />
-          Archived connections
+          <WifiOff className="h-3.5 w-3.5" />
+          Disconnected connections
         </button>
       </div>
 
-      {dashboardView === "ARCHIVED" ? (
-        <section className="surface overflow-hidden" aria-label="Archived connections">
+      {dashboardView === "DISCONNECTED" ? (
+        <section className="surface overflow-hidden" aria-label="Disconnected connections">
           <div className="border-b border-border bg-muted/50 px-4 py-3">
-            <p className="text-xs font-semibold uppercase tracking-normal text-muted-foreground">Archived connections</p>
-            <p className="mt-1 text-xs text-muted-foreground">Removed connections keep their accounts, jobs, and audit history. Existing Facebook recovery uses a verified reconnect approval.</p>
+            <p className="text-xs font-semibold uppercase tracking-normal text-muted-foreground">Disconnected connections</p>
+            <p className="mt-1 text-xs text-muted-foreground">Force-disconnected connections appear here. Older archived connections remain available for recovery. Removed connections disappear from both lists.</p>
           </div>
           {archivedError && (
             <div role="alert" className="flex items-start gap-2 border-b border-border bg-red-50 px-4 py-3 text-sm text-red-700">
@@ -829,39 +874,59 @@ export function ConnectionsDashboard({
           )}
           {archivedLoading && !archived ? (
             <div className="flex min-h-48 items-center justify-center gap-2 text-sm text-muted-foreground">
-              <Loader2 className="h-4 w-4 animate-spin" /> Loading archived connections…
+              <Loader2 className="h-4 w-4 animate-spin" /> Loading disconnected connections…
             </div>
           ) : !archived || visibleArchived.length === 0 ? (
             <div className="flex min-h-48 flex-col items-center justify-center px-6 text-center">
-              <Archive className="mb-3 h-7 w-7 text-muted-foreground/50" />
-              <p className="font-medium text-foreground">No archived connections</p>
-              <p className="mt-1 text-sm text-muted-foreground">Connections you remove appear here and can be restored.</p>
+              <WifiOff className="mb-3 h-7 w-7 text-muted-foreground/50" />
+              <p className="font-medium text-foreground">No disconnected connections</p>
+              <p className="mt-1 text-sm text-muted-foreground">Force-disconnected and previously archived connections appear here.</p>
             </div>
           ) : (
             <div className="divide-y divide-border">
               {visibleArchived.map((connection) => (
                 <div key={connection._id} className="flex flex-wrap items-center gap-3 px-4 py-4">
                   <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-border bg-muted">
-                    <Archive className="h-5 w-5 text-muted-foreground" />
+                    {connection.archivedAt ? <Archive className="h-5 w-5 text-muted-foreground" /> : <WifiOff className="h-5 w-5 text-muted-foreground" />}
                   </div>
                   <div className="min-w-0 flex-1">
                     <h2 className="truncate text-sm font-semibold text-foreground">{accountName(connection)}</h2>
                     <p className="mt-0.5 truncate text-xs text-muted-foreground">
-                      Archived {relativeTime(connection.archivedAt ?? undefined, now)} · {accountIdentity(connection)}
+                      {connection.archivedAt
+                        ? `Archived ${relativeTime(connection.archivedAt, now)}`
+                        : `Last active ${relativeTime(connection.lastHeartbeat ?? connection.lastSeenAt, now)}`}
+                      {connection.facebookUserId ? ` · ${accountIdentity(connection)}` : ""}
+                      {connection.extensionInstanceIdMasked ? ` · Extension ${connection.extensionInstanceIdMasked}` : ""}
                       {connection.archiveReason ? ` · ${statusLabel(connection.archiveReason)}` : ""}
                     </p>
+                    {connection.platformAccounts?.some((account) => account.connectionId) && <p className="mt-1 truncate text-xs text-muted-foreground">
+                      {connection.platformAccounts.filter((account) => account.connectionId).map((account) =>
+                        `${account.platform === "INSTAGRAM" ? "Instagram" : account.platform === "TIKTOK" ? "TikTok" : "Facebook"}${account.username ? ` @${account.username}` : ""}`,
+                      ).join(" · ")}
+                    </p>}
                   </div>
                   <span className="inline-flex rounded-full border px-2.5 py-1 text-xs font-medium border-red-200 bg-red-50 text-red-700">
-                    {connection.hasPendingReconnectApproval ? "Reconnect approval pending" : "Archived"}
+                    {connection.hasPendingReconnectApproval ? "Reconnect approval pending" : connection.archivedAt ? "Archived" : "Disconnected"}
                   </span>
-                  {(!connection.installationId || connection.legacyFacebookConnectionId) ? <button
-                    type="button"
-                    onClick={() => handleAction(connection, "restore")}
-                    className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-                  >
-                    <RotateCcw className="h-3.5 w-3.5" />
-                    Restore / reconnect
-                  </button> : <p className="max-w-56 text-xs text-muted-foreground">Archived safely. Multi-platform reconnect is not yet available; accounts and jobs are retained.</p>}
+                  <div className="flex flex-wrap items-center gap-2">
+                    {(connection.archivedAt ? (!connection.installationId || connection.legacyFacebookConnectionId) :
+                      Boolean(connection.installationId && connection.revocationReason === "USER_DISCONNECTED")) ? <button
+                      type="button"
+                      onClick={() => handleAction(connection, "restore")}
+                      className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" />
+                      Restore
+                    </button> : connection.archivedAt ? <p className="max-w-56 text-xs text-muted-foreground">This historical connection needs a new installation to reconnect.</p> : null}
+                    {!connection.archivedAt && <button
+                      type="button"
+                      onClick={() => handleAction(connection, "remove")}
+                      className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-red-200 bg-red-50 px-3 text-xs font-medium text-red-700 transition-colors hover:bg-red-100"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      Remove from connections…
+                    </button>}
+                  </div>
                 </div>
               ))}
             </div>
@@ -924,7 +989,7 @@ export function ConnectionsDashboard({
       )}
       {dialog.kind === "confirm" && (
         <ConfirmDialog
-          spec={getConfirmSpec(dialog.action)}
+          spec={getConfirmSpec(dialog.action, dialog.connection)}
           error={dialogError}
           busy={dialogBusy}
           onCancel={closeDialog}

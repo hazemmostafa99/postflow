@@ -117,6 +117,7 @@ export class InstagramSessionManager {
       instagramDetectedAccountId: accountId,
       instagramDetectedUsername: null,
       instagramConnectionStatus: result.status ?? 'CONNECTED',
+      instagramConnectionError: null,
       instagramWorkerStatus: result.workerStatus ?? 'IDLE',
     });
     console.info('[PostFlow][Instagram] Cookie session identity persisted', {
@@ -355,11 +356,17 @@ export class InstagramSessionManager {
       // Legacy installations without ds_user_id remain readable, but new
       // cookie-backed reports intentionally omit the username entirely.
       ...(!evidence.externalAccountId && evidence.externalUsername ? { externalUsername: evidence.externalUsername } : {}),
-    }, 'POST', true) as { apiFetchError?: boolean; status?: string; workerStatus?: string; detectedExternalUsername?: string } | null;
+    }, 'POST', true) as { apiFetchError?: boolean; status?: string | number; message?: string; workerStatus?: string; detectedExternalUsername?: string } | null;
     // A null response is valid while this installation has no platform record
     // yet (for example, CHECKING before the first verified identity). Network
     // and HTTP failures are returned with apiFetchError and remain retryable.
-    if (result?.apiFetchError) throw new Error('Instagram session evidence could not be persisted');
+    if (result?.apiFetchError) {
+      const status = typeof result.status === 'number'
+        ? result.status === 0 ? 'network/timeout (status 0)' : `HTTP ${result.status}`
+        : 'unknown API error';
+      const message = typeof result.message === 'string' ? `: ${result.message}` : '';
+      throw new Error(`Instagram session evidence could not be persisted (${status}${message})`);
+    }
     const persisted = Boolean(result);
     if (result?.status === 'ACCOUNT_MISMATCH') snapshot = { ...snapshot, state: 'ACCOUNT_MISMATCH' };
     if (snapshot.state === 'LOGIN_REQUIRED' || snapshot.state === 'ACCOUNT_MISMATCH') {
@@ -391,6 +398,7 @@ export class InstagramSessionManager {
       // Remove the old UI/cache value once an id-backed session is verified.
       ...(snapshot.externalAccountId ? { instagramDetectedUsername: null } : { instagramDetectedUsername: snapshot.username ?? null }),
       instagramConnectionStatus: connectionStatus,
+      instagramConnectionError: null,
       instagramWorkerStatus: workerStatus,
     });
     this.lastEvidenceReport.set(tabId, {
